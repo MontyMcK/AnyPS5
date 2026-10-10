@@ -257,6 +257,9 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         Prepare([this, held] { Enqueue(std::move(held->commit), std::move(held->writes), held->labelAddress, std::move(held->labelBytes)); }, std::move(writes), labelAddress, std::move(labelBytes));
         return;
     }
+    // Finished commits are destroyed here, off the committer (their captures are a draw's whole
+    // front end), after the mutex and the preparation turn are released (declared before both).
+    std::vector<Commit> finished;
     drainPrep();
     const auto sequence = PrepSequence();
     if (sequence != 0 && !PrepEnqueued()) waitPrepTurn(sequence);
@@ -271,6 +274,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     } release{*this, sequence};
     std::unique_lock lock(mutex);
     rethrowFailure();
+    finished.swap(retired);
     if (items.size() >= Depth()) {
         const ProducerScope producer(Producer::EnqueueRoom);
         const auto start = std::chrono::steady_clock::now();
@@ -358,6 +362,8 @@ void DrawPipeline::run() {
         PipeTrace(Trace::CommitEnd);
         const auto spent = elapsedNs(start);
         std::lock_guard lock(mutex);
+        static const bool retireOffCommitter = std::getenv("APS5_NO_RETIRED_COMMITS") == nullptr;
+        if (retireOffCommitter && retired.size() < 4096) retired.push_back(std::move(items.front().commit));
         items.pop_front();
         ++commits;
         commitNs += spent;

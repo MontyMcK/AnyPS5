@@ -94,6 +94,7 @@ private:
     std::condition_variable wake;
     std::condition_variable idle;
     std::deque<Item> items;
+    std::vector<Commit> retired;
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};
     std::uint32_t idleWaiters = 0;
