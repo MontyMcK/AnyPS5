@@ -184,7 +184,7 @@ public:
                 if (!VirtualProtect(reinterpret_cast<void*>(base), pageBytes, view.protection, &previous)) fail("resume resident guest write");
                 view.armed = false;
                 view.cleanStreak = 0;
-                view.armAfter = static_cast<std::uint8_t>(std::min(255, view.armAfter * 2));
+                view.armAfter = 255;
                 forgetClean(base, base + pageBytes);
                 return true;
             }
@@ -396,8 +396,16 @@ private:
         bool resident;
         Physical* slot;
         std::uint8_t cleanStreak = 0;
-        std::uint8_t armAfter = 4;
+        std::uint8_t armAfter = InitialArmAfter();
     };
+    static std::uint8_t InitialArmAfter() {
+        static const std::uint8_t value = [] {
+            const char* text = std::getenv("APS5_ARM_AFTER");
+            const auto parsed = text != nullptr ? std::strtoul(text, nullptr, 10) : 64ul;
+            return static_cast<std::uint8_t>(std::clamp<unsigned long>(parsed, 1ul, 255ul));
+        }();
+        return value;
+    }
     struct Run {
         std::uintptr_t end;
         std::array<std::uint64_t, 8> collected;

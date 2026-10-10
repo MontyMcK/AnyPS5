@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_PIPELINECACHE_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <filesystem>
@@ -32,6 +33,7 @@ private:
     VkPipelineCache cache = VK_NULL_HANDLE;
     std::filesystem::path path;
     std::size_t savedBytes = 0;
+    std::chrono::steady_clock::time_point savedAt = std::chrono::steady_clock::now();
     std::mutex mutex;
     std::condition_variable wake;
     bool stopping = false;

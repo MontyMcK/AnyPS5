@@ -137,6 +137,11 @@ struct HostImports {
     VkDevice watchDevice = VK_NULL_HANDLE;
     bool unwatchImports = false;
     bool unwatchDmaBufImports = false;
+    VkDevice unimportableDevice = VK_NULL_HANDLE;
+    std::uint64_t unimportableGeneration = 0;
+    std::uint64_t unimportableEpoch = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> unimportable;
+    std::uint64_t unimportableHits = 0;
 };
 
 HostImports& Imports() {
@@ -193,7 +198,7 @@ const char* bindImport(const Context& context, HostImport& entry, VkExternalMemo
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
     info.size = entry.bytes;
     // INDIRECT_BUFFER: DISPATCH_INDIRECT group counts are read in place (VulkanDevice::DispatchIndirect).
-    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
+    info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT;
     info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (const auto result = context.Function<PFN_vkCreateBuffer>("vkCreateBuffer")(context.device, &info, nullptr, &entry.buffer); result != VK_SUCCESS) return failed("vkCreateBuffer", result);
     VkMemoryRequirements requirements{};
@@ -727,7 +732,7 @@ private:
 // completes first, so its results reach the guest and the shadow before the compare and no batch
 // writes a block being replaced; GPU reads of the mirror by earlier recorded work (an address-based
 // dispatch whose lease is released at completion) see the newer bytes, as they would on hardware.
-void prepareRange(std::uint64_t address, std::uint64_t bytes) {
+void prepareRange(std::uint64_t address, std::uint64_t bytes, bool flushStorage = true) {
     // The compare reads the pages directly; a mirror is only reused while its Range exists, but a
     // lease of a build in flight can keep a replaced Range alive past a protection change.
     Require(GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes)), "image mirror range became inaccessible");
@@ -735,7 +740,7 @@ void prepareRange(std::uint64_t address, std::uint64_t bytes) {
     // recorded work notes a write inside the range (a descriptor written inside a writable exe
     // range; the lease itself maps the range read-only). The access is the whole range.
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::MirrorRefresh);
-    GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
+    if (flushStorage) GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
     auto& state = Mirrors();
     if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(bytes))) {
         Recorder::CountSync(4);
@@ -788,8 +793,40 @@ void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshB
         while (last < mirrors.size() && mirrors[last]->base == mirrors[last - 1]->base + mirrors[last - 1]->bytes) ++last;
         const auto begin = mirrors[first]->base;
         const auto bytes = mirrors[last - 1]->base + mirrors[last - 1]->bytes - begin;
-        prepareRange(begin, bytes);
+        static const bool bdaFlush = std::getenv("APS5_BDA_FLUSH") != nullptr;
+        const auto prepareStarted = std::chrono::steady_clock::now();
+        prepareRange(begin, bytes, bdaFlush);
+        const auto collectStarted = std::chrono::steady_clock::now();
+        const auto epochBefore = GuestMemory::ThreadCollectEpoch();
+        const auto unwatchBefore = GuestMemory::UnwatchSerial();
         const auto generation = GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes));
+        {
+            static const bool traceHeap = std::getenv("APS5_TRACE_HEAP_REFRESH") != nullptr;
+            if (traceHeap) {
+                static std::mutex heapMutex;
+                static double prepareSeconds = 0.0, collectSeconds = 0.0;
+                static std::uint64_t calls = 0, freshEpoch = 0, newEpoch = 0, newUnwatch = 0, slow = 0;
+                static thread_local std::uint64_t lastEpoch = 0, lastUnwatch = 0;
+                if (epochBefore == 0) ++freshEpoch;
+                else if (epochBefore != lastEpoch) ++newEpoch;
+                if (unwatchBefore != lastUnwatch) ++newUnwatch;
+                lastEpoch = epochBefore;
+                lastUnwatch = unwatchBefore;
+                if (std::chrono::steady_clock::now() - collectStarted > std::chrono::microseconds(500)) ++slow;
+                static auto window = std::chrono::steady_clock::now();
+                const auto now = std::chrono::steady_clock::now();
+                std::lock_guard heapLock(heapMutex);
+                prepareSeconds += std::chrono::duration<double>(collectStarted - prepareStarted).count();
+                collectSeconds += std::chrono::duration<double>(now - collectStarted).count();
+                ++calls;
+                if (now - window >= std::chrono::seconds(10)) {
+                    std::fprintf(stderr, "[heap-refresh] %llu refreshes of 0x%llx+0x%llx: prepare %.2f s, collect %.2f s; %llu walks over 0.5 ms; thread epoch: %llu none, %llu changed since the thread's last refresh; unwatch serial changed %llu\n", static_cast<unsigned long long>(calls), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(bytes), prepareSeconds, collectSeconds, static_cast<unsigned long long>(slow), static_cast<unsigned long long>(freshEpoch), static_cast<unsigned long long>(newEpoch), static_cast<unsigned long long>(newUnwatch));
+                    window = now;
+                    prepareSeconds = collectSeconds = 0.0;
+                    calls = freshEpoch = newEpoch = newUnwatch = slow = 0;
+                }
+            }
+        }
         Require(generation != 0, "a heap mirror's range is no longer write-watched");
         for (auto index = first; index < last; ++index) {
             auto& mirror = *mirrors[index];
@@ -1319,10 +1356,33 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     if (!importsStale(context, state)) {
         if (const auto* entry = findImport(state, address, address + bytes)) return entry;
     }
+    static const bool negativeCache = std::getenv("APS5_NO_UNIMPORTABLE_MEMO") == nullptr;
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    if (negativeCache) {
+        if (state.unimportableDevice != context.device || state.unimportableGeneration != generation || state.unimportableEpoch != state.epoch) {
+            state.unimportable.clear();
+            state.unimportableDevice = context.device;
+            state.unimportableGeneration = generation;
+            state.unimportableEpoch = state.epoch;
+        }
+        const auto end = address + bytes;
+        if (std::any_of(state.unimportable.begin(), state.unimportable.end(), [&](const auto& range) { return range.first <= address && end <= range.second; })) {
+            ++state.unimportableHits;
+            return nullptr;
+        }
+    }
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
-    if (const auto* range = containingRange(lease, address, address + bytes)) return importAllocation(context, state, range->address, range->bytes, lease);
-    return nullptr;
+    const auto* range = containingRange(lease, address, address + bytes);
+    const HostImport* imported = range != nullptr ? importAllocation(context, state, range->address, range->bytes, lease) : nullptr;
+    if (imported == nullptr && negativeCache && state.unimportable.size() < 4096) {
+        state.unimportableDevice = context.device;
+        state.unimportableGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        state.unimportableEpoch = state.epoch;
+        if (range != nullptr) state.unimportable.emplace_back(range->address, range->address + range->bytes);
+        else state.unimportable.emplace_back(address, address + bytes);
+    }
+    return imported;
 }
 
 bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {
@@ -1582,6 +1642,87 @@ void GuestBufferMemory::AcquireRegistered() {
         sweepMirrors();
         reportMirrors();
     }
+}
+
+GuestBufferMemory::SpaceShare GuestBufferMemory::ShareSpace(std::uint64_t serial, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& sourceWrites) {
+    Require(!prepared && !uploaded && regions.empty() && lease.empty() && space == nullptr, "an address template use must start from an empty upload");
+    if (!addressSpaceCacheEnabled() || serial == 0) return SpaceShare::Replaced;
+    ensurePinWaiter();
+    auto& spaces = Spaces();
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    auto current = spaces.current.load();
+    if (current == nullptr || current->serial != serial || current->device != context.device || current->generation != generation) return SpaceShare::Replaced;
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        if (current->importsEpoch != state.epoch) return SpaceShare::Imports;
+    }
+    writes = sourceWrites;
+    space = std::move(current);
+    importsEpoch = space->importsEpoch;
+    prepared = true;
+    std::vector<RefreshBlock> blocks;
+    std::vector<ImageMirror*> heaps;
+    for (const auto& region : space->base) {
+        if (region.mirror == nullptr) continue;
+        if (region.mirror->heap) heaps.push_back(region.mirror.get());
+        else if (region.mirror->writable && prepareRefresh(*region.mirror, region.begin, region.end - region.begin)) appendBlocks(blocks, *region.mirror, region.begin, region.end - region.begin);
+    }
+    refreshHeapMirrors(heaps, blocks);
+    compareBlocks(blocks);
+    if (mirrorsEnabled()) {
+        sweepMirrors();
+        reportMirrors();
+    }
+    return SpaceShare::Taken;
+}
+
+bool GuestBufferMemory::SpaceCovers(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    return baseOverlap(address, address + bytes, nullptr) == BaseOverlap::Inside;
+}
+
+std::optional<VkDescriptorBufferInfo> GuestBufferMemory::SpaceDescriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const {
+    if (!uploaded || committed || space == nullptr || !regions.empty() || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address - 3) return std::nullopt;
+    const auto begin = address & ~std::uint64_t{3};
+    const auto end = begin == address ? address + bytes : (address + bytes + 3) & ~std::uint64_t{3};
+    const Region* found = nullptr;
+    if (baseOverlap(begin, end, &found) != BaseOverlap::Inside || found == nullptr || (found->direct == nullptr && found->mirror == nullptr)) return std::nullopt;
+    const auto base = found->direct != nullptr ? found->direct->base : found->mirror->base;
+    if (base % 4 != 0 || context.limits.minStorageBufferOffsetAlignment == 0 || address < base) return std::nullopt;
+    const auto offset = address - base;
+    adjustment = static_cast<std::uint32_t>(offset % std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4));
+    const auto range = ViewBytes(bytes, adjustment);
+    const auto limit = found->direct != nullptr ? found->direct->base + found->direct->bytes : found->end;
+    if (address - adjustment + range > limit || range > context.limits.maxStorageBufferRange) return std::nullopt;
+    const auto handle = found->direct != nullptr ? found->direct->buffer : found->mirror->buffer->Handle();
+    return VkDescriptorBufferInfo{handle, offset - adjustment, range};
+}
+
+bool GuestBufferMemory::FinishSharedSpace() {
+    Require(prepared && !uploaded && space != nullptr && regions.empty() && lease.empty(), "an address template use finished without its address space");
+    if (context.hostImportAlignment != 0) {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        if (importsStale(context, state)) refreshImports(context, state, space->lease);
+        if (state.epoch != space->importsEpoch) return false;
+    }
+    uploaded = true;
+    takeHeapReferences();
+    return true;
+}
+
+void GuestBufferMemory::TakeSpace(GuestBufferMemory& source) {
+    Require(!prepared && !uploaded && regions.empty() && lease.empty() && space == nullptr, "an address template use must start from an empty upload");
+    Require(source.SpaceOnly(), "only an upload served by its address space alone hands it over");
+    writes = source.writes;
+    heapReferences = std::move(source.heapReferences);
+    source.heapReferences.clear();
+    space = std::move(source.space);
+    source.space.reset();
+    importsEpoch = source.importsEpoch;
+    prepared = true;
+    uploaded = true;
 }
 
 void GuestBufferMemory::validate(std::uint64_t address, std::size_t bytes) const {

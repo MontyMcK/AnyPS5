@@ -13,6 +13,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <span>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -25,6 +26,8 @@ namespace AgcDriver::Graphics {
 class Recorder;
 
 void FlushCachedTextures(VkDevice device);
+// Debug aid: every cached storage image's first mip into `directory` (see StorageTexture::DumpBaseLevel).
+std::size_t DumpCachedStorageImages(VkDevice device, const std::string& directory, std::span<const std::uint64_t> addresses = {}, std::optional<std::uint32_t> minimumWidth = {});
 void ClearCachedTextures(VkDevice device);
 struct LookupMemoCounts {
     std::uint64_t hits;
@@ -177,7 +180,9 @@ public:
     // Without `dataWords` the ShaderData and FlattenedSrt descriptor words stay out of the key
     // (their count and size remain): a compute template then serves dispatches whose constants
     // differ, and the hit refreshes its data buffers with the dispatch's words (RefreshData).
-    static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false);
+    static std::vector<std::uint32_t> ContentKey(const CompiledShader& shader, bool dataWords = true, bool movableBuffers = false, bool movableImages = false);
+    static bool MovableImages();
+    bool SameImageWords(std::span<const CompiledShader> shaders) const;
     // Records the shader's ShaderData and FlattenedSrt words into this object's data buffers
     // (vkCmdUpdateBuffer, a transfer write the caller's pre-dispatch barrier makes visible; a
     // buffer already holding the words is left alone). Returns whether anything was recorded. With
@@ -187,6 +192,24 @@ public:
     // ranges are fixed by the build), so a Revalidate's collects on the same worker are memo hits.
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
+    bool AddressReusable() const { return addressReusable; }
+    static bool AddressTemplates();
+    enum class AddressMiss : std::size_t { None, Replaced, Imports, Proof, Moved, Outside, MovedOutside, Count };
+    static std::shared_ptr<ShaderResources> AddressUse(const std::shared_ptr<ShaderResources>& source, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, AddressMiss& miss);
+    static std::shared_ptr<ShaderResources> DetachAddressUse(const std::shared_ptr<ShaderResources>& source);
+    struct AddressTemplateStats {
+        std::uint64_t hits = 0;
+        std::uint64_t detached = 0;
+        std::array<std::uint64_t, static_cast<std::size_t>(AddressMiss::Count)> misses{};
+        std::uint64_t movedBuffers = 0;
+        std::uint64_t timedHits = 0;
+        double movedUs = 0;
+        double spaceUs = 0;
+        double proofUs = 0;
+        double finishUs = 0;
+        double setUs = 0;
+    };
+    static AddressTemplateStats AddressTemplateCounters();
     // `shaders` are the stages the object was built from, in build order (a recorded draw's vertex
     // and fragment stages, or one compute stage): their bindings are walked like the build did.
     // How a Revalidate proved (or refused) the object, for the [recipe] line: the proof path taken
@@ -197,7 +220,7 @@ public:
         ProofPath path = ProofPath::Fast;
         ProofFailure failure = ProofFailure::None;
     };
-    bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr);
+    bool Revalidate(std::span<const CompiledShader> shaders, ProofReport* report = nullptr, bool movedImagesRebound = false);
     bool Revalidate(const CompiledShader& shader, ProofReport* report = nullptr) { return Revalidate(std::span<const CompiledShader>(&shader, 1), report); }
     // The proof a recipe hit runs on its template (design_cpu_final M4): Revalidate by that name.
     bool ProveCurrent(std::span<const CompiledShader> shaders, ProofReport* report = nullptr) { return Revalidate(shaders, report); }
@@ -347,6 +370,29 @@ private:
     void prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
     VkDescriptorBufferInfo descriptor(Allocation& allocation);
     void noteReusable();
+    struct AddressUseTag {};
+    ShaderResources(AddressUseTag, const std::shared_ptr<ShaderResources>& source);
+    void noteAddressReusable();
+    bool writeAddressSet(std::span<const MovedBuffer> moved);
+    std::optional<std::vector<MovedBuffer>> movedBuffers(std::span<const CompiledShader> shaders, Recorder* recorder, bool dataOnly) const;
+    struct AddressWrite {
+        VkWriteDescriptorSet write;
+        std::size_t first;
+        bool image;
+    };
+    bool drawBuild = false;
+    bool addressReusable = false;
+    bool recycledSet = false;
+    std::uint64_t addressSpaceSerial = 0;
+    std::shared_ptr<const ShaderResources> addressSource;
+    std::vector<AddressWrite> addressWrites;
+    std::vector<VkDescriptorBufferInfo> addressBuffers;
+    std::vector<VkDescriptorImageInfo> addressImages;
+    std::vector<std::size_t> addressFaults;
+    std::vector<std::size_t> addressInfos;
+    std::vector<std::size_t> addressTextureSlots;
+    std::vector<std::pair<std::size_t, VkDescriptorImageInfo>> movedImageViews;
+    std::vector<std::shared_ptr<Buffer>> addressData;
     void reportDescriptorCaches() const;
     // What a sampled texture was proved current against when the build (or the last full Revalidate)
     // looked it up, so the next Revalidate can repeat the proof from write stamps and the DCC keys
@@ -366,6 +412,10 @@ private:
         // Storage-sourced textures: the image the view follows (kept alive by the texture).
         const StorageTexture* source = nullptr;
         bool valid = false;
+        bool depth = false;
+        std::array<std::uint32_t, 8> words{};
+        std::size_t wordCount = 0;
+        VkComponentMapping components{};
     };
     void captureValidation();
     // A surface of this object the fast proof found a foreign image pending over: the element
@@ -401,10 +451,12 @@ private:
     OwnRefreshFallback refreshOwnObjects(std::span<const CompiledShader> shaders, std::span<PendingOverlap> overlapping);
     // Today's per-element walk (APS5_NO_EPOCH_REVALIDATE=1).
     bool fastRevalidateEach();
+    const std::vector<bool>* fastSkip = nullptr;
     Context context;
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;
     std::unique_ptr<BdaResources> bda;
+    bool storesThroughAddresses = true;
     bool usesBda = false;
     bool usesFaultBuffer = false;
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;
@@ -421,10 +473,14 @@ private:
     std::vector<std::shared_ptr<Texture>> textures;
     std::vector<bool> textureFirstLayer;
     std::vector<bool> textureBaseLevel;
+    std::vector<std::array<std::uint32_t, 8>> textureWords;
+    std::vector<bool> textureDepthCompare;
+    std::vector<bool> textureUnnormalized;
     std::vector<std::shared_ptr<StorageTexture>> storageTextures;
     std::vector<std::uint32_t> storageMips;
     std::vector<std::uint64_t> storageKeys;
     std::vector<bool> storageFirstLayer;
+    std::vector<std::uint32_t> storageLayers;
     std::vector<bool> storageWritten;
     std::vector<bool> storageAtomic;
     std::vector<bool> storageAtomic64;

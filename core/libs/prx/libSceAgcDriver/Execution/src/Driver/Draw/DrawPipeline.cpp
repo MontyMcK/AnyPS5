@@ -58,8 +58,113 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
+bool DrawPipeline::SplitDraws() {
+    static const bool enabled = std::getenv("APS5_SPLIT_DRAWS") != nullptr && Depth() != 0;
+    return enabled;
+}
+
+std::size_t DrawPipeline::PrepWorkers() {
+    static const std::size_t workers = [] {
+        const char* text = std::getenv("APS5_SPLIT_DRAWS");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 1ull;
+        return static_cast<std::size_t>(std::clamp<unsigned long long>(value, 1, 16));
+    }();
+    return workers;
+}
+
+std::uint64_t& DrawPipeline::PrepSequence() {
+    static thread_local std::uint64_t sequence = 0;
+    return sequence;
+}
+
+bool& DrawPipeline::PrepEnqueued() {
+    static thread_local bool enqueued = false;
+    return enqueued;
+}
+
+void DrawPipeline::Prepare(Commit job) {
+    std::unique_lock lock(prepMutex);
+    const auto room = Depth() * PrepWorkers();
+    if (prepOutstanding.load(std::memory_order_relaxed) >= room) {
+        const auto start = std::chrono::steady_clock::now();
+        prepIdle.wait(lock, [&] { return prepOutstanding.load(std::memory_order_relaxed) < room; });
+        prepWaitNs += elapsedNs(start);
+    }
+    prepItems.emplace_back(prepNextSequence++, std::move(job));
+    prepOutstanding.fetch_add(1, std::memory_order_release);
+    while (prepThreads.size() < PrepWorkers()) prepThreads.emplace_back([this] { prepRun(); });
+    prepWake.notify_one();
+}
+
+void DrawPipeline::waitPrepTurn(std::uint64_t sequence) {
+    std::unique_lock lock(prepMutex);
+    prepTurnChanged.wait(lock, [&] { return prepTurn == sequence; });
+}
+
+void DrawPipeline::finishPrepTurn(std::uint64_t sequence) {
+    std::lock_guard lock(prepMutex);
+    if (prepTurn == sequence) ++prepTurn;
+    prepTurnChanged.notify_all();
+}
+
+void DrawPipeline::prepRun() {
+    Active() = true;
+    for (;;) {
+        std::pair<std::uint64_t, Commit> job;
+        {
+            std::unique_lock lock(prepMutex);
+            prepWake.wait(lock, [&] { return !prepItems.empty(); });
+            job = std::move(prepItems.front());
+            prepItems.pop_front();
+        }
+        PrepSequence() = job.first;
+        PrepEnqueued() = false;
+        const auto start = std::chrono::steady_clock::now();
+        bool failed = false;
+        try {
+            job.second();
+        } catch (const std::exception& error) {
+            failed = true;
+            static std::atomic<std::uint64_t> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[draw] split draw preparation failed: %.200s\n", error.what());
+        } catch (...) {
+            failed = true;
+        }
+        if (!PrepEnqueued()) {
+            waitPrepTurn(job.first);
+            finishPrepTurn(job.first);
+        }
+        PrepSequence() = 0;
+        const auto spent = elapsedNs(start);
+        std::lock_guard lock(prepMutex);
+        ++prepJobs;
+        prepNs += spent;
+        if (failed) ++prepFailures;
+        prepOutstanding.fetch_sub(1, std::memory_order_release);
+        prepIdle.notify_all();
+    }
+}
+
+void DrawPipeline::drainPrep() {
+    if (prepOutstanding.load(std::memory_order_acquire) == 0 || OnPrepThread()) return;
+    std::unique_lock lock(prepMutex);
+    prepIdle.wait(lock, [&] { return prepOutstanding.load(std::memory_order_relaxed) == 0; });
+}
+
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    drainPrep();
+    const auto sequence = PrepSequence();
+    if (sequence != 0 && !PrepEnqueued()) waitPrepTurn(sequence);
+    struct TurnRelease {
+        DrawPipeline& pipeline;
+        std::uint64_t sequence;
+        ~TurnRelease() {
+            if (sequence == 0 || PrepEnqueued()) return;
+            PrepEnqueued() = true;
+            pipeline.finishPrepTurn(sequence);
+        }
+    } release{*this, sequence};
     std::unique_lock lock(mutex);
     rethrowFailure();
     if (items.size() >= Depth()) {
@@ -103,6 +208,11 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto perDraw = enqueued == 0 ? 0.0 : static_cast<double>(fullWaitNs) / 1e3 / static_cast<double>(enqueued);
     const auto queued = enqueued == 0 ? 0.0 : static_cast<double>(depthSum) / static_cast<double>(enqueued);
     std::fprintf(stderr, "[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, drainText.c_str());
+    if (SplitDraws()) {
+        std::lock_guard prepLock(prepMutex);
+        std::fprintf(stderr, "[draw] split preparation (10 s): %llu draws at %.1f us each, %llu failed, %.1f ms waiting for room\n", static_cast<unsigned long long>(prepJobs), prepJobs == 0 ? 0.0 : static_cast<double>(prepNs) / 1e3 / static_cast<double>(prepJobs), static_cast<unsigned long long>(prepFailures), static_cast<double>(prepWaitNs) / 1e6);
+        prepJobs = prepNs = prepWaitNs = prepFailures = 0;
+    }
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = 0;
     drains = {};
     drainWaitNs = {};
@@ -146,6 +256,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     if (!Busy()) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     const auto start = std::chrono::steady_clock::now();
+    drainPrep();
     std::unique_lock lock(mutex);
     ++idleWaiters;
     idle.wait(lock, [&] { return items.empty(); });
@@ -159,6 +270,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
 
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > 8) return std::nullopt;
+    if (prepOutstanding.load(std::memory_order_acquire) != 0 && !OnPrepThread()) drainPrep();
     const auto end = address + bytes;
     std::lock_guard lock(mutex);
     for (auto item = items.rbegin(); item != items.rend(); ++item) {
@@ -170,6 +282,17 @@ std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, s
         return value;
     }
     return std::nullopt;
+}
+
+std::pair<std::uint64_t, std::uint64_t> DrawPipeline::OverlapRange(std::uint64_t address, std::size_t bytes) {
+    const auto end = address + bytes;
+    std::lock_guard lock(mutex);
+    for (const auto& item : items) {
+        for (const auto& [begin, limit] : item.writes) {
+            if (address < limit && begin < end) return {begin, limit};
+        }
+    }
+    return {0, 0};
 }
 
 bool DrawPipeline::Overlaps(std::uint64_t address, std::size_t bytes) {

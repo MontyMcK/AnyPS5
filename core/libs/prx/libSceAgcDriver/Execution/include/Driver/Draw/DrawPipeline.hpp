@@ -32,8 +32,16 @@ public:
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {});
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
-    bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0; }
+    bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0 || prepOutstanding.load(std::memory_order_acquire) != 0; }
+    static bool SplitDraws();
+    void Prepare(Commit job);
+    void DrainPrep() { drainPrep(); }
+    bool OnPrepThread() const { return PrepSequence() != 0; }
+    static std::size_t PrepWorkers();
+    static std::uint64_t& PrepSequence();
+    static bool& PrepEnqueued();
     bool Overlaps(std::uint64_t address, std::size_t bytes);
+    std::pair<std::uint64_t, std::uint64_t> OverlapRange(std::uint64_t address, std::size_t bytes);
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
 
 private:
@@ -45,6 +53,10 @@ private:
     };
     DrawPipeline() = default;
     void run();
+    void prepRun();
+    void drainPrep();
+    void waitPrepTurn(std::uint64_t sequence);
+    void finishPrepTurn(std::uint64_t sequence);
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
 
@@ -67,6 +79,19 @@ private:
     std::array<std::uint64_t, 257> drainOpcodes{};
     std::uint64_t depthSum = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+    std::mutex prepMutex;
+    std::condition_variable prepWake;
+    std::condition_variable prepIdle;
+    std::deque<std::pair<std::uint64_t, Commit>> prepItems;
+    std::atomic<std::size_t> prepOutstanding{0};
+    std::vector<std::thread> prepThreads;
+    std::uint64_t prepNextSequence = 1;
+    std::uint64_t prepTurn = 1;
+    std::condition_variable prepTurnChanged;
+    std::uint64_t prepJobs = 0;
+    std::uint64_t prepNs = 0;
+    std::uint64_t prepWaitNs = 0;
+    std::uint64_t prepFailures = 0;
 };
 
 }

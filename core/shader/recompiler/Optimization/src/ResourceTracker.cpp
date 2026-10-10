@@ -11,8 +11,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <span>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -137,7 +139,7 @@ public:
                 plan.handle->ReplaceArgument(dword, plan.key);
             }
             for (const auto index : plan.memory) {
-                m_program.Resources().memoryInfo[index].planningOnly = true;
+                if (plan.planningReads) m_program.Resources().memoryInfo[index].planningOnly = true;
             }
         }
         std::erase_if(m_program.Metadata().dynamicReads, [&](IrValue* value) {
@@ -171,6 +173,7 @@ private:
         std::array<IrValue*, 8> roots {};
         std::array<std::uint32_t, 8> memory {};
         std::array<const IrValue*, 8> reads {};
+        bool planningReads = true;
     };
 
     void MakeSource(const IrValue& handle, std::uint32_t width, bool sampler, bool sampleAdjust, DescriptorSource& descriptor) {
@@ -333,9 +336,10 @@ private:
     }
 
     // The table entry offset `key * 32` (a shift or a multiply), optionally plus an immediate.
-    static bool MatchTableOffset(IrValue* value, IrValue*& key, std::uint32_t& entryOffset) {
+    static bool MatchTableOffset(IrValue* value, IrValue*& key, std::uint32_t& entryOffset, std::uint32_t& stride) {
         value = value->Resolve();
         entryOffset = 0;
+        stride = 32;
         if (value->Opcode() == IrOpcode::IAdd32 && value->ArgumentCount() == 2u) {
             std::uint32_t immediate = 0;
             if (immediateU32(value->Argument(0), immediate)) {
@@ -352,10 +356,11 @@ private:
         }
         std::uint32_t scale = 0;
         if (value->Opcode() == IrOpcode::ShiftLeftLogical32) {
-            if (!immediateU32(value->Argument(1), scale) || scale != 5u) {
+            if (!immediateU32(value->Argument(1), scale) || scale < 5u || scale > 10u) {
                 return false;
             }
             key = value->Argument(0)->Resolve();
+            stride = 1u << scale;
             return true;
         }
         if (value->Opcode() != IrOpcode::IMul32) {
@@ -368,15 +373,18 @@ private:
         } else {
             return false;
         }
-        return scale == 32u;
+        stride = scale;
+        return scale >= 32u && scale % 4u == 0u;
     }
 
     // A T# whose eight dwords are scalar reads of one V# (the table) at `entryOffset + key * 32`
     // with a wave-uniform runtime key: a bindless image table. The key stays an ordinary value
     // (the SPIR-V selects the bound slot from it); the eight reads become planning-only.
     bool TryMakeTableImage(IrValue& handle, IndirectImagePlan& plan) {
+        static const bool traceTable = std::getenv("APS5_TRACE_CHAIN_IMAGES") != nullptr;
+        const auto tableReject = [&](int reason) { if (traceTable) std::fprintf(stderr, "[table-image] rejected at check %d\n", reason); return false; };
         if (handle.Opcode() != IrOpcode::GetImageResource || handle.ArgumentCount() != 8u) {
-            return false;
+            return tableReject(1);
         }
 
         std::array<IrValue*, 8> heapReads {};
@@ -388,22 +396,22 @@ private:
             std::uint32_t memoryIndex = 0;
             const MemoryInfo* memory = ScalarReadMemory(*heapReads[dword], memoryIndex);
             if (memory == nullptr || !MemoryIndexBelongsTo(memoryIndex, *heapReads[dword])) {
-                return false;
+                return tableReject(2);
             }
             if (dword == 0u) {
                 immediateOffset = memory->offset;
             } else if (memory->offset != immediateOffset + dword * sizeof(std::uint32_t)) {
-                return false;
+                return tableReject(3);
             }
             IrValue* currentHandle = heapReads[dword]->Argument(0)->Resolve();
-            if (heapHandle != nullptr && currentHandle != heapHandle) {
-                return false;
+            if (heapHandle != nullptr && currentHandle != heapHandle && !EquivalentValue(m_program.Resources(), currentHandle, heapHandle)) {
+                return tableReject(4);
             }
             heapHandle = currentHandle;
             if (dword == 0u) {
                 heapOffset = heapReads[dword]->Argument(1)->Resolve();
             } else if (!EquivalentValue(m_program.Resources(), heapOffset, heapReads[dword]->Argument(1))) {
-                return false;
+                return tableReject(5);
             }
             plan.memory[dword] = memoryIndex;
             plan.reads[dword] = heapReads[dword];
@@ -411,28 +419,31 @@ private:
 
         IrValue* key = nullptr;
         std::uint32_t entryOffset = 0;
-        if (!MatchTableOffset(heapOffset, key, entryOffset) || key->Type() != IrType::U32) {
-            return false;
+        std::uint32_t entryStride = 32;
+        if (!MatchTableOffset(heapOffset, key, entryOffset, entryStride) || key->Type() != IrType::U32) {
+            if (traceTable) std::fprintf(stderr, "[table-image] offset %s stride %u key type %u\n", std::string(IrOpcodeName(heapOffset->Resolve()->Opcode())).c_str(), entryStride, key != nullptr ? static_cast<unsigned>(key->Type()) : 999u);
+            return tableReject(6);
         }
         entryOffset += immediateOffset;
 
         const std::array<const IrValue*, 1> imageUsers {&handle};
         for (const auto* read : heapReads) {
             if (!usesOnly(*read, imageUsers)) {
-                return false;
+                return tableReject(7);
             }
         }
 
         DescriptorSource heapSource;
         std::uint32_t heapSourceIndex = 0;
         if (!MakeRuntimeBufferSource(*heapHandle, heapSourceIndex, heapSource)) {
-            return false;
+            return tableReject(8);
         }
 
         DescriptorSource::IndirectImage table;
         table.heapSource = heapSourceIndex;
         table.materialSource = heapSourceIndex;
         table.entryOffset = entryOffset;
+        table.entryStride = entryStride;
         DescriptorSource materialSource = heapSource;
         std::uint32_t materialMemoryIndex = 0;
         const MemoryInfo* materialMemory = ScalarReadMemory(*key, materialMemoryIndex);
@@ -461,6 +472,148 @@ private:
         plan.source = InternSource(imageSource);
         plan.key = key;
         plan.roots = imageSource.dwords;
+        return true;
+    }
+
+    bool MatchSelectorOffset(IrValue* value, IrValue* selector, std::uint32_t& stride, std::uint32_t& offset) const {
+        value = value->Resolve();
+        offset = 0;
+        if (value->Opcode() == IrOpcode::IAdd32 && value->ArgumentCount() == 2u) {
+            std::uint32_t immediate = 0;
+            if (immediateU32(value->Argument(0), immediate)) {
+                value = value->Argument(1)->Resolve();
+            } else if (immediateU32(value->Argument(1), immediate)) {
+                value = value->Argument(0)->Resolve();
+            } else {
+                return false;
+            }
+            offset = immediate;
+        }
+        if (value->ArgumentCount() != 2u) return false;
+        std::uint32_t scale = 0;
+        if (value->Opcode() == IrOpcode::ShiftLeftLogical32) {
+            if (!immediateU32(value->Argument(1), scale) || scale >= 16u || !EquivalentValue(m_program.Resources(), value->Argument(0), selector)) return false;
+            stride = 1u << scale;
+            return true;
+        }
+        if (value->Opcode() != IrOpcode::IMul32) return false;
+        if (immediateU32(value->Argument(1), scale) && EquivalentValue(m_program.Resources(), value->Argument(0), selector)) {
+            stride = scale;
+        } else if (immediateU32(value->Argument(0), scale) && EquivalentValue(m_program.Resources(), value->Argument(1), selector)) {
+            stride = scale;
+        } else {
+            return false;
+        }
+        return stride != 0u;
+    }
+
+    bool FindChainRecord(const IrValue& handle, std::uint32_t width, IrValue*& selector, std::uint32_t& recordIndex, DescriptorSource& recordSource, std::uint32_t& stride) {
+        static const bool enabled = std::getenv("APS5_NO_CHAIN_IMAGES") == nullptr;
+        if (!enabled || handle.ArgumentCount() != width) return false;
+        static const bool traceRejects = std::getenv("APS5_TRACE_CHAIN_IMAGES") != nullptr;
+        const auto reject = [&](const char* reason) { if (traceRejects) std::fprintf(stderr, "[chain-image] rejected: %s\n", reason); return false; };
+        std::vector<IrValue*> stack;
+        std::unordered_set<const IrValue*> visited;
+        for (std::uint32_t dword = 0; dword < width; dword++) stack.push_back(handle.Argument(dword)->Resolve());
+        selector = nullptr;
+        std::vector<IrValue*> recordReads;
+        while (!stack.empty()) {
+            IrValue* value = stack.back();
+            stack.pop_back();
+            if (!visited.insert(value).second) continue;
+            if (visited.size() > 16384u) {
+                if (traceRejects) {
+                    std::map<std::string, std::uint32_t> histogram;
+                    for (const auto* seen : visited) ++histogram[std::string(IrOpcodeName(seen->Opcode()))];
+                    std::string text;
+                    for (const auto& [name, count] : histogram) if (count > 200u) text += " " + name + "=" + std::to_string(count);
+                    std::fprintf(stderr, "[chain-image] large graph:%s\n", text.c_str());
+                }
+                return reject("dependency graph too large");
+            }
+            if (value->Opcode() == IrOpcode::ReadFirstLane) {
+                if (selector != nullptr && selector != value && !EquivalentValue(m_program.Resources(), selector, value)) return reject("several distinct readfirstlane selectors");
+                selector = value;
+                continue;
+            }
+            if (value->Opcode() == IrOpcode::ReadConstBuffer && value->ArgumentCount() == 2u) recordReads.push_back(value);
+            if (value->Opcode() == IrOpcode::Phi) {
+                for (std::uint32_t argument = 0; argument < value->ArgumentCount(); argument++) {
+                    IrValue* incoming = value->Argument(argument)->Resolve();
+                    const auto op = incoming->Opcode();
+                    if (op == IrOpcode::ReadConstBuffer || op == IrOpcode::LoadAddressU32 || op == IrOpcode::GetAddressResource || op == IrOpcode::Phi) stack.push_back(incoming);
+                }
+                continue;
+            }
+            for (std::uint32_t argument = 0; argument < value->ArgumentCount(); argument++) stack.push_back(value->Argument(argument)->Resolve());
+        }
+        if (selector == nullptr) return reject("no readfirstlane selector in the descriptor dependencies");
+        if (selector->Type() != IrType::U32) return reject("the readfirstlane selector is not u32");
+        IrValue* record = nullptr;
+        stride = 0;
+        for (IrValue* read : recordReads) {
+            std::uint32_t offset = 0;
+            std::uint32_t candidate = 0;
+            if (!MatchSelectorOffset(read->Argument(1), selector, candidate, offset)) continue;
+            if (record != nullptr && (read->Argument(0)->Resolve() != record->Argument(0)->Resolve() || candidate != stride)) return reject("several record buffers or strides");
+            record = read;
+            stride = candidate;
+        }
+        if (record == nullptr) return reject("no record read indexed by the selector");
+        if (!MakeRuntimeBufferSource(*record->Argument(0)->Resolve(), recordIndex, recordSource)) return reject("record buffer descriptor is not a runtime value");
+        return true;
+    }
+
+    bool TryMakeChainImage(IrValue& handle, IndirectImagePlan& plan) {
+        if (handle.Opcode() != IrOpcode::GetImageResource) return false;
+        static const bool traceRejects = std::getenv("APS5_TRACE_CHAIN_IMAGES") != nullptr;
+        const auto reject = [&](const char* reason) { if (traceRejects) std::fprintf(stderr, "[chain-image] rejected: %s\n", reason); return false; };
+        IrValue* selector = nullptr;
+        std::uint32_t recordIndex = 0;
+        DescriptorSource recordSource;
+        std::uint32_t stride = 0;
+        if (!FindChainRecord(handle, 8u, selector, recordIndex, recordSource, stride)) return false;
+        const std::array<const IrValue*, 1> imageUsers {&handle};
+        for (std::uint32_t dword = 0; dword < 8u; dword++) {
+            IrValue* read = handle.Argument(dword)->Resolve();
+            if (read->Opcode() != IrOpcode::LoadAddressU32 && read->Opcode() != IrOpcode::ReadConstBuffer) return reject("a descriptor dword is not a memory read");
+            const auto index = read->Flags<MemoryFlags>().index;
+            if (index >= m_program.Resources().memoryInfo.size()) return reject("a descriptor read has no memory metadata");
+            if (!usesOnly(*read, imageUsers) || !MemoryIndexBelongsTo(index, *read)) plan.planningReads = false;
+            plan.memory[dword] = index;
+            plan.reads[dword] = read;
+        }
+        DescriptorSource::IndirectImage table;
+        table.chain = true;
+        table.heapSource = recordIndex;
+        table.materialSource = recordIndex;
+        table.selectorStride = stride;
+        DescriptorSource imageSource;
+        imageSource.dwordCount = 8u;
+        for (std::uint32_t dword = 0; dword < 8u; dword++) imageSource.dwords[dword] = handle.Argument(dword)->Resolve();
+        imageSource.indirectImage = table;
+        plan.handle = &handle;
+        plan.source = InternSource(imageSource);
+        plan.key = selector;
+        for (std::uint32_t dword = 0; dword < 4u; dword++) plan.roots[dword] = recordSource.dwords[dword];
+        for (std::uint32_t dword = 4u; dword < 8u; dword++) plan.roots[dword] = recordSource.dwords[dword - 4u];
+        static const bool trace = std::getenv("APS5_TRACE_CHAIN_IMAGES") != nullptr;
+        if (trace) std::fprintf(stderr, "[chain-image] image handle planned, record stride %u\n", stride);
+        return true;
+    }
+
+    bool TryMakeChainSampler(const IrValue& handle, DescriptorSource& descriptor) {
+        IrValue* selector = nullptr;
+        std::uint32_t recordIndex = 0;
+        DescriptorSource recordSource;
+        std::uint32_t stride = 0;
+        if (handle.Opcode() != IrOpcode::GetSamplerResource || !FindChainRecord(handle, descriptor.dwordCount, selector, recordIndex, recordSource, stride)) return false;
+        DescriptorSource::IndirectImage table;
+        table.chain = true;
+        table.heapSource = recordIndex;
+        table.materialSource = recordIndex;
+        table.selectorStride = stride;
+        descriptor.indirectImage = table;
         return true;
     }
 
@@ -756,7 +909,7 @@ private:
                 IrValue* handle = inst->Argument(0)->Resolve();
                 const IndirectImagePlan* planned = FindIndirectImage(*handle);
                 IndirectImagePlan plan;
-                if (planned == nullptr && !TryMakeTableImage(*handle, plan)) {
+                if (planned == nullptr && !TryMakeTableImage(*handle, plan) && !TryMakeChainImage(*handle, plan)) {
                     continue;
                 }
                 // A store through a table would mark every bound slot pending write-back.
@@ -788,7 +941,7 @@ private:
             }
             badDword = 0;
         }
-        if (!ValidateSource(descriptor, badDword)) {
+        if (!ValidateSource(descriptor, badDword) && !(expected == IrOpcode::GetSamplerResource && TryMakeChainSampler(*handle, descriptor))) {
             fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
         }
         source = InternSource(descriptor);

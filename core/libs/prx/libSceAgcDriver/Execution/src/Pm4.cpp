@@ -605,6 +605,22 @@ std::optional<MemoryCopy> DecodeMemoryCopy(std::span<const std::uint32_t> packet
     return MemoryCopy{source, destination, bytes};
 }
 
+std::optional<MemoryCopy> DecodeGdsCopy(std::span<const std::uint32_t> packet) {
+    if (packet.size() != 7 || ((packet[0] >> 8u) & 0xffu) != 0x50) return std::nullopt;
+    const auto sourceSelect = dmaSource(packet);
+    const auto destinationSelect = dmaDestination(packet);
+    if (sourceSelect != DmaSelectGds && destinationSelect != DmaSelectGds) return std::nullopt;
+    if ((!memorySelector(sourceSelect) && sourceSelect != DmaSelectGds) || (!memorySelector(destinationSelect) && destinationSelect != DmaSelectGds)) return std::nullopt;
+    const std::size_t bytes = packet[6] & 0x3ffffffu;
+    if (bytes == 0 || bytes % 4 != 0) return std::nullopt;
+    if (sourceSelect == DmaSelectGds && !gdsRange(packet[2], bytes)) return std::nullopt;
+    if (destinationSelect == DmaSelectGds && !gdsRange(packet[4], bytes)) return std::nullopt;
+    const auto source = sourceSelect == DmaSelectGds ? GdsAddress() + packet[2] : address(packet[2], packet[3]);
+    const auto destination = destinationSelect == DmaSelectGds ? GdsAddress() + packet[4] : address(packet[4], packet[5]);
+    if (source % 4 != 0 || destination % 4 != 0 || (source < destination + bytes && destination < source + bytes)) return std::nullopt;
+    return MemoryCopy{source, destination, bytes};
+}
+
 bool UsesGpuCacheBarrier(std::span<const std::uint32_t> packet) {
     require(!packet.empty() && ((packet[0] >> 8u) & 0xffu) == 0x58, "cache barrier requires ACQUIRE_MEM");
     Validate(packet, 0);

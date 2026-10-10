@@ -7,14 +7,22 @@
 
 namespace ShaderRecompiler::BdaAbi {
 
-inline constexpr std::uint32_t Version = 1;
+inline constexpr std::uint32_t Version = 2;
 inline constexpr std::uint32_t Read = 1;
 inline constexpr std::uint32_t Write = 2;
 
+// buckets: entries of the index after the ranges, or 0. The index is a BucketHeader and, per
+// bucket of 1 << shift bytes from base, the range indices [low, high) a lookup in it searches.
 struct Header {
     std::uint32_t version;
     std::uint32_t count;
     std::uint32_t entryBytes;
+    std::uint32_t buckets;
+};
+
+struct BucketHeader {
+    std::uint64_t base;
+    std::uint32_t shift;
     std::uint32_t reserved;
 };
 
@@ -41,6 +49,7 @@ struct Fault {
 
 static_assert(std::is_standard_layout_v<Header> && std::is_trivially_copyable_v<Header> && sizeof(Header) == 16);
 static_assert(std::is_standard_layout_v<Range> && std::is_trivially_copyable_v<Range> && sizeof(Range) == 32);
+static_assert(std::is_standard_layout_v<BucketHeader> && sizeof(BucketHeader) == 16);
 static_assert(offsetof(Range, deviceAddress) == 16 && offsetof(Range, permissions) == 24);
 static_assert(std::is_standard_layout_v<Fault> && std::is_trivially_copyable_v<Fault> && sizeof(Fault) == 32);
 static_assert(offsetof(Fault, address) == 8 && offsetof(Fault, instruction) == 24);

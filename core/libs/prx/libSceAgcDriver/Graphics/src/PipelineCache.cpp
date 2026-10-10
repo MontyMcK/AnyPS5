@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "ShaderCacheDirectory.hpp"
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -107,6 +108,10 @@ void PipelineCache::save(bool final) {
     const auto getData = context.Function<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData");
     std::size_t size = 0;
     if (getData(context.device, cache, &size, nullptr) != VK_SUCCESS || size == 0 || size == savedBytes) return;
+    // A large cache is rewritten whole: between the teardown saves, only growth of a sixteenth (at
+    // least 16 MiB) or two minutes since the last save pays for another copy, hash and write.
+    const auto now = std::chrono::steady_clock::now();
+    if (!final && size > savedBytes && size - savedBytes < std::max<std::size_t>(savedBytes / 16u, std::size_t{16} << 20u) && now - savedAt < std::chrono::minutes(2)) return;
     std::vector<std::byte> file(sizeof(FileHeader) + size);
     const auto result = getData(context.device, cache, &size, file.data() + sizeof(FileHeader));
     if (result != VK_SUCCESS && result != VK_INCOMPLETE) return;
@@ -119,6 +124,7 @@ void PipelineCache::save(bool final) {
         return;
     }
     savedBytes = size;
+    savedAt = std::chrono::steady_clock::now();
     if (final || profiling()) std::fprintf(stderr, "[pipeline-cache] saved %.1f KiB to %s in %.1f ms%s\n", static_cast<double>(size) / 1024.0, path.string().c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), final ? " (teardown)" : "");
 }
 

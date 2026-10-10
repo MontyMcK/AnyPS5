@@ -1,4 +1,7 @@
 #include <cstdint>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 #include <cstring>
 #include <new>
@@ -87,7 +90,17 @@ int32_t APS5_VABI sceJpegDecCreate(const JpegDecCreateParam* param, void* memory
     return 0;
 }
 
+static int32_t decodeJpeg(void* handle, const JpegDecDecodeParam* param, JpegDecImageInfo* image_info);
+
 int32_t APS5_VABI sceJpegDecDecode(void* handle, const JpegDecDecodeParam* param, JpegDecImageInfo* image_info) {
+    const auto result = decodeJpeg(handle, param, image_info);
+    static const bool trace = std::getenv("APS5_TRACE_IMAGE_DECODE") != nullptr;
+    static std::atomic<int> traced{0};
+    if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 300) std::fprintf(stderr, "[jpegdec] decode %u bytes -> 0x%08x\n", param != nullptr ? static_cast<unsigned>(param->jpeg_mem_size) : 0u, static_cast<unsigned>(result));
+    return result;
+}
+
+static int32_t decodeJpeg(void* handle, const JpegDecDecodeParam* param, JpegDecImageInfo* image_info) {
     const Context* context = toContext(handle);
     if (!context) return SCE_JPEG_DEC_ERROR_INVALID_HANDLE;
     (void)context;

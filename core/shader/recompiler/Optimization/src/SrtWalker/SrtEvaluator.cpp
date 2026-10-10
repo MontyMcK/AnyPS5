@@ -255,6 +255,10 @@ bool BasicEvaluator<TNode>::EvaluateInst(const TNode& inst, std::uint64_t& resul
         case IrOpcode::GetShaderBase: result = _runtime.shaderBase; return true;
         case IrOpcode::Phi: return EvaluatePhi(inst, result);
         case IrOpcode::ReadFirstLane: {
+            if (_runtime.firstLaneOverride.has_value()) {
+                result = *_runtime.firstLaneOverride;
+                return true;
+            }
             const TNode mask = inst.Argument(1);
             if constexpr (std::is_same_v<TNode, CompactNode>) {
                 static const bool reuse = std::getenv("APS5_SRT_MASK_REUSE") != nullptr;

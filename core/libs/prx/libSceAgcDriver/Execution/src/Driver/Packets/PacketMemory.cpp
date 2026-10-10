@@ -53,6 +53,9 @@ namespace AgcDriver::DriverDetail {
 bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool traceDma = std::getenv("APS5_TRACE_DMA") != nullptr;
+    const auto dmaStarted = std::chrono::steady_clock::now();
+    int dmaPath = 0;
     wroteOnGpu = false;
 
     bool orderedAlready = false;
@@ -96,6 +99,10 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         }
     }
     if (opcode == 0x50 && packet.size() >= 7) {
+        static const std::uint64_t traceWrite = [] { const char* text = std::getenv("APS5_TRACE_WRITE_ADDRESS"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
+        const auto dmaDestination = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
+        if (traceWrite != 0 && Pm4::DmaDestination(packet) != 1 && dmaDestination <= traceWrite && traceWrite < dmaDestination + (packet[6] & 0x3ffffffu)) std::fprintf(stderr, "[trace-write] DMA_DATA source %u dst 0x%llx+0x%x data/src 0x%08x over 0x%llx\n", Pm4::DmaSource(packet), static_cast<unsigned long long>(dmaDestination), packet[6] & 0x3ffffffu, packet[2], static_cast<unsigned long long>(traceWrite));
+        if (Pm4::DmaSource(packet) == 2 && Pm4::DmaDestination(packet) != 1) Graphics::TraceDepthMetadataFill(packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u), packet[6] & 0x3ffffffu, packet[2], true, "dma");
         if (Pm4::DmaSource(packet) == 2 && Pm4::DmaDestination(packet) != 1) Graphics::NoteDepthMetadataFill(packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u), packet[6] & 0x3ffffffu, packet[2]);
     }
     if (!drainAll && !endOfPipeInterrupt && (opcode == 0x49 || opcode == 0x37)) {
@@ -139,7 +146,24 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     }
 
     static const bool cpuStores = std::getenv("APS5_CPU_STORES") != nullptr;
-    if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
+    static const bool gdsCopies = std::getenv("APS5_GDS_COPY") != nullptr;
+    bool copiedGds = false;
+    if (!drainAll && !cpuStores && gdsCopies && opcode == 0x50 && packet.size() >= 7 && Pm4::DmaDestination(packet) == 1) {
+        if (const auto copy = Pm4::DecodeGdsCopy(packet); copy.has_value() && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes) && GuestMemory::Accessible(reinterpret_cast<const void*>(copy->destination), copy->bytes, true)) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            if (const auto localDevice = device.Load()) {
+                recordDeferredLabels(localDevice.get(), submission.queue);
+                const auto outcome = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, std::numeric_limits<std::size_t>::max(), std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
+                dmaPath = 20 + outcome.path;
+                if (outcome.path == 0 || outcome.path == 1 || outcome.path == 3) {
+                    wroteOnGpu = true;
+                    copiedGds = true;
+                }
+            }
+        }
+    }
+    if (!drainAll && !cpuStores && !copiedGds && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
         if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
@@ -159,6 +183,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 recordDeferredLabels(localDevice.get(), submission.queue);
                 const auto stamp = ++eventSerial;
                 const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue) : 4;
+                dmaPath = 100 + reason;
                 if (reason == 0 || reason == 1 || reason == 5 || reason == 6) noteLabelStore(store->address, bytes, stamp);
                 if (reason == 0 || reason == 5 || reason == 6) {
                     if (reason == 0) ++storesOnGpu;
@@ -182,6 +207,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 if (const auto localDevice = device.Load()) {
                     recordDeferredLabels(localDevice.get(), submission.queue);
                     const auto outcome = localDevice->CopyBuffer(copy->destination, copy->source, copy->bytes, 0, std::numeric_limits<std::size_t>::max(), 0, 0, submission.queue, [](std::span<const std::byte>, std::uint64_t) {});
+                    dmaPath = 10 + outcome.path;
                     if (outcome.path == 1 || outcome.path == 3) {
                         wroteOnGpu = true;
                         drained = false;
@@ -250,6 +276,11 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             draining->ReapRecorded(epoch);
             draining.reset();
         }
+    }
+    if (traceDma && opcode == 0x50 && packet.size() >= 7) {
+        static std::atomic<int> traced{0};
+        const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - dmaStarted).count();
+        if (traced.fetch_add(1, std::memory_order_relaxed) < 300) std::fprintf(stderr, "[dma] queue 0x%x src sel %u 0x%llx dst sel %u 0x%llx bytes 0x%x path %d drained %d took %.2f ms\n", submission.queue, Pm4::DmaSource(packet), static_cast<unsigned long long>(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u)), Pm4::DmaDestination(packet), static_cast<unsigned long long>(packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u)), packet[6] & 0x3ffffffu, dmaPath, drains ? 1 : 0, us / 1000.0);
     }
     return drains;
 }

@@ -1,4 +1,7 @@
 #include <cstdint>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstddef>
 #include <cstring>
 #include <new>
@@ -119,7 +122,17 @@ int32_t APS5_VABI scePngDecCreate(const PngDecCreateParam* param, void* memory_a
     return 0;
 }
 
+static int32_t decodePng(void* handle, const PngDecDecodeParam* param, PngDecImageInfo* image_info);
+
 int32_t APS5_VABI scePngDecDecode(void* handle, const PngDecDecodeParam* param, PngDecImageInfo* image_info) {
+    const auto result = decodePng(handle, param, image_info);
+    static const bool trace = std::getenv("APS5_TRACE_IMAGE_DECODE") != nullptr;
+    static std::atomic<int> traced{0};
+    if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 300) std::fprintf(stderr, "[pngdec] decode %u bytes -> 0x%08x\n", param != nullptr ? static_cast<unsigned>(param->png_mem_size) : 0u, static_cast<unsigned>(result));
+    return result;
+}
+
+static int32_t decodePng(void* handle, const PngDecDecodeParam* param, PngDecImageInfo* image_info) {
     const Context* context = toContext(handle);
     if (!context) return SCE_PNG_DEC_ERROR_INVALID_HANDLE;
     if (!param) return SCE_PNG_DEC_ERROR_INVALID_PARAM;

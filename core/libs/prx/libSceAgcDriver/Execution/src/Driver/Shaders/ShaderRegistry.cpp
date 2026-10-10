@@ -8,10 +8,12 @@
 #include <set>
 #include "prx/libc/include/general/LogMacros.hpp"
 #include "ControlFlow/GraphBuilder.hpp"
+#include "ControlFlow/UserDataCalls.hpp"
 #include "ControlFlow/Structurizer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Capture/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "CacheKey.hpp"
@@ -19,14 +21,47 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
 #include "CompiledVariant.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <list>
+#include <pthread.h>
+#include <thread>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 
 namespace AgcDriver::DriverDetail {
+
+static std::uint64_t CaptureValidationCode(const ShaderSnapshot& snapshot) {
+    static const char* directory = std::getenv("APS5_CAPTURE_VALIDATION");
+    if (directory == nullptr) return 0;
+    std::uint64_t hash = 14695981039346656037ull;
+    const auto bytes = std::as_bytes(std::span(snapshot.code));
+    for (const auto byte : bytes) hash = (hash ^ std::to_integer<unsigned char>(byte)) * 1099511628211ull;
+    static std::mutex mutex;
+    static std::set<std::uint64_t> captured;
+    static std::size_t written = 0;
+    std::lock_guard lock(mutex);
+    if (captured.contains(hash)) return hash;
+    if (captured.size() >= 4096 || bytes.size() > 64 * 1024 * 1024 - written) return hash;
+    char name[40];
+    std::snprintf(name, sizeof(name), "validation-%016llx.bin", static_cast<unsigned long long>(hash));
+    std::ofstream file(std::filesystem::path(directory) / name, std::ios::binary);
+    file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    file.close();
+    if (file) {
+        captured.insert(hash);
+        written += bytes.size();
+    }
+    return hash;
+}
 
 void ReuseShaderControlFlowValidation(ShaderSnapshot& snapshot, const ShaderSnapshot& previous) {
     if (snapshot.code != previous.code) return;
@@ -48,12 +83,15 @@ void ValidateShaderControlFlow(const ShaderSnapshot& snapshot, std::size_t codeO
         if (found->second) std::rethrow_exception(found->second);
         return;
     }
+    const auto codeHash = CaptureValidationCode(snapshot);
     const auto started = std::chrono::steady_clock::now();
     std::exception_ptr failure;
     try {
         const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(std::span(snapshot.code).subspan(codeOffset));
-        auto graph = ShaderRecompiler::GraphBuilder{}.Build(decoded);
-        ShaderRecompiler::Structurizer{}.Structurize(graph);
+        if (std::ranges::none_of(decoded.instructions, [](const auto& instruction) { return instruction.op == ShaderRecompiler::RdnaOpcode::SSwappcB64; })) {
+            auto graph = ShaderRecompiler::GraphBuilder{}.Build(decoded);
+            ShaderRecompiler::Structurizer{}.Structurize(graph);
+        }
     } catch (const std::bad_alloc&) {
         throw;
     } catch (const std::exception&) {
@@ -66,7 +104,7 @@ void ValidateShaderControlFlow(const ShaderSnapshot& snapshot, std::size_t codeO
         const auto count = ++validations;
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
         if (ms >= 10.0 || count <= 8 || count % 100 == 0)
-            ProfilePrint_nid_no_patch("[control-flow] validation=%llu code=0x%llx header=0x%llx offset=%zu words=%zu ms=%.3f failed=%d\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(snapshot.codeAddress), static_cast<unsigned long long>(snapshot.headerAddress), codeOffset, snapshot.code.size(), ms, failure != nullptr);
+            ProfilePrint_nid_no_patch("[control-flow] validation=%llu code=0x%llx header=0x%llx offset=%zu words=%zu ms=%.3f failed=%d type=%u hash=%016llx\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(snapshot.codeAddress), static_cast<unsigned long long>(snapshot.headerAddress), codeOffset, snapshot.code.size(), ms, failure != nullptr, snapshot.type, static_cast<unsigned long long>(codeHash));
     }
     if (failure) std::rethrow_exception(failure);
 }
@@ -142,6 +180,9 @@ struct ShaderPreparationTransaction::State {
     struct Change {
         std::shared_ptr<PreparedShaders> destination;
         PreparedShaderState prepared;
+        bool edited = false;
+        std::size_t baseEntries = 0;
+        std::size_t baseAbis = 0;
     };
     static std::mutex writers;
     static thread_local State* active;
@@ -170,15 +211,21 @@ PreparedShaderState& ShaderPreparationTransaction::Edit(const ShaderSnapshot& sn
     require(!committed, "shader preparation transaction is already committed");
     auto& changes = root->changes;
     const auto found = changes.find(snapshot.prepared.get());
-    if (found != changes.end()) return found->second.prepared;
+    if (found != changes.end()) {
+        found->second.edited = true;
+        return found->second.prepared;
+    }
     std::lock_guard lock(snapshot.prepared->mutex);
-    return changes.emplace(snapshot.prepared.get(), State::Change{snapshot.prepared, *snapshot.prepared}).first->second.prepared;
+    return changes.emplace(snapshot.prepared.get(), State::Change{snapshot.prepared, *snapshot.prepared, true, snapshot.prepared->entries.size(), snapshot.prepared->registeredAbis.size()}).first->second.prepared;
 }
 
 const PreparedShaderState& ShaderPreparationTransaction::Read(const ShaderSnapshot& snapshot) const {
     require(!committed, "shader preparation transaction is already committed");
-    const auto found = root->changes.find(snapshot.prepared.get());
-    return found != root->changes.end() ? found->second.prepared : *snapshot.prepared;
+    auto& changes = root->changes;
+    const auto found = changes.find(snapshot.prepared.get());
+    if (found != changes.end()) return found->second.prepared;
+    std::lock_guard lock(snapshot.prepared->mutex);
+    return changes.emplace(snapshot.prepared.get(), State::Change{snapshot.prepared, *snapshot.prepared, false, snapshot.prepared->entries.size(), snapshot.prepared->registeredAbis.size()}).first->second.prepared;
 }
 
 void ShaderPreparationTransaction::Commit() {
@@ -192,7 +239,16 @@ void ShaderPreparationTransaction::Commit() {
         locks.reserve(state->changes.size());
         for (const auto& [key, change] : state->changes) locks.emplace_back(change.destination->mutex);
         for (auto& [key, change] : state->changes) {
+            if (!change.edited) continue;
             auto& destination = *change.destination;
+            for (std::size_t index = std::min(change.baseEntries, destination.entries.size()); index < destination.entries.size(); ++index) {
+                const auto& added = destination.entries[index];
+                const auto duplicate = std::ranges::any_of(change.prepared.entries, [&](const auto& existing) { return existing.codeOffset == added.codeOffset && existing.handle == added.handle; });
+                if (!duplicate) change.prepared.entries.push_back(added);
+            }
+            for (std::size_t index = std::min(change.baseAbis, destination.registeredAbis.size()); index < destination.registeredAbis.size(); ++index) {
+                if (std::ranges::find(change.prepared.registeredAbis, destination.registeredAbis[index]) == change.prepared.registeredAbis.end()) change.prepared.registeredAbis.push_back(destination.registeredAbis[index]);
+            }
             destination.entries.swap(change.prepared.entries);
             destination.registeredAbis.swap(change.prepared.registeredAbis);
             destination.graphicsAbis.swap(change.prepared.graphicsAbis);
@@ -248,9 +304,11 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
     for (const auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset == codeOffset && ShaderRecompiler::MatchesPreparedShader(request, *entry.handle, key)) return entry.handle;
     }
-    if (snapshot.header.empty()) {
-        if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
-        APS5_LOG_ERR("Compute shader 0x%llx was not registered; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
+    if (snapshot.header.empty() || !request.shader.capturedCalls.empty()) {
+        if (snapshot.header.empty()) {
+            if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
+            APS5_LOG_ERR("Compute shader 0x%llx was not registered; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
+        }
         auto handle = ShaderRecompiler::PrepareShader(request);
         snapshot.prepared->entries.push_back({codeOffset, handle});
         return handle;
@@ -282,26 +340,33 @@ ShaderRecompiler::RectListShaders PreparedRectangle(const ShaderSnapshot& snapsh
     throw std::runtime_error("AGC driver: prepared rectangle artifacts are missing");
 }
 
-ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request) {
+ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, ShaderMemory* memory) {
     require(codeOffset < snapshot.code.size(), "prepared shader code offset is outside the snapshot");
     const auto code = std::span(snapshot.code).subspan(codeOffset);
     require(request.shader.code.data() == code.data() && request.shader.code.size() == code.size(), "prepared invocation does not refer to registered code");
     auto invocationRequest = request;
+    ShaderRecompiler::CapturedCallProgram captured;
     struct PreparedKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, PreparedKeyStorage>();
-    ShaderRecompiler::BuildPreparedShaderKey(request, key);
     std::lock_guard lock(snapshot.prepared->mutex);
+    const bool captureCalls = std::ranges::none_of(snapshot.prepared->entries, [&](const auto& entry) { return entry.codeOffset == codeOffset; }) || std::ranges::any_of(snapshot.prepared->entries, [&](const auto& entry) {
+        return entry.codeOffset == codeOffset && !ShaderRecompiler::GetPreparedCalls(*entry.handle).empty();
+    });
+    if (memory != nullptr && captureCalls && request.shader.stage == ShaderRecompiler::ShaderStage::Compute) {
+        captured = memory->ResolveCalls(request);
+        if (!captured.code.empty()) {
+            invocationRequest.shader.code = captured.code;
+            invocationRequest.shader.capturedCalls = captured.calls;
+        }
+    }
+    ShaderRecompiler::BuildPreparedShaderKey(invocationRequest, key);
     for (const auto& entry : snapshot.prepared->entries) {
         if (entry.codeOffset != codeOffset) continue;
-        invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*entry.handle);
         if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) return std::move(*invocation);
     }
-    if (snapshot.header.empty()) {
-        if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
-        APS5_LOG_ERR("Compute shader 0x%llx was not registered; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
-        auto handle = ShaderRecompiler::PrepareShader(request);
-        invocationRequest = request;
-        invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
+    if (snapshot.header.empty() || !captured.code.empty()) {
+        if (snapshot.header.empty() && (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute)) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
+        auto handle = ShaderRecompiler::PrepareShader(invocationRequest);
         auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
         if (!invocation.has_value()) throw std::runtime_error("AGC driver: raw compute artifact does not match its invocation");
         snapshot.prepared->entries.push_back({codeOffset, std::move(handle)});
@@ -402,15 +467,26 @@ void ReportCompileProgress(bool failed) {
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> TryPrepareShader(const ShaderRecompiler::RecompileRequest& request) {
     try {
+        const auto started = std::chrono::steady_clock::now();
         auto handle = ShaderRecompiler::PrepareShader(request);
+        const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        if (seconds > 0.2) std::fprintf(stderr, "[prepare] shader 0x%llx stage %u (%zu words) took %.2f s on thread %lu\n", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.shader.stage), request.shader.code.size(), seconds, GetCurrentThreadId());
         ReportCompileProgress(false);
         return handle;
     } catch (const std::exception& error) {
         ReportCompileProgress(true);
         static std::mutex reportMutex;
         static std::set<std::uint64_t> reported;
-        std::lock_guard lock(reportMutex);
-        if (reported.insert(request.shader.codeAddress).second) std::fprintf(stderr, "[prepare] shader 0x%llx left unprepared: %.200s\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
+        bool first = false;
+        {
+            std::lock_guard lock(reportMutex);
+            first = reported.insert(request.shader.codeAddress).second;
+        }
+        if (first) {
+            char line[320];
+            const int length = std::snprintf(line, sizeof(line), "[prepare] shader 0x%llx left unprepared: %.200s\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
+            if (length > 0) std::fwrite(line, 1, std::min<std::size_t>(static_cast<std::size_t>(length), sizeof(line) - 1), stderr);
+        }
         return nullptr;
     }
 }
@@ -473,6 +549,11 @@ std::vector<PreparedShaders::Entry> PrepareRegisteredImpl(const ShaderSnapshot& 
     }
     std::vector<std::uint32_t> userData(userCount);
     if (stage != Stage::Compute && stage != Stage::Fragment && snapshot.type != 6) vertex = Graphics::DecodeVertexStageInfo(snapshot.header, snapshot.headerAddress, userData, nullptr, true);
+    if (stage == Stage::Compute) {
+        const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
+        const ShaderRecompiler::SwappcInfo swappc{false, firstUser, userCount};
+        if (!ShaderRecompiler::AnalyzeUserDataCalls(decoded, swappc).empty()) return {};
+    }
     const std::array<ShaderRecompiler::MemoryRegion, 2> memory{{{snapshot.codeAddress, std::as_bytes(std::span(snapshot.code))}, {snapshot.headerAddress, snapshot.header}}};
     ShaderRecompiler::RecompileRequest request{{stage, address, code, snapshot.headerAddress, snapshot.header}, {wave, firstUser, userData, compute, pixel, vertex, memory}, stage == Stage::Compute ? device.ComputeTarget(wave) : device.Target(), {0, 0, 0, 128}, graphics};
     if (graphics && graphics->mesh) request.layout.pushConstantSizeBytes = ShaderRecompiler::MeshDrawPushOffsetBytes;
@@ -499,10 +580,89 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snap
         ReportCompileProgress(true);
         static std::mutex reportMutex;
         static std::set<std::uint64_t> reported;
-        std::lock_guard lock(reportMutex);
-        if (reported.insert(snapshot.codeAddress).second) std::fprintf(stderr, "[prepare] shader 0x%llx left unprepared: %.200s\n", static_cast<unsigned long long>(snapshot.codeAddress), error.what());
+        bool first = false;
+        {
+            std::lock_guard lock(reportMutex);
+            first = reported.insert(snapshot.codeAddress).second;
+        }
+        if (first) {
+            char line[384];
+            const int length = std::snprintf(line, sizeof(line), "[prepare] shader 0x%llx left unprepared: %.200s [type=%u words=%zu hash=%016llx]\n", static_cast<unsigned long long>(snapshot.codeAddress), error.what(), snapshot.type, snapshot.code.size(), static_cast<unsigned long long>(CaptureValidationCode(snapshot)));
+            if (length > 0) std::fwrite(line, 1, std::min<std::size_t>(static_cast<std::size_t>(length), sizeof(line) - 1), stderr);
+        }
         return {};
     }
+}
+
+}
+
+namespace {
+
+class RegistrationPreparePool {
+public:
+    static RegistrationPreparePool& Instance() {
+        static auto* pool = new RegistrationPreparePool();
+        return *pool;
+    }
+
+    void Submit(std::function<void()> task) {
+        {
+            std::lock_guard lock(mutex);
+            tasks.push_back(std::move(task));
+        }
+        ready.notify_one();
+    }
+
+private:
+    RegistrationPreparePool() {
+        const auto count = std::max(2u, std::thread::hardware_concurrency() / 2u);
+        pthread_attr_t attributes;
+        pthread_attr_init(&attributes);
+        pthread_attr_setstacksize(&attributes, 64u << 20u);
+        for (unsigned index = 0; index < count; ++index) {
+            pthread_t thread;
+            if (pthread_create(&thread, &attributes, &RegistrationPreparePool::Main, this) == 0) pthread_detach(thread);
+        }
+        pthread_attr_destroy(&attributes);
+    }
+
+    static void* Main(void* argument) {
+        auto& pool = *static_cast<RegistrationPreparePool*>(argument);
+        for (;;) {
+            std::function<void()> task;
+            {
+                std::unique_lock lock(pool.mutex);
+                pool.ready.wait(lock, [&] { return !pool.tasks.empty(); });
+                task = std::move(pool.tasks.front());
+                pool.tasks.pop_front();
+            }
+            task();
+        }
+        return nullptr;
+    }
+
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<std::function<void()>> tasks;
+};
+
+bool AsyncRegistrationPrepare() {
+    static const bool sync = std::getenv("APS5_SYNC_SHADER_PREPARE") != nullptr;
+    return !sync;
+}
+
+void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<VulkanDevice> device, QueueState registered) {
+    RegistrationPreparePool::Instance().Submit([snapshot = std::move(snapshot), device = std::move(device), registered = std::move(registered)] {
+        auto entries = PrepareRegistered(*snapshot, *device, registered, true);
+        std::vector<std::uint64_t> key;
+        if ((snapshot->type == 0 || snapshot->type == 1) && !entries.empty()) BuildRegisteredAbiKey(registered, *device, key);
+        std::lock_guard lock(snapshot->prepared->mutex);
+        for (auto& entry : entries) {
+            const auto duplicate = std::ranges::any_of(snapshot->prepared->entries, [&](const auto& existing) { return existing.codeOffset == entry.codeOffset && existing.handle->artifact == entry.handle->artifact; });
+            if (!duplicate) snapshot->prepared->entries.push_back(std::move(entry));
+        }
+        if (!key.empty() && std::ranges::find(snapshot->prepared->registeredAbis, key) == snapshot->prepared->registeredAbis.end()) snapshot->prepared->registeredAbis.push_back(std::move(key));
+    });
 }
 
 }
@@ -563,7 +723,42 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
     return prepared;
 }
 
+namespace {
+
+class AbiTimer {
+public:
+    explicit AbiTimer(int kind) : kind(kind), started(std::chrono::steady_clock::now()) {}
+    ~AbiTimer() {
+        static std::mutex mutex;
+        static std::array<std::uint64_t, 2> calls{};
+        static std::array<double, 2> seconds{};
+        static std::array<double, 2> longest{};
+        static auto window = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration<double>(now - started).count();
+        std::lock_guard lock(mutex);
+        ++calls[kind];
+        seconds[kind] += elapsed;
+        longest[kind] = std::max(longest[kind], elapsed);
+        if (now - window < std::chrono::seconds(1)) return;
+        window = now;
+        char line[256];
+        const int length = std::snprintf(line, sizeof(line), "[abi] resolve shader %llu calls %.2f s (max %.3f), graphics stages %llu calls %.2f s (max %.3f)\n", static_cast<unsigned long long>(calls[0]), seconds[0], longest[0], static_cast<unsigned long long>(calls[1]), seconds[1], longest[1]);
+        if (length > 0) std::fwrite(line, 1, std::min<std::size_t>(static_cast<std::size_t>(length), sizeof(line) - 1), stderr);
+        calls = {};
+        seconds = {};
+        longest = {};
+    }
+
+private:
+    int kind;
+    std::chrono::steady_clock::time_point started;
+};
+
+}
+
 void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
+    AbiTimer abiTimer(1);
     PerformanceContext timingContext(FrameTiming::Preparation());
     PerformanceTimer timing("Shader.ResolveGraphicsStagesAbi");
     ShaderPreparationTransaction transaction;
@@ -629,6 +824,7 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
 }
 
 void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) {
+    AbiTimer abiTimer(0);
     PerformanceContext timingContext(FrameTiming::Preparation());
     PerformanceTimer timing("Shader.ResolveAbi");
     ShaderPreparationTransaction transaction;
@@ -665,6 +861,28 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
         transaction.Commit();
         return;
     }
+    if (AsyncRegistrationPrepare()) {
+        {
+            std::lock_guard lock(snapshot->prepared->mutex);
+            if (std::ranges::find(snapshot->prepared->registeredAbis, key) != snapshot->prepared->registeredAbis.end() || std::ranges::find(snapshot->prepared->pendingAbis, key) != snapshot->prepared->pendingAbis.end()) {
+                transaction.Commit();
+                return;
+            }
+            snapshot->prepared->pendingAbis.push_back(key);
+        }
+        RegistrationPreparePool::Instance().Submit([snapshot, device = localDevice, state, abi = key] {
+            auto entries = PrepareRegistered(*snapshot, *device, state, false);
+            std::lock_guard lock(snapshot->prepared->mutex);
+            for (auto& entry : entries) {
+                const auto duplicate = std::ranges::any_of(snapshot->prepared->entries, [&](const auto& existing) { return existing.handle->artifact == entry.handle->artifact; });
+                if (!duplicate) snapshot->prepared->entries.push_back(std::move(entry));
+            }
+            if (std::ranges::find(snapshot->prepared->registeredAbis, abi) == snapshot->prepared->registeredAbis.end()) snapshot->prepared->registeredAbis.push_back(abi);
+            std::erase(snapshot->prepared->pendingAbis, abi);
+        });
+        transaction.Commit();
+        return;
+    }
     auto entries = PrepareRegistered(*snapshot, *localDevice, state, false);
     auto& prepared = transaction.Edit(*snapshot);
     for (auto& entry : entries) {
@@ -689,6 +907,18 @@ static const Shader NullPixelShader = [] {
 
 std::uint64_t NullPixelProgramAddress() {
     return reinterpret_cast<std::uintptr_t>(NullPixelCode);
+}
+
+// The registered state of the driver's null pixel program at the snapshot's address (a replayed
+// capture restores the capturing process's null program next to its own).
+RegisteredShaderState NullPixelRegisteredState(const ShaderSnapshot& snapshot) {
+    auto state = DecodeRegisteredState(snapshot);
+    state.shader.emplace(0x008u, static_cast<std::uint32_t>(snapshot.codeAddress >> 8u));
+    state.shader.emplace(0x009u, static_cast<std::uint32_t>(snapshot.codeAddress >> 40u));
+    state.shader.emplace(0x00bu, 0u);
+    state.context.emplace(0x1b3u, 0x2u);
+    state.context.emplace(0x1b4u, 0x2u);
+    return state;
 }
 
 std::uint64_t SnapshotCodeHash(const ShaderSnapshot&, std::size_t) {
@@ -787,6 +1017,7 @@ void Driver::RegisterShader(const Shader* shader) {
     PerformanceTimer timing("Shader.Register");
     ShaderPreparationTransaction transaction;
     CheckFailure();
+    const auto entered = FrameCapture::Enter(*this);
     GuestMemory::CheckRange(shader, sizeof(Shader), 1);
     Shader fields;
     std::memcpy(&fields, static_cast<const void*>(shader), sizeof(Shader));
@@ -801,7 +1032,77 @@ void Driver::RegisterShader(const Shader* shader) {
     std::memcpy(snapshot.code.data(), code, fields.shader_size);
     snapshot.header.resize(fields.header_size);
     std::memcpy(snapshot.header.data(), static_cast<const void*>(shader), fields.header_size);
+    static const char* traceRegs = std::getenv("APS5_TRACE_SHADER_REGS");
+    if (traceRegs != nullptr && (std::string(traceRegs) == "all" || std::strtoull(traceRegs, nullptr, 16) == snapshot.codeAddress)) {
+        const auto print = [](const ShaderRegister* registers, std::uint32_t count) {
+            for (std::uint32_t i = 0; i < count && registers != nullptr; ++i) {
+                ShaderRegister value;
+                std::memcpy(&value, static_cast<const void*>(registers + i), sizeof(value));
+                std::fprintf(stderr, " %x=%08x", value.offset, value.value);
+            }
+        };
+        std::fprintf(stderr, "[shader] 0x%llx type %u cx", static_cast<unsigned long long>(snapshot.codeAddress), fields.type);
+        print(fields.cx_registers, fields.num_cx_registers);
+        std::fprintf(stderr, " sh");
+        print(fields.sh_registers, fields.num_sh_registers);
+        std::fprintf(stderr, "\n");
+    }
+    if (entered.owns_lock()) FrameCapture::RecordShader(snapshot.codeAddress, snapshot.headerAddress, snapshot.type, snapshot.code, snapshot.header);
+    registerSnapshot(std::move(snapshot), transaction, true);
+}
 
+void Driver::RestoreShader(std::uint64_t codeAddress, std::uint64_t headerAddress, std::uint8_t type, std::vector<std::uint32_t> code, std::vector<std::byte> header, bool prepare) {
+    ShaderPreparationTransaction transaction;
+    CheckFailure();
+    ShaderSnapshot snapshot{codeAddress, headerAddress, type, std::move(code), std::move(header)};
+    registerSnapshot(std::move(snapshot), transaction, prepare);
+}
+
+void Driver::RestoreRegistry(std::vector<ShaderSnapshot> snapshots, bool prepare) {
+    ShaderPreparationTransaction transaction;
+    CheckFailure();
+    std::shared_ptr<VulkanDevice> localDevice = device.Load();
+    if (localDevice == nullptr) {
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        if (device == nullptr) device = std::make_shared<VulkanDevice>();
+        localDevice = device;
+    }
+    std::shared_ptr<ShaderRegistry> next;
+    {
+        std::lock_guard lock(mutex);
+        next = shaders != nullptr ? std::make_shared<ShaderRegistry>(*shaders) : std::make_shared<ShaderRegistry>();
+    }
+    for (auto& snapshot : snapshots) {
+        try {
+            const bool nullPixel = snapshot.type == NullPixelShader.type && snapshot.code.size() == std::size(NullPixelCode) && std::equal(snapshot.code.begin(), snapshot.code.end(), std::begin(NullPixelCode));
+            snapshot.registeredState = std::make_shared<const RegisteredShaderState>(nullPixel ? NullPixelRegisteredState(snapshot) : DecodeRegisteredState(snapshot));
+            if (prepare) {
+                QueueState registered{};
+                registered.shader = snapshot.registeredState->shader;
+                registered.context = snapshot.registeredState->context;
+                registered.userConfig = snapshot.registeredState->userConfig;
+                snapshot.prepared->entries = PrepareRegistered(snapshot, *localDevice, registered, true);
+                if ((snapshot.type == 0 || snapshot.type == 1) && !snapshot.prepared->entries.empty()) {
+                    std::vector<std::uint64_t> key;
+                    BuildRegisteredAbiKey(registered, *localDevice, key);
+                    snapshot.prepared->registeredAbis.push_back(std::move(key));
+                }
+            }
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[replay] shader 0x%llx was not restored: %s\n", static_cast<unsigned long long>(snapshot.codeAddress), error.what());
+            continue;
+        }
+        const auto address = snapshot.codeAddress;
+        next->insert_or_assign(address, std::make_shared<const ShaderSnapshot>(std::move(snapshot)));
+    }
+    std::lock_guard lock(mutex);
+    rethrowFailure();
+    shaders = std::move(next);
+    publishNullPixelShader(*localDevice);
+    transaction.Commit();
+}
+
+void Driver::registerSnapshot(ShaderSnapshot snapshot, ShaderPreparationTransaction& transaction, bool prepare) {
     {
         std::lock_guard lock(mutex);
         rethrowFailure();
@@ -825,54 +1126,55 @@ void Driver::RegisterShader(const Shader* shader) {
         localDevice = device;
     }
     snapshot.registeredState = std::make_shared<const RegisteredShaderState>(DecodeRegisteredState(snapshot));
-    QueueState registered{};
-    registered.shader = snapshot.registeredState->shader;
-    registered.context = snapshot.registeredState->context;
-    registered.userConfig = snapshot.registeredState->userConfig;
-    snapshot.prepared->entries = PrepareRegistered(snapshot, *localDevice, registered, true);
-    if ((snapshot.type == 0 || snapshot.type == 1) && !snapshot.prepared->entries.empty()) {
-        std::vector<std::uint64_t> key;
-        BuildRegisteredAbiKey(registered, *localDevice, key);
-        snapshot.prepared->registeredAbis.push_back(std::move(key));
+    if (prepare && AsyncRegistrationPrepare()) {
+        QueueState registered{};
+        registered.shader = snapshot.registeredState->shader;
+        registered.context = snapshot.registeredState->context;
+        registered.userConfig = snapshot.registeredState->userConfig;
+        auto published = std::make_shared<const ShaderSnapshot>(std::move(snapshot));
+        {
+            std::lock_guard lock(mutex);
+            rethrowFailure();
+            PublishRegisteredShader(shaders, published);
+            publishNullPixelShader(*localDevice);
+        }
+        PrepareRegisteredInBackground(std::move(published), localDevice, std::move(registered));
+        transaction.Commit();
+        return;
     }
-    static const char* traceRegs = std::getenv("APS5_TRACE_SHADER_REGS");
-    if (traceRegs != nullptr && (std::string(traceRegs) == "all" || std::strtoull(traceRegs, nullptr, 16) == snapshot.codeAddress)) {
-        const auto print = [](const ShaderRegister* registers, std::uint32_t count) {
-            for (std::uint32_t i = 0; i < count && registers != nullptr; ++i) {
-                ShaderRegister value;
-                std::memcpy(&value, static_cast<const void*>(registers + i), sizeof(value));
-                std::fprintf(stderr, " %x=%08x", value.offset, value.value);
-            }
-        };
-        std::fprintf(stderr, "[shader] 0x%llx type %u cx", static_cast<unsigned long long>(snapshot.codeAddress), fields.type);
-        print(fields.cx_registers, fields.num_cx_registers);
-        std::fprintf(stderr, " sh");
-        print(fields.sh_registers, fields.num_sh_registers);
-        std::fprintf(stderr, "\n");
+    if (prepare) {
+        QueueState registered{};
+        registered.shader = snapshot.registeredState->shader;
+        registered.context = snapshot.registeredState->context;
+        registered.userConfig = snapshot.registeredState->userConfig;
+        snapshot.prepared->entries = PrepareRegistered(snapshot, *localDevice, registered, true);
+        if ((snapshot.type == 0 || snapshot.type == 1) && !snapshot.prepared->entries.empty()) {
+            std::vector<std::uint64_t> key;
+            BuildRegisteredAbiKey(registered, *localDevice, key);
+            snapshot.prepared->registeredAbis.push_back(std::move(key));
+        }
     }
     std::lock_guard lock(mutex);
     rethrowFailure();
     PublishRegisteredShader(shaders, std::make_shared<const ShaderSnapshot>(std::move(snapshot)));
+    publishNullPixelShader(*localDevice);
+    transaction.Commit();
+}
+
+void Driver::publishNullPixelShader(const VulkanDevice& localDevice) {
     if (shaders->find(NullPixelProgramAddress()) == shaders->end()) {
         ShaderSnapshot null{NullPixelProgramAddress(), reinterpret_cast<std::uintptr_t>(&NullPixelShader), NullPixelShader.type, {}, {}};
         null.code.assign(std::begin(NullPixelCode), std::end(NullPixelCode));
         null.header.resize(sizeof(Shader));
         std::memcpy(null.header.data(), &NullPixelShader, sizeof(Shader));
-        auto nullRegisteredState = DecodeRegisteredState(null);
-        nullRegisteredState.shader.emplace(0x008u, static_cast<std::uint32_t>(null.codeAddress >> 8u));
-        nullRegisteredState.shader.emplace(0x009u, static_cast<std::uint32_t>(null.codeAddress >> 40u));
-        nullRegisteredState.shader.emplace(0x00bu, 0u);
-        nullRegisteredState.context.emplace(0x1b3u, 0x2u);
-        nullRegisteredState.context.emplace(0x1b4u, 0x2u);
-        null.registeredState = std::make_shared<const RegisteredShaderState>(std::move(nullRegisteredState));
+        null.registeredState = std::make_shared<const RegisteredShaderState>(NullPixelRegisteredState(null));
         QueueState nullState{};
         nullState.shader = null.registeredState->shader;
         nullState.context = null.registeredState->context;
         nullState.userConfig = null.registeredState->userConfig;
-        null.prepared->entries = PrepareRegistered(null, *localDevice, nullState, true);
+        null.prepared->entries = PrepareRegistered(null, localDevice, nullState, true);
         PublishRegisteredShader(shaders, std::make_shared<const ShaderSnapshot>(std::move(null)));
     }
-    transaction.Commit();
 }
 
 }

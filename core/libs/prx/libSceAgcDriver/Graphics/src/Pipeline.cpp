@@ -8,13 +8,19 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <deque>
+#include <functional>
 #include <list>
 #include <mutex>
+#include <pthread.h>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -96,13 +102,17 @@ void ValidateViewport(const Context& context, const VkViewport& viewport) {
     Require(std::min(viewport.y, viewport.y + viewport.height) >= context.limits.viewportBoundsRange[0] && std::max(viewport.y, viewport.y + viewport.height) <= context.limits.viewportBoundsRange[1], "viewport Y exceeds device bounds");
 }
 
-Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()), depthBounds(state.depth.has_value() && state.depthBoundsTest), depthBias(state.depth.has_value() && state.depthBias) {
+Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : Pipeline(context, state, vertexInput, resources.Layout(), shaders, attachmentLayout) {}
+
+Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, VkDescriptorSetLayout setLayout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()), depthBounds(state.depth.has_value() && state.depthBoundsTest), depthBias(state.depth.has_value() && state.depthBias) {
     PerformanceTimer timing("Vulkan.GraphicsPipeline");
     // A cached pipeline may outlive its device's teardown (see ClearCachedPipelines); it must not keep
     // the buffer pool, which is reset with the device, alive past it.
     this->context.bufferPool.reset();
     Require(state.blends.size() == (state.colors.empty() ? 0u : state.colors.back().exportIndex + 1u) && state.colors.size() <= state.blends.size(), "blend states do not match decoded color state");
     Require(state.blends.size() <= context.limits.maxColorAttachments, "color targets exceed device attachment limits");
+    Require(state.reversedBlend == 0 || context.dualSrcBlend, "reversed blending requires dual-source blending support");
+    Require(state.reversedBlend == 0 || state.blends.size() <= context.limits.maxFragmentDualSrcAttachments, "reversed blending exceeds dual-source attachment limits");
     Require(state.hasColorTarget || (context.limits.framebufferNoAttachmentsSampleCounts & VK_SAMPLE_COUNT_1_BIT) != 0, "device does not support single-sample rendering without attachments");
     Require(!depthBounds || context.depthBounds, "device does not support the depth bounds test");
     Require(!depthBias || state.depthBiasClamp == 0.0f || context.depthBiasClamp, "device does not support depth bias clamping");
@@ -142,7 +152,6 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         }
         // A descriptor set layout with the same bindings as this one is compatible with the pipeline
         // layout, so later draws bind their own ShaderResources' set under it.
-        const auto setLayout = resources.Layout();
         const VkPushConstantRange push{pushStages, 0, PipelinePushConstantBytes};
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layoutInfo.setLayoutCount = 1;
@@ -256,7 +265,10 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         pipelineInfo.layout = layout;
         pipelineInfo.renderPass = renderPass;
         timing.Mark("modules_and_state");
+        const auto createStarted = std::chrono::steady_clock::now();
         Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
+        const auto createSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - createStarted).count();
+        if (createSeconds > 0.25) std::fprintf(stderr, "[draw] graphics pipeline took %.2f s\n", createSeconds);
         timing.Mark("create");
         LogPipelineStatistics_nid_no_patch(context, pipeline);
     } catch (...) {
@@ -495,6 +507,15 @@ struct PipelineStore {
     std::uint64_t evicted = 0;
     std::uint64_t generation = 1;
     std::uint64_t identityHits = 0;
+    std::unordered_map<std::uint64_t, std::vector<std::byte>> pending;
+    std::unordered_set<std::uint64_t> failed;
+    std::size_t inflight = 0;
+    std::condition_variable idle;
+    std::uint64_t asyncStarted = 0;
+    std::uint64_t asyncSkips = 0;
+    std::chrono::steady_clock::time_point waitWindow{};
+    std::chrono::steady_clock::duration waitedInWindow{};
+    double asyncSeconds = 0.0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
@@ -545,17 +566,128 @@ void reportPipelines(PipelineStore& store) {
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
     const auto lookups = store.hits + store.misses + store.uncached;
-    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%; %llu repeats of the thread's previous key), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.identityHits), static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
+    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%; %llu repeats of the thread's previous key), %llu misses, %llu private (no variant id), %llu evicted, %zu cached; async: %llu compiles started (%.1f s compiling), %llu draws skipped while compiling, %zu in flight\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.identityHits), static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size(), static_cast<unsigned long long>(store.asyncStarted), store.asyncSeconds, static_cast<unsigned long long>(store.asyncSkips), store.inflight);
     store.hits = store.misses = store.uncached = store.evicted = store.identityHits = 0;
+    store.asyncStarted = store.asyncSkips = 0;
+    store.asyncSeconds = 0.0;
+}
+
+bool asyncPipelines() {
+    static const bool enabled = [] { const char* text = std::getenv("APS5_ASYNC_PIPELINES"); return text != nullptr && std::strcmp(text, "0") != 0; }();
+    return enabled;
+}
+
+class PipelineCompilePool {
+public:
+    static PipelineCompilePool& Instance() {
+        static auto* pool = new PipelineCompilePool();
+        return *pool;
+    }
+
+    void Submit(std::function<void()> task) {
+        {
+            std::lock_guard lock(mutex);
+            tasks.push_back(std::move(task));
+        }
+        ready.notify_one();
+    }
+
+private:
+    PipelineCompilePool() {
+        const char* text = std::getenv("APS5_ASYNC_PIPELINE_THREADS");
+        const auto requested = text != nullptr ? static_cast<unsigned>(std::strtoul(text, nullptr, 10)) : 0u;
+        const auto count = requested != 0 ? requested : std::max(2u, std::thread::hardware_concurrency() / 2u);
+        pthread_attr_t attributes;
+        pthread_attr_init(&attributes);
+        pthread_attr_setstacksize(&attributes, 64u << 20u);
+        for (unsigned index = 0; index < count; ++index) {
+            pthread_t thread;
+            if (pthread_create(&thread, &attributes, &PipelineCompilePool::Main, this) == 0) pthread_detach(thread);
+        }
+        pthread_attr_destroy(&attributes);
+    }
+
+    static void* Main(void* argument) {
+        auto& pool = *static_cast<PipelineCompilePool*>(argument);
+        for (;;) {
+            std::function<void()> task;
+            {
+                std::unique_lock lock(pool.mutex);
+                pool.ready.wait(lock, [&] { return !pool.tasks.empty(); });
+                task = std::move(pool.tasks.front());
+                pool.tasks.pop_front();
+            }
+            task();
+        }
+        return nullptr;
+    }
+
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<std::function<void()>> tasks;
+};
+
+void insertPipeline(PipelineStore& store, VkDevice device, const std::shared_ptr<BufferPool>& pool, std::uint64_t hash, const std::vector<std::byte>& key, const std::shared_ptr<Pipeline>& pipeline) {
+    store.entries.push_back({device, pool, hash, key, pipeline});
+    store.index[hash] = std::prev(store.entries.end());
+    static const std::size_t bound = [] { const char* text = std::getenv("APS5_PIPELINE_CACHE_ENTRIES"); const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull; return value != 0 ? static_cast<std::size_t>(value) : std::size_t{4096}; }();
+    while (store.entries.size() > bound) {
+        const auto victim = std::find_if(store.entries.begin(), store.entries.end(), [](const PipelineStore::Entry& entry) { return entry.pipeline.use_count() == 1; });
+        if (victim == store.entries.end()) break;
+        store.index.erase(victim->hash);
+        store.entries.erase(victim);
+        ++store.generation;
+        ++store.evicted;
+    }
+}
+
+void compileInBackground(PipelineStore& store, const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, std::uint64_t hash, const std::vector<std::byte>& key) {
+    struct Job {
+        Context context;
+        State state;
+        VertexInputLayout vertexInput;
+        VkDescriptorSetLayout setLayout;
+        std::vector<ShaderRecompiler::RecompileResult> programs;
+        std::vector<CompiledShader> shaders;
+        VkImageLayout attachmentLayout;
+        std::uint64_t hash;
+    };
+    auto job = std::make_shared<Job>(Job{context, state, vertexInput, resources.Layout(), {}, {}, attachmentLayout, hash});
+    job->programs.reserve(shaders.size());
+    for (const auto& shader : shaders) job->programs.push_back(*shader.program);
+    for (std::size_t index = 0; index < shaders.size(); ++index) job->shaders.push_back({shaders[index].stage, &job->programs[index], shaders[index].pushConstantOffset});
+    store.pending.emplace(hash, key);
+    ++store.inflight;
+    ++store.asyncStarted;
+    PipelineCompilePool::Instance().Submit([job, &store] {
+        const auto started = std::chrono::steady_clock::now();
+        std::shared_ptr<Pipeline> pipeline;
+        try {
+            pipeline = std::make_shared<Pipeline>(job->context, job->state, job->vertexInput, job->setLayout, job->shaders, job->attachmentLayout);
+        } catch (const std::exception&) {
+            pipeline = nullptr;
+        }
+        const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        std::lock_guard lock(store.mutex);
+        store.asyncSeconds += seconds;
+        const auto found = store.pending.find(job->hash);
+        if (found != store.pending.end()) {
+            if (pipeline == nullptr) store.failed.insert(job->hash);
+            else if (!store.index.contains(job->hash)) insertPipeline(store, job->context.device, job->context.bufferPool, job->hash, found->second, pipeline);
+            store.pending.erase(found);
+        }
+        --store.inflight;
+        store.idle.notify_all();
+    });
 }
 
 }
 
-std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool mayDefer) {
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     auto& store = Pipelines();
-    std::lock_guard lock(store.mutex);
+    std::unique_lock lock(store.mutex);
     reportPipelines(store);
     const bool identity = pipelineIdentity();
     auto* last = identity ? &ThreadLastPipeline() : nullptr;
@@ -601,6 +733,44 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
         }
     }
+    if (const auto found = store.pending.find(hash); found != store.pending.end() && (!mayDefer || found->second != key)) {
+        ++store.uncached;
+        return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+    }
+    if (asyncPipelines() && mayDefer && !store.failed.contains(hash)) {
+        static const auto waitMs = [] {
+            const char* text = std::getenv("APS5_ASYNC_PIPELINE_WAIT_MS");
+            return text != nullptr ? std::strtoull(text, nullptr, 10) : 10ull;
+        }();
+        const auto waitForCompile = [&]() -> std::shared_ptr<Pipeline> {
+            const auto now = std::chrono::steady_clock::now();
+            if (now - store.waitWindow > std::chrono::seconds(1)) {
+                store.waitWindow = now;
+                store.waitedInWindow = std::chrono::steady_clock::duration::zero();
+            }
+            if (waitMs == 0 || store.waitedInWindow > std::chrono::milliseconds(100)) return nullptr;
+            const std::vector<std::byte> wanted = key;
+            store.idle.wait_for(lock, std::chrono::milliseconds(waitMs), [&] { return !store.pending.contains(hash); });
+            store.waitedInWindow += std::chrono::steady_clock::now() - now;
+            const auto found = store.index.find(hash);
+            if (found == store.index.end() || found->second->key != wanted || !alive(*found->second, context)) return nullptr;
+            store.entries.splice(store.entries.end(), store.entries, found->second);
+            return found->second->pipeline;
+        };
+        if (store.pending.contains(hash)) {
+            if (auto ready = waitForCompile()) return ready;
+            ++store.asyncSkips;
+            return nullptr;
+        }
+        ++store.misses;
+        for (auto it = store.entries.begin(); it != store.entries.end();) {
+            it = alive(*it, context) ? std::next(it) : abandon(store, it);
+        }
+        compileInBackground(store, context, state, vertexInput, resources, shaders, attachmentLayout, hash, key);
+        if (auto ready = waitForCompile()) return ready;
+        ++store.asyncSkips;
+        return nullptr;
+    }
     ++store.misses;
     // Entries of another device belong to one the driver replaced (it does so under the GpuMutex
     // before any draw reaches the new device), whose objects went with it: forget them.
@@ -608,25 +778,16 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         it = alive(*it, context) ? std::next(it) : abandon(store, it);
     }
     auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
-    store.entries.push_back({context.device, context.bufferPool, hash, key, pipeline});
-    store.index[hash] = std::prev(store.entries.end());
-    static const std::size_t bound = [] { const char* text = std::getenv("APS5_PIPELINE_CACHE_ENTRIES"); const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull; return value != 0 ? static_cast<std::size_t>(value) : std::size_t{4096}; }();
-    while (store.entries.size() > bound) {
-        // Only an entry no recorded draw still holds may go (Kept keeps its shared_ptr until the fence).
-        const auto victim = std::find_if(store.entries.begin(), store.entries.end(), [](const PipelineStore::Entry& entry) { return entry.pipeline.use_count() == 1; });
-        if (victim == store.entries.end()) break;
-        store.index.erase(victim->hash);
-        store.entries.erase(victim);
-        ++store.generation;
-        ++store.evicted;
-    }
+    insertPipeline(store, context.device, context.bufferPool, hash, key, pipeline);
     if (const auto found = store.index.find(hash); found != store.index.end() && found->second->pipeline == pipeline) remember(found->second);
     return pipeline;
 }
 
 void ClearCachedPipelines(VkDevice device) {
     auto& store = Pipelines();
-    std::lock_guard lock(store.mutex);
+    std::unique_lock lock(store.mutex);
+    store.idle.wait(lock, [&] { return store.inflight == 0; });
+    store.failed.clear();
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         if (it->device != device) {
             ++it;

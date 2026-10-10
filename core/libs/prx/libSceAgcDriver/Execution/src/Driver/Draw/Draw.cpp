@@ -11,6 +11,9 @@
 
 namespace AgcDriver::DriverDetail {
 
+std::vector<std::shared_ptr<DispatchVariant>>& RebasedProbes();
+bool verifyRebasedHits();
+
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -115,6 +118,66 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             readUserWords(queue, program);
             if (program.merged) initializeMerged(queue, program, program.mergedPointer, program.mergedPointerRequired);
         }
+        if (traceDrawCache()) {
+            static std::atomic<int> printed{0};
+            for (std::size_t i = 0; i < refreshed->programs.size() && i < dataEntry->decode->programs.size(); ++i) {
+                const auto& before = dataEntry->decode->programs[i].userData;
+                const auto& after = refreshed->programs[i].userData;
+                if (before == after) continue;
+                std::string line = "[draw-cache] user words differ: stage " + std::to_string(i) + " role " + std::to_string(static_cast<int>(dataEntry->decode->roles[i])) + " code 0x";
+                char item[96];
+                std::snprintf(item, sizeof(item), "%llx words %zu:", static_cast<unsigned long long>(refreshed->programs[i].binary.codeAddress), after.size());
+                line += item;
+                for (std::size_t w = 0; w < after.size() && w < before.size(); ++w) {
+                    if (before[w] == after[w]) continue;
+                    std::snprintf(item, sizeof(item), " [%zu] %08x->%08x", w, before[w], after[w]);
+                    line += item;
+                }
+                if (printed.fetch_add(1, std::memory_order_relaxed) < 60) std::fprintf(stderr, "%s\n", line.c_str());
+                if (i >= dataEntry->stages.size() || dataEntry->stages[i].empty()) continue;
+                const auto& variant = *dataEntry->stages[i].front();
+                std::size_t runs = 0, rebasedRuns = 0, equalRuns = 0, wordsCompared = 0, wordsDiffering = 0, inaccessible = 0, shiftedWords = 0;
+                std::size_t offset = 0;
+                std::uint32_t commonDelta = 0;
+                bool oneDelta = true;
+                for (std::size_t w = 0; w < after.size() && w < before.size(); ++w) {
+                    if (before[w] == after[w]) continue;
+                    if (commonDelta == 0) commonDelta = after[w] - before[w];
+                    else if (after[w] - before[w] != commonDelta) oneDelta = false;
+                }
+                for (const auto& [begin, end] : variant.runs) {
+                    const auto count = static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
+                    ++runs;
+                    auto address = begin;
+                    const auto low = static_cast<std::uint32_t>(begin);
+                    for (std::size_t w = 0; w < after.size() && w < before.size(); ++w) {
+                        if (before[w] == after[w] || low < before[w] || low - before[w] >= 0x100000u) continue;
+                        address = begin + static_cast<std::uint64_t>(static_cast<std::int64_t>(static_cast<std::int32_t>(after[w] - before[w])));
+                        ++rebasedRuns;
+                        break;
+                    }
+                    if (offset + count <= variant.words.size() && GuestMemory::Accessible(reinterpret_cast<const void*>(address), count * 4)) {
+                        std::size_t differing = 0;
+                        const auto* live = reinterpret_cast<const std::uint32_t*>(address);
+                        for (std::size_t k = 0; k < count; ++k) {
+                            if (live[k] == variant.words[offset + k]) continue;
+                            if (oneDelta && live[k] == variant.words[offset + k] + commonDelta) ++shiftedWords;
+                            ++differing;
+                            static std::atomic<int> wordsPrinted{0};
+                            if (wordsPrinted.fetch_add(1, std::memory_order_relaxed) < 60) std::fprintf(stderr, "[draw-cache] rebase word: run 0x%llx -> 0x%llx word %zu/%zu old %08x new %08x delta %08x (user delta %08x)\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(address), k, count, variant.words[offset + k], live[k], live[k] - variant.words[offset + k], commonDelta);
+                        }
+                        wordsCompared += count;
+                        wordsDiffering += differing;
+                        equalRuns += differing == 0 ? 1 : 0;
+                    } else {
+                        ++inaccessible;
+                    }
+                    offset += count;
+                }
+                static std::atomic<int> rebasedPrinted{0};
+                if (rebasedPrinted.fetch_add(1, std::memory_order_relaxed) < 80) std::fprintf(stderr, "[draw-cache] rebase probe: stage %zu runs %zu rebased %zu equal %zu inaccessible %zu words %zu differing %zu shifted %zu one delta %d\n", i, runs, rebasedRuns, equalRuns, inaccessible, wordsCompared, wordsDiffering, shiftedWords, oneDelta ? 1 : 0);
+            }
+        }
         if (verifyDrawDataHits()) {
             const auto full = decodeDraw(queue, submission);
             if (!sameDecode(*refreshed, *full)) {
@@ -186,7 +249,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
         phaseTiming.Phase(DrawRowDecode);
     }
-    ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
     std::vector<ShaderRecompiler::RecompileResult> results;
     std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> compiledStages;
     compiledStages.reserve(programs.size());
@@ -209,6 +271,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     std::uint64_t dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0;
     bool drawHit = false;
     bool verifyHit = false;
+    if (verifyRebasedHits()) RebasedProbes().clear();
     lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, useDrawEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates);
 
     if (registerKey) {
@@ -233,6 +296,60 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         phaseTiming.Phase(DrawRowDecode);
     }
+
+    const bool splitDraw = DrawPipeline::SplitDraws() && pipelined && !drawParameters.indirect && !lockedPrepare && deferredLabels().labels.empty() && dumpTarget == 0 && dumpSlot1 == 0 && !verifyHit && !verifyDrawDataHits() && !verifyRebasedHits() && std::all_of(dataCandidates.begin(), dataCandidates.end(), [](const auto& candidates) { return candidates.empty(); });
+    auto splitRejected = std::make_shared<std::string>();
+    std::string* rejectedOut = splitDraw ? splitRejected.get() : &rejected;
+    const auto splitEpoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+    auto tail = [this, &queue, &submission, packet, rejectedOut, splitRejected, splitDraw, splitEpoch, phaseMsIn = phaseMs, phaseLapIn = phaseLap, capturesIn = captures, drawParameters, pipelined, traceIndirect, gpuLock = std::move(gpuLock), localDevice, useDrawEntries, registerKey, drawKey, entry = std::move(entry), decode = std::move(decode), dataEntry = std::move(dataEntry), shapeKey, programs = std::move(programs), memory = std::move(memory), linked = std::move(linked), vertexInfos = std::move(vertexInfos), decodeReads = std::move(decodeReads), results = std::move(results), compiledStages = std::move(compiledStages), stages = std::move(stages), pushCursorBytes, programResults = std::move(programResults), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), recompiled = std::move(recompiled), dataCandidates = std::move(dataCandidates), reused = std::move(reused), dataStagesReused, dataStagesCompiled, dataVerified, drawHit, verifyHit]() mutable -> DrawVerdict {
+    if (splitDraw) DrawPipeline::FollowEpoch(splitEpoch);
+    using Stage = ShaderRecompiler::ShaderStage;
+    using Role = ShaderRecompiler::ProgramRole;
+    auto phaseMs = phaseMsIn;
+    auto phaseLap = phaseLapIn;
+    auto captures = capturesIn;
+    DrawPhaseTiming phaseTiming{profile, phaseMs, phaseLap};
+    PerformanceTimer timing("Driver.DrawTail");
+    std::string& rejected = *rejectedOut;
+    const auto drawn = [&] {
+        phaseTiming.Phase(DrawRowVectors);
+        if (!profile) return DrawVerdict::Drawn;
+        auto& pending = pendingDrawPhases();
+        pending.phases = true;
+        pending.captures = captures;
+        pending.ms = phaseMs;
+        pending.tailAt = phaseLap;
+        return DrawVerdict::Drawn;
+    };
+    const auto& graphics = decode->state;
+    const auto& pixel = decode->pixel;
+    const std::vector<Role>& roles = decode->roles;
+    const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {
+        if (!graphics.stages.mesh) return;
+        auto& words = programs.front().userData;
+        require(programs.front().firstUserSgpr == 0 && words.size() >= ShaderRecompiler::MeshIndexBufferUserWord + 4, "mesh program lacks the hidden user words");
+        const auto descriptor = Graphics::MeshIndexBufferDescriptor(parameters);
+        std::copy(descriptor.begin(), descriptor.end(), words.begin() + ShaderRecompiler::MeshIndexBufferUserWord);
+    };
+    const auto locate = [&](std::uint32_t location) -> std::optional<std::pair<std::size_t, std::size_t>> {
+        if (location == 0x280u) return std::nullopt;
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            if (roles[i] == Role::Fragment || roles[i] == Role::GeometryBack || location < programs[i].userDataBase) continue;
+            const auto word = location - programs[i].userDataBase + (8u - programs[i].firstUserSgpr);
+            if (word < programs[i].userData.size()) return std::make_pair(i, static_cast<std::size_t>(word));
+        }
+        return std::nullopt;
+    };
+    const auto decodeVertexInfo = [&](std::size_t i) {
+        const auto& program = programs[i];
+        if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
+        decodeReads[i].clear();
+        vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i]);
+        if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = (readRegister(queue.context, 0x207) & (0xffffu | (1u << 21u) | (1u << 22u) | (1u << 23u))) | graphics.layerExports;
+    };
+    ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+    static_cast<void>(setMeshIndexBuffer);
+    static_cast<void>(locate);
 
     static const bool indxOffsetSkipFold = std::getenv("APS5_INDX_OFFSET_SKIP_FOLD") != nullptr;
     static const bool indexedOffsetFold = std::getenv("APS5_NO_INDEXED_OFFSET_FOLD") == nullptr;
@@ -292,6 +409,106 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 programResults[i] = compiledStages.back().get();
                 if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
+                if (verifyRebasedHits() && i < RebasedProbes().size() && RebasedProbes()[i] != nullptr) {
+                    const auto& probe = *RebasedProbes()[i];
+                    const auto& fresh = *programResults[i];
+                    const auto& kept = *probe.compiled;
+                    std::vector<ShaderRecompiler::MemoryRegion> regions(stageCaptures[i].regions.begin(), stageCaptures[i].regions.end());
+                    for (const auto& read : decodeReads[i]) regions.push_back({read.address, std::as_bytes(std::span(read.bytes))});
+                    std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
+                    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+                    std::vector<std::uint32_t> words;
+                    for (const auto& region : regions) {
+                        runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+                        const auto count = region.bytes.size() / sizeof(std::uint32_t);
+                        const auto offset = words.size();
+                        words.resize(offset + count);
+                        std::memcpy(words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
+                    }
+                    std::string what;
+                    const auto merged = [](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& list) {
+                        std::vector<std::pair<std::uint64_t, std::uint64_t>> out;
+                        for (const auto& run : list) {
+                            if (!out.empty() && out.back().second == run.first) out.back().second = run.second;
+                            else out.push_back(run);
+                        }
+                        return out;
+                    };
+                    if (merged(runs) != merged(probe.runs)) {
+                        what = "runs";
+                        char item[96];
+                        std::snprintf(item, sizeof(item), " fresh %zu kept %zu:", runs.size(), probe.runs.size());
+                        what += item;
+                        for (std::size_t r = 0; r < runs.size() || r < probe.runs.size(); ++r) {
+                            std::snprintf(item, sizeof(item), " %llx/%llx", r < runs.size() ? static_cast<unsigned long long>(runs[r].first) : 0ull, r < probe.runs.size() ? static_cast<unsigned long long>(probe.runs[r].first) : 0ull);
+                            what += item;
+                        }
+                    }
+                    else if (words != probe.words) what = "words";
+                    else if (fresh.variantId != kept.variantId) what = "variant";
+                    else if (fresh.specializationId != kept.specializationId) what = "specialization";
+                    else if (fresh.pushConstants != kept.pushConstants) {
+                        what = "push constants";
+                        const auto wordsOf = [](const std::vector<std::byte>& bytes) {
+                            std::vector<std::uint32_t> out(bytes.size() / sizeof(std::uint32_t));
+                            std::memcpy(out.data(), bytes.data(), out.size() * sizeof(std::uint32_t));
+                            return out;
+                        };
+                        const auto x = wordsOf(fresh.pushConstants);
+                        const auto y = wordsOf(kept.pushConstants);
+                        char item[96];
+                        for (std::size_t w = 0; w < x.size() && w < y.size(); ++w) {
+                            if (x[w] == y[w]) continue;
+                            std::snprintf(item, sizeof(item), " [%zu] fresh %08x kept %08x", w, x[w], y[w]);
+                            what += item;
+                        }
+                        what += " user words now:";
+                        for (const auto word : program.userData) {
+                            std::snprintf(item, sizeof(item), " %08x", word);
+                            what += item;
+                        }
+                    }
+                    else if (fresh.bindings.size() != kept.bindings.size()) what = "binding count";
+                    else if (fresh.vertexAttributes.size() != kept.vertexAttributes.size()) what = "attribute count";
+                    if (what.empty()) {
+                        for (std::size_t b = 0; b < fresh.bindings.size() && what.empty(); ++b) {
+                            const auto& x = fresh.bindings[b].guestDescriptor;
+                            const auto& y = kept.bindings[b].guestDescriptor;
+                            if (x == y) continue;
+                            std::size_t at = 0;
+                            while (at < x.size() && at < y.size() && x[at] == y[at]) ++at;
+                            char item[160];
+                            std::snprintf(item, sizeof(item), "binding %zu role %u word %zu/%zu fresh %08x kept %08x", b, static_cast<unsigned>(fresh.bindings[b].role), at, x.size(), at < x.size() ? x[at] : 0u, at < y.size() ? y[at] : 0u);
+                            what = item;
+                        }
+                        for (std::size_t a = 0; a < fresh.vertexAttributes.size() && what.empty(); ++a) {
+                            if (fresh.vertexAttributes[a].resource.fields != kept.vertexAttributes[a].resource.fields) {
+                                const auto& x = fresh.vertexAttributes[a].resource.fields;
+                                const auto& y = kept.vertexAttributes[a].resource.fields;
+                                char item[320];
+                                std::size_t match = probe.words.size();
+                                for (std::size_t w = 0; w < probe.words.size(); ++w) {
+                                    if (probe.words[w] == x[0]) {
+                                        match = w;
+                                        break;
+                                    }
+                                }
+                                std::snprintf(item, sizeof(item), "attribute %zu fresh %08x %08x %08x %08x kept %08x %08x %08x %08x; probe word %zu: %08x %08x %08x %08x", a, x[0], x[1], x[2], x[3], y[0], y[1], y[2], y[3], match, match + 0 < probe.words.size() ? probe.words[match] : 0u, match + 1 < probe.words.size() ? probe.words[match + 1] : 0u, match + 2 < probe.words.size() ? probe.words[match + 2] : 0u, match + 3 < probe.words.size() ? probe.words[match + 3] : 0u);
+                                what = item;
+                            }
+                        }
+                    }
+                    static std::atomic<std::uint64_t> agreed{0}, differed{0};
+                    if (what.empty()) agreed.fetch_add(1, std::memory_order_relaxed);
+                    else differed.fetch_add(1, std::memory_order_relaxed);
+                    static std::atomic<int> printed{0};
+                    if (!what.empty() && printed.fetch_add(1, std::memory_order_relaxed) < 40) std::fprintf(stderr, "[draw-cache] rebased verify: stage %zu program 0x%llx differs in %s\n", i, static_cast<unsigned long long>(program.binary.codeAddress), what.c_str());
+                    static std::atomic<std::uint64_t> reported{0};
+                    if ((agreed.load(std::memory_order_relaxed) + differed.load(std::memory_order_relaxed)) / 2000 != reported.load(std::memory_order_relaxed)) {
+                        reported.store((agreed.load(std::memory_order_relaxed) + differed.load(std::memory_order_relaxed)) / 2000, std::memory_order_relaxed);
+                        std::fprintf(stderr, "[draw-cache] rebased verify: %llu agreed, %llu differed\n", static_cast<unsigned long long>(agreed.load(std::memory_order_relaxed)), static_cast<unsigned long long>(differed.load(std::memory_order_relaxed)));
+                    }
+                }
             }
             if (dataEntry != nullptr && reused[i]) ++dataStagesReused;
             else if (dataEntry != nullptr) ++dataStagesCompiled;
@@ -313,7 +530,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         drawEntryCounters.dataStagesCompiled += dataStagesCompiled;
         drawEntryCounters.dataVerified += dataVerified;
     }
-    cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey);
+    cacheDrawStages(useDrawEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, dataEntry);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
@@ -494,6 +711,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     phaseTiming.Phase(DrawRowGraphics);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
     timing.Mark("draw_and_resource_release");
+    return drawn();
+    };
+    if (!splitDraw) return tail();
+    auto held = std::make_shared<decltype(tail)>(std::move(tail));
+    DrawPipeline::Queue0().Prepare([held] { static_cast<void>((*held)()); });
     return drawn();
 }
 

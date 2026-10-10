@@ -12,6 +12,8 @@
 
 namespace AgcDriver::Graphics {
 
+struct HostImport;
+
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
@@ -27,6 +29,7 @@ struct DrawInputCopy {
 };
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use);
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived);
+const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment);
 struct DrawInputMemoCounts {
     std::uint64_t hits;
     std::uint64_t misses;
@@ -93,7 +96,7 @@ const char* IndirectDrawPathName(IndirectDrawPath path);
 // Draw packets that drew nothing, for the [draws] line: Nothing (an empty count, or no color writes
 // and no pixel shader), Prechecked (State.hpp's DrawRejection refused it before the decode) and
 // Thrown (the decode or the build threw); `us` is the packet's time in the driver.
-enum class DrawSkip : std::uint8_t { Nothing, Prechecked, Thrown, Count };
+enum class DrawSkip : std::uint8_t { Nothing, Prechecked, Thrown, PipelinePending, Count };
 void CountDrawSkip(DrawSkip kind, double us);
 
 // Recorded draws whose written guest buffers were copied (their results reach guest memory by a CPU

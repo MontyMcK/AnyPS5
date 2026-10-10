@@ -1,4 +1,7 @@
+#include <array>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
@@ -31,7 +34,15 @@ static const std::set<uint16_t>& ValidChunks() {
     static const std::set<uint16_t> chunks = [] {
         std::set<uint16_t> result{0};
         std::ifstream file(ResolvePath_nid_no_patch("/app0/playgo-chunkdefs.xml"));
-        if (!file) return result;
+        if (!file) {
+            std::ifstream table(ResolvePath_nid_no_patch("/app0/sce_sys/playgo-chunk.dat"), std::ios::binary);
+            std::array<unsigned char, 12> header{};
+            if (table.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size())) && std::memcmp(header.data(), "plgx", 4) == 0) {
+                const auto count = static_cast<unsigned>(header[10] | (header[11] << 8));
+                for (unsigned id = 0; id < count; ++id) result.insert(static_cast<uint16_t>(id));
+            }
+            return result;
+        }
         const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         static const std::regex chunk(R"re(<chunk\s+id="(\d+)")re");
         for (auto it = std::sregex_iterator(text.begin(), text.end(), chunk); it != std::sregex_iterator(); ++it)
@@ -51,8 +62,13 @@ static int ValidateChunks(const uint16_t* chunk_ids, uint32_t number_of_entries)
     if (!chunk_ids) return SCE_PLAYGO_ERROR_BAD_POINTER;
     if (number_of_entries == 0) return SCE_PLAYGO_ERROR_BAD_SIZE;
     const auto& valid = ValidChunks();
-    for (uint32_t index = 0; index < number_of_entries; ++index)
-        if (!valid.contains(chunk_ids[index])) return SCE_PLAYGO_ERROR_BAD_CHUNK_ID;
+    for (uint32_t index = 0; index < number_of_entries; ++index) {
+        if (!valid.contains(chunk_ids[index])) {
+            static int reported = 0;
+            if (reported++ < 16) std::fprintf(stderr, "[playgo] unknown chunk id %u rejected (%zu chunks known)\n", static_cast<unsigned>(chunk_ids[index]), valid.size());
+            return SCE_PLAYGO_ERROR_BAD_CHUNK_ID;
+        }
+    }
     return 0;
 }
 

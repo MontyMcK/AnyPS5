@@ -109,7 +109,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     }
 }
 
-void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey) {
+void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey, const std::shared_ptr<DrawEntry>& dataEntry) {
     if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu)) {
         phaseTiming.Phase(DrawRowVectors);
         std::uint64_t unstable = 0, mismatches = 0, differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
@@ -129,6 +129,34 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
 
             std::vector<ShaderRecompiler::MemoryRegion> regions(stageCapture.regions.begin(), stageCapture.regions.end());
             for (const auto& read : decodeReads[i]) regions.push_back({read.address, std::as_bytes(std::span(read.bytes))});
+            variant->readRuns.reserve(regions.size());
+            for (const auto& region : regions) variant->readRuns.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+            if (dataEntry != nullptr && dataEntry->decode != nullptr && i < dataEntry->stages.size() && i < dataEntry->decode->programs.size()) {
+                const auto& before = dataEntry->decode->programs[i].userData;
+                const auto& after = programs[i].userData;
+                const auto previous = std::find_if(dataEntry->stages[i].begin(), dataEntry->stages[i].end(), [&](const std::shared_ptr<DispatchVariant>& kept) { return kept->pushOffset == variant->pushOffset; });
+                if (previous != dataEntry->stages[i].end() && (*previous)->readRuns.size() == variant->readRuns.size() && before.size() == after.size()) {
+                    std::vector<std::uint64_t> sources;
+                    sources.reserve(variant->readRuns.size());
+                    bool learned = before.size() <= 63;
+                    for (std::size_t r = 0; r < variant->readRuns.size() && learned; ++r) {
+                        const auto& [oldBegin, oldEnd] = (*previous)->readRuns[r];
+                        const auto& [newBegin, newEnd] = variant->readRuns[r];
+                        if (oldEnd - oldBegin != newEnd - newBegin) {
+                            learned = false;
+                            break;
+                        }
+                        const auto delta = static_cast<std::int64_t>(newBegin - oldBegin);
+                        std::uint64_t candidates = delta == 0 ? std::uint64_t{1} << 63u : 0;
+                        for (std::size_t w = 0; w < before.size(); ++w) {
+                            if (static_cast<std::int64_t>(static_cast<std::int32_t>(after[w] - before[w])) == delta) candidates |= std::uint64_t{1} << w;
+                        }
+                        if (candidates == 0) learned = false;
+                        else sources.push_back(candidates);
+                    }
+                    if (learned) variant->readSources = std::move(sources);
+                }
+            }
             std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
             for (const auto& region : regions) {
                 variant->runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());

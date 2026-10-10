@@ -64,6 +64,27 @@ bool ExactDrawWrites() {
     return exact;
 }
 
+std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> ComputeWriteRanges(const ShaderRecompiler::RecompileResult& compiled) {
+    if (compiled.bdaWrites) return std::nullopt;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    visitWrittenBuffers(compiled, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { ranges.emplace_back(begin, end); });
+    for (const auto& binding : compiled.bindings) {
+        if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage) continue;
+        for (std::uint32_t element = 0; element < binding.count; ++element) {
+            const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
+            if (!written) continue;
+            if (binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) return std::nullopt;
+            const auto resource = Graphics::DecodeTextureResource(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8));
+            if (resource.baseAddress == 0) continue;
+            const auto surfaceBytes = Graphics::DescribeSurface(resource).guestBytes;
+            if (surfaceBytes == 0) return std::nullopt;
+            ranges.emplace_back(resource.baseAddress, resource.baseAddress + surfaceBytes);
+            if (resource.dccAddress != 0) ranges.emplace_back(resource.dccAddress, resource.dccAddress + surfaceBytes / 256 + 1);
+        }
+    }
+    return ranges;
+}
+
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages, bool exact) {
     constexpr std::uint64_t Slack = 64 * 1024;
     constexpr std::uint64_t UnknownBytes = 64ull * 1024 * 1024;

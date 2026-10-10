@@ -10,6 +10,7 @@
 #endif
 #include <cstdint>
 #include <cstddef>
+#include <cstdlib>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include <mutex>
@@ -30,6 +31,8 @@ static std::mutex g_callbackLock;
 static NetCtlCallback g_callbacks[MAX_CALLBACKS] = {};
 
 static bool HostHasAddress(int family) {
+    static const bool offline = std::getenv("APS5_NET_OFFLINE") != nullptr;
+    if (offline) return false;
 #ifdef _WIN32
     static const int socket_status = [] {
         WSADATA data{};

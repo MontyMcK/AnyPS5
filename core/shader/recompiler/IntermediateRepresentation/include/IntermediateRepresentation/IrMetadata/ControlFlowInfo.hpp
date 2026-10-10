@@ -31,7 +31,9 @@ struct DescriptorSource {
         std::uint32_t selectorOffset = 0;
         std::uint32_t keyArg = 0;
         std::uint32_t entryOffset = 0;
+        std::uint32_t entryStride = 32;
         bool hasMaterial = false;
+        bool chain = false;
 
         bool operator==(const IndirectImage& other) const = default;
     };

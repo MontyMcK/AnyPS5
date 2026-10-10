@@ -1,16 +1,46 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "Optimization/ShaderStageInputInfo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <array>
 #include <cstdlib>
 #include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+void noteDwordFillKernel(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments, const ShaderRecompiler::ShaderComputeStageInfo& compute) {
+    static const bool disabled = std::getenv("APS5_NO_DWORD_FILL_CLEAR") != nullptr;
+    if (disabled) return;
+    static constexpr std::array<std::uint32_t, 23> dwordFillKernel{0xbfa00001u, 0xd7460004u, 0x04010c09u, 0x7e000204u, 0x7e020205u, 0x7e040206u, 0x7e060207u, 0x7da80808u, 0xbf88000du, 0x360a0883u, 0xbe84047eu, 0xbe86047eu, 0x7e100505u, 0x7da40a08u, 0xbefc0308u, 0x7e0c8700u, 0x8a867e06u, 0xbefe0406u, 0xbf85fff9u, 0xbefe0404u, 0xe0102000u, 0x80000604u, 0xbf810000u};
+    if (indirectArguments != 0 || userData.size() < 9 || packet.size() < 5 || compute.numThreads[0] != 64 || compute.numThreads[1] != 1 || compute.numThreads[2] != 1) return;
+    if (code.size() < dwordFillKernel.size() || !std::equal(dwordFillKernel.begin(), dwordFillKernel.end(), code.begin())) return;
+    if (userData[4] != userData[5] || userData[5] != userData[6] || userData[6] != userData[7]) return;
+    const auto stride = (userData[1] >> 16u) & 0x3fffu;
+    const bool swizzled = ((userData[1] >> 31u) & 1u) != 0;
+    const bool addTid = ((userData[3] >> 23u) & 1u) != 0;
+    if ((userData[3] >> 30u) != 0 || stride != 4 || swizzled || addTid || ((packet[4] & 0x20u) != 0) || packet[2] != 1 || packet[3] != 1) return;
+    const auto records = std::min<std::uint64_t>({static_cast<std::uint64_t>(packet[1]) * 64u, userData[8], userData[2]});
+    const auto base = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
+    Graphics::TraceDepthMetadataFill(base, static_cast<std::size_t>(records * 4u), userData[4], true, "dword-fill dispatch");
+    Graphics::NoteDepthMetadataFill(base, static_cast<std::size_t>(records * 4u), userData[4]);
+}
+
+}
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     PerformanceTimer timing("Driver.Dispatch");
@@ -24,6 +54,19 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (!registeredShader) registeredShader = ReadRawComputeShader(address);
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
+    static const std::pair<std::uint64_t, std::uint64_t> traceRange = [] {
+        const char* text = std::getenv("APS5_TRACE_DISPATCH_RANGE");
+        if (text == nullptr) return std::pair<std::uint64_t, std::uint64_t>{0, 0};
+        char* end = nullptr;
+        const auto begin = std::strtoull(text, &end, 0);
+        const auto last = end != nullptr && *end == '-' ? std::strtoull(end + 1, nullptr, 0) : begin + 1;
+        return std::pair<std::uint64_t, std::uint64_t>{begin, last};
+    }();
+    if (traceRange.second != 0 && address >= traceRange.first && address < traceRange.second) {
+        static std::atomic<std::uint64_t> traced{0};
+        const auto count = traced.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 2000 || count % 1000 == 0) std::fprintf(stderr, "[trace-dispatch] #%llu shader 0x%llx queue 0x%x present %llu %s groups %u %u %u args 0x%llx registered %d words %zu\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(address), submission.queue, static_cast<unsigned long long>(Graphics::Recorder::Presents()), indirectArguments != 0 ? "indirect" : "direct", packet.size() > 3 ? packet[1] : 0u, packet.size() > 3 ? packet[2] : 0u, packet.size() > 3 ? packet[3] : 0u, static_cast<unsigned long long>(indirectArguments), snapshot.header.empty() ? 0 : 1, snapshot.code.size());
+    }
     const auto userCount = (readRegister(queue.shader, 0x213) >> 1u) & 0x1fu;
     std::vector<std::uint32_t> userData;
     for (std::uint32_t i = 0; i < userCount; ++i) {
@@ -56,7 +99,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
         return;
     }
-    if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+    // APS5_PIPELINED_DISPATCHES=1: a direct dispatch on the draw pipeline's queue keeps the pipeline
+    // running; its device work becomes the committer's next job instead of a drain.
+    static const bool pipelinedDispatches = std::getenv("APS5_PIPELINED_DISPATCHES") != nullptr;
+    bool deferDrain = pipelinedDispatches && DrawPipeline::Active() && indirectArguments == 0 && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
+    if (DrawPipeline::Active() && !deferDrain) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
     if (indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
         pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
         return;
@@ -196,11 +243,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
         static const bool dumpFailures = std::getenv("APS5_DUMP_SHADER_FAILURES") != nullptr;
         try {
-            const auto invocation = InvocationFor(snapshot, codeOffset, request);
-            timing.Mark("prepared_invocation");
-
             const auto waitedBefore = traceCapSync() ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             forgetAtCapture = GuestMemory::ForgetSerial();
+            const auto invocation = InvocationFor(snapshot, codeOffset, request, shaderMemory.get());
+            request.shader = invocation.Request().shader;
+            timing.Mark("prepared_invocation");
+
             capture = [&] {
                 const SampledReadScope sampling(evidenceReads);
                 return shaderMemory->Capture(invocation);
@@ -281,6 +329,79 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     };
     phaseTiming.Phase(PhaseSnapshots);
 
+    if (deferDrain) {
+        auto writes = ComputeWriteRanges(compiled);
+        if (writes.has_value() && !stampValidate() && deferredLabels().labels.empty() && !probeThis) {
+            const auto commitQueue = submission.queue;
+            const auto commitPacket = (packet[0] >> 8u) & 0xffu;
+            const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+            const std::array<std::uint32_t, 5> packetWords{packet[0], packet[1], packet[2], packet[3], packet[4]};
+            auto commit = [this, localDevice, compiledResult, keepVariant, attachVariant, shaderMemory, captured, registeredShader, groups, address, dataHit, cached, commitQueue, commitPacket, epoch, packetWords, codeOffset, userData, compute]() mutable {
+                DrawPipeline::FollowEpoch(epoch);
+                GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
+                const auto& compiled = *compiledResult;
+                std::vector<Graphics::GuestMemorySnapshot> snapshots;
+                snapshots.reserve(captured.size());
+                for (const auto& region : captured) snapshots.push_back({region.guestAddress, region.bytes});
+                std::shared_ptr<RecipeHit> recipeHit;
+                if (cached && keepVariant != nullptr) recipeHit = localDevice->PrepareRecipe(keepVariant->recipe.load(std::memory_order_acquire), false);
+                std::shared_ptr<const Recipe> builtRecipe;
+                auto* const attachTo = keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
+                const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
+                bool writersNoted = false;
+                for (;;) {
+                    std::shared_ptr<PreparedDispatch> prepared;
+                    if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) prepared = localDevice->PrepareDispatch(compiled, snapshots);
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
+                    struct SubmitDue {
+                        Driver& driver;
+                        const std::shared_ptr<VulkanDevice>& device;
+                        ~SubmitDue() noexcept(false) {
+                            if (std::uncaught_exceptions() == 0) driver.submitDueAfterCommit(device.get());
+                        }
+                    } submitDue{*this, localDevice};
+                    recordLabelsForPacket(localDevice.get(), commitQueue);
+                    if (noteWrites && writerKeyedEvidence() && !writersNoted) {
+                        noteWrittenBuffers(address, commitQueue, compiled);
+                        writersNoted = true;
+                    }
+                    if (recipeHit != nullptr) {
+                        VulkanDevice::IndirectOutcome outcome{0, 0};
+                        if (localDevice->DispatchRecipe(compiled, groups[0], groups[1], groups[2], 0, address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, dataHit) == RecipeOutcome::Rebuild) {
+                            recipeHit = nullptr;
+                            VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, false);
+                            continue;
+                        }
+                    } else {
+                        localDevice->Dispatch(compiled, groups[0], groups[1], groups[2], snapshots, address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
+                    }
+                    if (builtRecipe != nullptr) {
+                        if (dataHit) {
+                            auto own = std::make_shared<Recipe>(*builtRecipe);
+                            own->dataWordsHash = Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, keepVariant->compiled.get(), 0});
+                            builtRecipe = std::move(own);
+                        }
+                        attachTo->recipe.store(std::move(builtRecipe), std::memory_order_release);
+                        VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
+                    }
+                    break;
+                }
+                if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, commitQueue, compiled);
+                noteDwordFillKernel(std::span(registeredShader->code).subspan(codeOffset), userData, packetWords, 0, compute);
+            };
+            auto held = std::make_shared<decltype(commit)>(std::move(commit));
+            DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(*writes));
+            if (profile) {
+                auto& pending = pendingDispatchPhases();
+                pending.outcome = DispatchOutcome::Real;
+                pending.phases = false;
+            }
+            return;
+        }
+        DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+    }
     std::shared_ptr<RecipeHit> recipeHit;
     if (cached && keepVariant != nullptr && !stampValidate()) {
         recipeHit = localDevice->PrepareRecipe(keepVariant->recipe.load(std::memory_order_acquire), indirectArguments != 0);
@@ -363,6 +484,21 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     phaseTiming.Phase(PhaseDevice);
     if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, submission.queue, compiled);
+    noteDwordFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, packet, indirectArguments, compute);
+    static const std::uint64_t traceWrite = [] { const char* text = std::getenv("APS5_TRACE_WRITE_ADDRESS"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
+    if (traceWrite != 0) {
+        for (const auto& binding : compiled.bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+            for (std::uint32_t element = 0; element < binding.count && binding.guestDescriptor.size() >= (static_cast<std::size_t>(element) + 1) * 4; ++element) {
+                const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4);
+                const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
+                const auto begin = descriptor.Base48();
+                const auto end = begin + descriptor.GetSize();
+                const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
+                if (begin <= traceWrite && traceWrite < end) std::fprintf(stderr, "[trace-write] dispatch shader 0x%llx queue 0x%x %s buffer element %u 0x%llx-0x%llx over 0x%llx\n", static_cast<unsigned long long>(address), submission.queue, written ? "writes" : "reads", element, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), static_cast<unsigned long long>(traceWrite));
+            }
+        }
+    }
     deviceMs += phaseTiming.Elapsed();
     phaseTiming.Phase(PhaseTail);
     if (profile) {

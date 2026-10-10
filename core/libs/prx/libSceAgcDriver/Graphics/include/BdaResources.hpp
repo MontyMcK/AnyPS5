@@ -10,10 +10,16 @@ bool LoopGuardTripped();
 class BdaResources {
 public:
     explicit BdaResources(const Context& context);
+    ~BdaResources();
+    BdaResources(const BdaResources&) = delete;
+    BdaResources& operator=(const BdaResources&) = delete;
     BdaResources(const Context& context, const GuestBufferMemory& memory);
     VkDescriptorBufferInfo Table() const;
     VkDescriptorBufferInfo Fault() const;
     void CheckFault() const;
+    std::unique_ptr<BdaResources> ShareTable(const Context& context) const;
+    void SetMayWrite(bool value) { mayWrite = value; }
+    bool MayWrite() const { return mayWrite; }
     // APS5_PROFILE_DRAW: page tables served from the per-device cache and built anew (cumulative),
     // and how many recent tables the cache holds right now.
     struct TableCacheStats {
@@ -44,6 +50,9 @@ private:
     std::shared_ptr<Buffer> table;
     std::unique_ptr<Buffer> fault;
     std::size_t tableBytes = 0;
+    bool mayWrite = true;
+    mutable bool checked = false;
+    VkDevice device = VK_NULL_HANDLE;
 };
 
 }

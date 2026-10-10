@@ -34,7 +34,7 @@ namespace AgcDriver::Graphics {
 
 PerformanceControls& LivePerformanceControls() {
     static PerformanceControls controls([] {
-        std::uint32_t flags = 0;
+        std::uint32_t flags = PerformanceControls::InPlaceDrawInputs;
         if (std::getenv("APS5_MERGE_DRAW_BARRIERS") != nullptr) flags |= PerformanceControls::MergeDrawBarriers;
         const char* table = std::getenv("APS5_BDA_TABLE_DEVICE_LOCAL");
         if (table != nullptr && std::string_view(table) == "1") flags |= PerformanceControls::BdaTableDeviceLocal;
@@ -65,9 +65,10 @@ void refreshPerformanceControls() {
     if (!controls.Apply({text.data(), static_cast<std::size_t>(input.gcount())})) return;
     const auto after = controls.Get();
     if (before != after)
-        std::fprintf(stderr, "[perf-controls] merge_draw_barriers=%u bda_table_device_local=%u\n",
+        std::fprintf(stderr, "[perf-controls] merge_draw_barriers=%u bda_table_device_local=%u in_place_draw_inputs=%u\n",
             (after & PerformanceControls::MergeDrawBarriers) != 0,
-            (after & PerformanceControls::BdaTableDeviceLocal) != 0);
+            (after & PerformanceControls::BdaTableDeviceLocal) != 0,
+            (after & PerformanceControls::InPlaceDrawInputs) != 0);
 }
 
 Recorder* activeRecorder = nullptr;
@@ -1079,6 +1080,11 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         if (kept && HookSyncProfiled()) CountRecordedStoreSkip(RecordedStoreKey(), evicted);
     } else {
         stored = StorageTexture::FlushPending(address, bytes, nullptr, "memory access", scope, &published);
+        static const bool traceFlush = std::getenv("APS5_TRACE_ACCESS_FLUSH") != nullptr;
+        if (traceFlush && stored) {
+            static std::atomic<std::uint32_t> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 400) std::fprintf(stderr, "[access-flush] read 0x%llx+0x%zx site %s thread %lu flushed images\n", static_cast<unsigned long long>(address), bytes, GuestMemory::ReadSiteName(site), GetCurrentThreadId());
+        }
     }
     if (stored || published) {
         // Stores into imported memory were only recorded; the CPU is about to read them. The wait
@@ -2205,7 +2211,7 @@ void Recorder::readGpuTiming(Batch& batch) {
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
     AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
-    for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
+    for (std::size_t i = 0; i < hot.size() && i < 30; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
     timingByKey.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
@@ -3359,7 +3365,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] completion label stores: %llu run, %llu skipped (no CPU write-back overlapped them); %llu counted pending at a write-back; %llu write-backs over a tracked label; %llu write-back completions pending\n", static_cast<unsigned long long>(completionStoresRun.load()), static_cast<unsigned long long>(completionStoresSkipped.load()), static_cast<unsigned long long>(completionLabelsCountedLate.load()), static_cast<unsigned long long>(writeBacksOverLabels.load()), static_cast<unsigned long long>(writeBackCompletions.load()));
                     AgcDriver::ProfilePrint_nid_no_patch("[recorder] submits %llu, vkQueueSubmit mean %.1f us, max %.1f us\n", static_cast<unsigned long long>(submitCount), submitCount != 0 ? submitUs / static_cast<double>(submitCount) : 0.0, submitMaxUs);
                     const auto reads = Recorder::ReadCounts();
-                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu; %llu hits on signaled batches ignored\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.staleIgnored));
+                    AgcDriver::ProfilePrint_nid_no_patch("[recorder] in-place reads: %llu noted, %llu queries, hits by reader: dispatch element %llu, gpu copy %llu, address-based %llu, indirect %llu, storage upload %llu, copy source %llu, draw input %llu; %llu hits on signaled batches ignored\n", static_cast<unsigned long long>(reads.noted), static_cast<unsigned long long>(reads.queries), static_cast<unsigned long long>(reads.hits[0]), static_cast<unsigned long long>(reads.hits[1]), static_cast<unsigned long long>(reads.hits[2]), static_cast<unsigned long long>(reads.hits[3]), static_cast<unsigned long long>(reads.hits[4]), static_cast<unsigned long long>(reads.hits[5]), static_cast<unsigned long long>(reads.hits[6]), static_cast<unsigned long long>(reads.staleIgnored));
                 }
             }
         } report{profile, source, waitStart, *this, signaledAtStart};

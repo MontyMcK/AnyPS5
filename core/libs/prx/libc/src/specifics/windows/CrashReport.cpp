@@ -222,6 +222,8 @@ void TraceSse4a(std::uint64_t rip, const sse4a::Instruction& instruction, const 
     Report("[sse4a] #%llu %s %s (length %u, index %u, %u bytes) at %s on thread %lu\n", count, mnemonic, operands, field.length, field.index, static_cast<unsigned>(instruction.size), line, GetCurrentThreadId());
 }
 
+void NoteHandledFault(const CONTEXT& context, std::uint64_t address);
+
 bool HandleSse4a(EXCEPTION_POINTERS* info) {
     if (!g_sse4aEmulation) return false;
     const auto* record = info->ExceptionRecord;
@@ -232,16 +234,59 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
     const std::size_t available = ReadCode(rip, bytes, sizeof(bytes));
     sse4a::Instruction instruction;
     sse4a::Field field;
+    const auto emulatedRsp = context->Rsp;
     if (!sse4a::Emulate(bytes, available, *context, &instruction, &field)) return false;
+    {
+        CONTEXT before = *context;
+        before.Rip = rip;
+        before.Rsp = emulatedRsp;
+        NoteHandledFault(before, 0);
+    }
     const auto count = ++g_sse4aEmulated;
     if (g_sse4aTrace) TraceSse4a(rip, instruction, field, count);
     return true;
 }
 
+struct HandledFault {
+    std::atomic<unsigned long> thread{0};
+    std::atomic<unsigned long long> rip{0};
+    std::atomic<unsigned long long> rsp{0};
+    std::atomic<unsigned long long> address{0};
+};
+HandledFault g_handledFaults[256];
+std::atomic<unsigned long long> g_handledFaultCount{0};
+
+void NoteHandledFault(const CONTEXT& context, std::uint64_t address) {
+    const auto index = g_handledFaultCount.fetch_add(1, std::memory_order_relaxed);
+    auto& entry = g_handledFaults[index % 256];
+    entry.thread.store(GetCurrentThreadId(), std::memory_order_relaxed);
+    entry.rip.store(context.Rip, std::memory_order_relaxed);
+    entry.rsp.store(context.Rsp, std::memory_order_relaxed);
+    entry.address.store(address, std::memory_order_relaxed);
+}
+
+void ReportHandledFaults(unsigned long thread, std::uint64_t rsp) {
+    const auto total = g_handledFaultCount.load(std::memory_order_relaxed);
+    Report("  handled faults: %llu in total (%llu SSE4a emulations, shown with write of 0x0); the latest on this thread (newest first):\n", total, g_sse4aEmulated.load());
+    char line[MAX_PATH + 64];
+    int printed = 0;
+    for (unsigned long long back = 0; back < 256 && back < total && printed < 8; ++back) {
+        const auto& entry = g_handledFaults[(total - 1 - back) % 256];
+        if (entry.thread.load(std::memory_order_relaxed) != thread) continue;
+        DescribeAddress(entry.rip.load(std::memory_order_relaxed), line, sizeof(line));
+        const auto faultRsp = entry.rsp.load(std::memory_order_relaxed);
+        Report("    #%llu ago: rip %s rsp %016llx (crash rsp %+lld) write of 0x%llx\n", back, line, faultRsp, static_cast<long long>(faultRsp) - static_cast<long long>(rsp), entry.address.load(std::memory_order_relaxed));
+        ++printed;
+    }
+}
+
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     const auto* fault = info->ExceptionRecord;
-    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) {
+        NoteHandledFault(*info->ContextRecord, fault->ExceptionInformation[1]);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
     const auto* record = info->ExceptionRecord;
@@ -276,6 +321,7 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     Report("  rsi %016llx rdi %016llx rbp %016llx rsp %016llx\n", context->Rsi, context->Rdi, context->Rbp, context->Rsp);
     Report("  r8  %016llx r9  %016llx r10 %016llx r11 %016llx\n", context->R8, context->R9, context->R10, context->R11);
     Report("  r12 %016llx r13 %016llx r14 %016llx r15 %016llx\n", context->R12, context->R13, context->R14, context->R15);
+    ReportHandledFaults(GetCurrentThreadId(), context->Rsp);
     // The words each register points at, to recognise which structure a bad pointer came from.
     {
         const std::pair<const char*, std::uint64_t> pointers[] = {{"rax", context->Rax}, {"rbx", context->Rbx}, {"rcx", context->Rcx}, {"rdx", context->Rdx}, {"rsi", context->Rsi}, {"rdi", context->Rdi}, {"r12", context->R12}, {"r13", context->R13}, {"r14", context->R14}, {"r15", context->R15}};

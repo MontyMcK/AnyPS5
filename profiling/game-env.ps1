@@ -8,6 +8,8 @@ $env:APS5_MERGE_DRAW_BARRIERS = '1'
 $env:APS5_BDA_TABLE_DEVICE_LOCAL = '0'
 $env:APS5_SHADER_DATA_DEVICE_LOCAL = '0'
 $env:APS5_TRACE_ALIAS_FLUSH = '1'
+$env:APS5_NET_OFFLINE = '1'
+$env:APS5_ASYNC_PIPELINES = '1'
 foreach ($flag in 'APS5_TRACE_WAIT_TIMELINE','APS5_TRACE_EQUEUE_EVENTS','APS5_TRACE_GPU','APS5_TRACE_COND_CALLER','APS5_PROFILE_GPU','APS5_DRAW_INPUT_MEMO','APS5_PERF_CONTROL') { Remove-Item "Env:\$flag" -ErrorAction SilentlyContinue }
 
 function Get-MenuWindow([string]$Log = 'D:\ps5\gt7\run-err.log') {

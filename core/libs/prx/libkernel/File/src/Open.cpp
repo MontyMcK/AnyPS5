@@ -7,7 +7,10 @@
 #include "prx/libkernel/KernelErrors.hpp"
 #include "SceTypes.hpp"
 
+#include <atomic>
 #include <cerrno>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -114,6 +117,11 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
     }
 #endif
     if (fd < 0) {
+        static const bool traceFailures = std::getenv("APS5_TRACE_OPEN_FAILURES") != nullptr;
+        if (traceFailures) {
+            static std::atomic<int> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 500) std::fprintf(stderr, "[open-fail] %s -> %s errno %d flags 0x%x\n", path, native.string().c_str(), errno, flags);
+        }
         return SceErrorFromErrno(errno);
     }
     if ((flags & SCE_KERNEL_O_ACCMODE) != SCE_KERNEL_O_RDONLY || (flags & (SCE_KERNEL_O_CREAT | SCE_KERNEL_O_TRUNC)))

@@ -1,5 +1,6 @@
 #include "BdaTests.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -235,6 +236,121 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
     GuestArena::GuestArenaRelease_nid_postfix(block, bytes);
 }
 
+void addressTemplateTests(const Context& context, const BdaTestAccess& access) {
+    void* block = GuestHeap::GuestHeapAllocate_nid_postfix(64);
+    const auto blockAddress = reinterpret_cast<std::uintptr_t>(block);
+    const auto registered = [&] {
+        const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        return std::any_of(lease.begin(), lease.end(), [&](const auto& range) { return range->address == blockAddress; });
+    };
+    const auto release = [&] {
+        GuestHeap::GuestHeapFree_nid_postfix(block);
+        GuestBufferMemory leased(context);
+        leased.AcquireRegistered();
+        leased.Upload(true);
+        leased.WriteBack();
+    };
+    ShaderRecompiler::RecompileResult vertex;
+    vertex.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    vertex.shaderDataDwords = 4;
+    const auto vsharp = [](std::uint64_t at, std::uint32_t bytes) { return std::vector<std::uint32_t>{static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at >> 32) & 0xffffu, bytes, 0x31000000u}; };
+    vertex.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5), binding(Role::ShaderData, 7), binding(Role::GuestBuffers, 6)};
+    vertex.bindings[2].guestDescriptor = {1, 2, 3, 4};
+    vertex.bindings[3].guestDescriptor = vsharp(blockAddress, 32);
+    vertex.bindings[3].bufferWritten = {false};
+    ShaderRecompiler::RecompileResult fragment;
+    const std::array<CompiledShader, 2> stages{{{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, {ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}}};
+    auto first = std::make_shared<ShaderResources>(context, stages, ColorTarget{}, 0, 0);
+    Require(first->HoldsLease() && first->NeedsCompletion() && first->WritesMemory(), "an address-based draw build holds no lease");
+    if (!ShaderResources::AddressTemplates()) {
+        Require(!first->AddressReusable(), "an address-based build became an address template with APS5_ADDRESS_TEMPLATES unset");
+        first->WriteBackBuffers();
+        Require(!first->HoldsLease(), "write-back kept the lease");
+        first.reset();
+        release();
+        std::cout << "APS5_ADDRESS_TEMPLATES unset: address template reuse not tested\n";
+        return;
+    }
+    if (!first->AddressReusable()) {
+        first->WriteBackBuffers();
+        first.reset();
+        release();
+        std::cout << "registered memory outside the address space's imports and mirrors: address template reuse not tested\n";
+        return;
+    }
+    const auto table = access.descriptor(4).buffer;
+    const auto templateFault = access.descriptor(5).buffer;
+    const auto templateData = access.descriptor(7).buffer;
+    const auto templateView = access.descriptor(6);
+    auto own = ShaderResources::DetachAddressUse(first);
+    Require(!first->HoldsLease() && own->HoldsLease() && own->NeedsCompletion() && own->WritesMemory() && !own->HasCopiedWrites(), "the detached use does not answer as the build it came from");
+    Require(access.descriptor(4).buffer == table && access.descriptor(5).buffer != templateFault && access.descriptor(7).buffer == templateData, "the detached use did not get a fault buffer of its own");
+    own->WriteBackBuffers();
+    Require(!own->HoldsLease(), "the detached use's write-back kept the lease");
+    own.reset();
+    auto miss = ShaderResources::AddressMiss::Count;
+    auto use = ShaderResources::AddressUse(first, stages, {}, miss);
+    Require(use != nullptr && miss == ShaderResources::AddressMiss::None, "an unchanged address-based draw was not served by its template");
+    Require(use->HoldsLease() && use->NeedsCompletion() && use->WritesMemory() && !first->HoldsLease() && !use->AddressReusable(), "a template use does not hold the lease as a build would");
+    const auto useFault = access.descriptor(5).buffer;
+    Require(access.descriptor(4).buffer == table && useFault != templateFault && access.descriptor(7).buffer == templateData, "a template use shares the template's fault buffer or lost its table");
+    vertex.bindings[2].guestDescriptor = {5, 6, 7, 8};
+    auto second = ShaderResources::AddressUse(first, stages, {}, miss);
+    Require(second != nullptr && miss == ShaderResources::AddressMiss::None, "an address-based draw with other constants was not served by its template");
+    const auto secondData = access.descriptor(7);
+    Require(access.descriptor(5).buffer != useFault && secondData.buffer != templateData, "two template uses in flight share a fault or data buffer");
+    std::array<std::uint32_t, 4> words{};
+    std::memcpy(words.data(), access.bytes(secondData.buffer).data() + secondData.offset, sizeof(words));
+    Require(words == std::array<std::uint32_t, 4>{5, 6, 7, 8}, "a template use does not bind its own constants");
+    vertex.bindings[3].guestDescriptor = vsharp(blockAddress + 32, 32);
+    auto moved = ShaderResources::AddressUse(first, stages, {}, miss);
+    Require(moved != nullptr && miss == ShaderResources::AddressMiss::None, "a draw whose read-only buffer moved inside the address space was not served by its template");
+    const auto movedView = access.descriptor(6);
+    Require(movedView.buffer == templateView.buffer && movedView.offset == templateView.offset + 32 && movedView.range == templateView.range && moved->HoldsLease(), "a template use did not bind its moved read-only buffer at the new address");
+    moved->WriteBackBuffers();
+    moved.reset();
+    alignas(16) std::array<std::uint32_t, 8> unregistered{};
+    vertex.bindings[3].guestDescriptor = vsharp(reinterpret_cast<std::uintptr_t>(unregistered.data()), 32);
+    Require(ShaderResources::AddressUse(first, stages, {}, miss) == nullptr && miss == ShaderResources::AddressMiss::MovedOutside, "a read-only buffer moved outside the address space was bound from the template");
+    vertex.bindings[3].guestDescriptor = vsharp(blockAddress, 32);
+    const auto watched = GuestArena::GuestArenaAvailable_nid_postfix() && GuestArena::GuestArenaWriteWatched_nid_postfix();
+    void* pages = watched ? GuestArena::GuestArenaAllocate_nid_postfix(65536, 65536) : nullptr;
+    if (pages != nullptr) {
+#ifdef _WIN32
+        GuestArena::GuestArenaCommit_nid_postfix(pages, 65536, PAGE_READWRITE, 65536);
+#endif
+        const auto page = reinterpret_cast<std::uintptr_t>(pages);
+        const auto generation = AgcDriver::GuestMemory::CollectWrites(page, 4);
+        Require(AgcDriver::GuestMemory::UnchangedSince(page, 4, generation), "an untouched page is written");
+        const auto slot = static_cast<std::uint32_t>(page >> ShaderRecompiler::BdaAbi::WrittenPageShift) + 1u;
+        auto fault = access.bytes(useFault);
+        std::memcpy(fault.data() + ShaderRecompiler::BdaAbi::WrittenSlotsWord * sizeof(std::uint32_t), &slot, sizeof(slot));
+        use->WriteBackBuffers();
+        Require(!AgcDriver::GuestMemory::UnchangedSince(page, 4, generation), "a template use's written page was not marked");
+        std::uint32_t cleared = 1;
+        std::memcpy(&cleared, fault.data() + ShaderRecompiler::BdaAbi::WrittenSlotsWord * sizeof(std::uint32_t), sizeof(cleared));
+        Require(cleared == 0, "a template use's written page slot was not cleared");
+#ifdef _WIN32
+        GuestArena::GuestArenaReset_nid_postfix(pages, 65536);
+#endif
+        GuestArena::GuestArenaRelease_nid_postfix(pages, 65536);
+    } else {
+        std::cout << "guest arena unavailable or not write-watched: template use written pages not tested\n";
+        use->WriteBackBuffers();
+    }
+    Require(!use->HoldsLease() && second->HoldsLease(), "one template use's write-back released another's lease");
+    second->WriteBackBuffers();
+    Require(!second->HoldsLease(), "a template use's write-back kept the lease");
+    use.reset();
+    second.reset();
+    Require(registered(), "guest heap block is not registered");
+    release();
+    Require(!registered(), "a guest free waited on an idle address template");
+    Require(ShaderResources::AddressUse(first, stages, {}, miss) == nullptr && miss == ShaderResources::AddressMiss::Replaced, "a template outlived its address space");
+    const auto counts = ShaderResources::AddressTemplateCounters();
+    Require(counts.hits >= 3 && counts.detached >= 1 && counts.movedBuffers >= 1 && counts.misses[static_cast<std::size_t>(ShaderResources::AddressMiss::Replaced)] >= 1 && counts.misses[static_cast<std::size_t>(ShaderResources::AddressMiss::MovedOutside)] >= 1, "address template counters missed the uses");
+}
+
 }
 
 void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
@@ -386,6 +502,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         if (dropped.enabled) Require(dropped.waiterDrops == after.waiterDrops + 1 && LeaseCounters().cacheDrops == dropped.waiterDrops, "the free did not drop the cached address space");
     }
     heapMirrorTests(context, access);
+    addressTemplateTests(context, access);
     Require(AddressCopyOverflow({{0x1000, 0x3000, 0x2000, "uncommitted pages"}}, 0x2000).empty(), "copies within the limit were refused");
     const auto copies = AddressCopyOverflow({{0x1000, 0x2000, 0x1000, "not mirrored"}, {0x10000, 0x30000, 0x18000, "uncommitted pages"}}, 0x2000);
     Require(!copies.empty() && copies.find("0x10000+0x20000 (0.1 MiB committed, uncommitted pages)") < copies.find("0x1000+0x1000"), "the copy limit does not name the largest copy first");

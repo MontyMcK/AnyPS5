@@ -253,6 +253,13 @@ public:
     std::uint64_t AddressSpaceSerial() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> AddressSpaceReads() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> OwnInPlaceReads() const;
+    bool SpaceOnly() const { return uploaded && !committed && space != nullptr && regions.empty() && lease.empty(); }
+    enum class SpaceShare : std::uint8_t { Taken, Replaced, Imports };
+    SpaceShare ShareSpace(std::uint64_t serial, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& sourceWrites);
+    bool SpaceCovers(std::uint64_t address, std::size_t bytes) const;
+    std::optional<VkDescriptorBufferInfo> SpaceDescriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
+    bool FinishSharedSpace();
+    void TakeSpace(GuestBufferMemory& source);
 
 private:
     struct Region {

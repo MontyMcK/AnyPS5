@@ -12,6 +12,11 @@ bool Driver::drawPrecheck() {
 }
 
 std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const Submission& submission, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect) {
+    static const bool traceAll = std::getenv("APS5_TRACE_ALL_DRAWS") != nullptr;
+    if (traceAll) {
+        static std::atomic<std::uint64_t> packets{0};
+        if (packets.fetch_add(1, std::memory_order_relaxed) < 8000) std::fprintf(stderr, "[draw-packet] %s indexed %d indirect %d indices %u instances %u\n", Pm4::Name(packet[0]).c_str(), drawParameters.indexed ? 1 : 0, drawParameters.indirect ? 1 : 0, drawParameters.indexCount, drawParameters.instanceCount);
+    }
     if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawVerdict::Nothing;
     if (const auto pass = Graphics::DecodeColorMetadataPass(queue)) {
         require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");

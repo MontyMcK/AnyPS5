@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -207,7 +209,18 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
 ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();
-        if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) {
+            // A page probe only picks word-by-word reads: the words that meet a queued write drain.
+            static const bool probeDrains = std::getenv("APS5_PROBE_DRAINS") != nullptr;
+            if (!probeDrains && known.empty() && bytes > sizeof(std::uint32_t)) return ShaderMemory::PendingWrite::Sync;
+            static const bool trace = std::getenv("APS5_TRACE_CAPTURE_DRAINS") != nullptr;
+            static std::atomic<int> traced{0};
+            if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 200) {
+                const auto [begin, limit] = pipeline.OverlapRange(address, bytes);
+                std::fprintf(stderr, "[capture-drain] read 0x%llx+0x%zx overlaps queued write 0x%llx+0x%llx\n", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(limit - begin));
+            }
+            pipeline.Drain(DrawPipeline::DrainReason::Capture);
+        }
     }
     std::uint64_t ValidateCounters::*reason = nullptr;
     PendingView pending;

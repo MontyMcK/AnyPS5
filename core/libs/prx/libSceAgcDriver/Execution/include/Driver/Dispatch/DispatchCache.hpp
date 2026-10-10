@@ -45,6 +45,8 @@ struct DispatchVariant {
     std::vector<ShaderRecompiler::MemoryRegion> captured;
     std::vector<std::pair<std::uint64_t, std::size_t>> spans;
     std::atomic<std::uint64_t> generation{0};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> readRuns;
+    std::vector<std::uint64_t> readSources;
 };
 
 struct DispatchEntry {

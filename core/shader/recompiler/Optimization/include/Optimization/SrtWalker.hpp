@@ -4,6 +4,7 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <utility>
 #include <vector>
@@ -30,6 +31,7 @@ struct SrtRuntime {
     void* userContext = nullptr;
     SrtMemoryReader readSpecializationMemory = nullptr;
     SrtReadTrace* readTrace = nullptr;
+    std::optional<std::uint32_t> firstLaneOverride;
 };
 
 enum class RuntimeValueType {
