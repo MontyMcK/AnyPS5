@@ -1470,7 +1470,15 @@ bool Recorder::QueuedKeyStoreOverlaps(std::uint64_t address, std::size_t bytes) 
 }
 
 bool Recorder::AnyQueuedKeyStore(const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) const {
-    if (open == nullptr) return false;
+    if (open == nullptr || open->keyStores.empty()) return false;
+    // One question over the span of every queued store first: most draws touch none of it.
+    std::uint64_t first = ~std::uint64_t{0};
+    std::uint64_t last = 0;
+    for (const auto& store : open->keyStores) {
+        first = std::min(first, store.begin);
+        last = std::max(last, store.end);
+    }
+    if (!overlaps(first, last)) return false;
     return std::any_of(open->keyStores.begin(), open->keyStores.end(), [&](const Batch::KeyStore& store) { return overlaps(store.begin, store.end); });
 }
 
@@ -1709,7 +1717,14 @@ bool Recorder::QueuedStoreOverlaps(std::uint64_t address, std::size_t bytes) con
 }
 
 bool Recorder::AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint64_t)>& overlaps) const {
-    if (open == nullptr) return false;
+    if (open == nullptr || open->run.queued.empty()) return false;
+    std::uint64_t first = ~std::uint64_t{0};
+    std::uint64_t last = 0;
+    for (const auto& store : open->run.queued) {
+        first = std::min(first, store.address);
+        last = std::max<std::uint64_t>(last, store.address + store.bytes.size());
+    }
+    if (!overlaps(first, last)) return false;
     return std::any_of(open->run.queued.begin(), open->run.queued.end(), [&](const Batch::StoreRun::Queued& store) { return overlaps(store.address, store.address + store.bytes.size()); });
 }
 

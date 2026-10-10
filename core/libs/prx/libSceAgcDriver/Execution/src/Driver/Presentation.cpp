@@ -109,7 +109,10 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             }
         }
         if (trailing) {
-            waitedMs += presenting->FinishPresent();
+            // APS5_FLIP_EARLY=1: the flip completes once its present is queued; the GPU orders the blit
+            // before any later work, and only presentations past the in-flight allowance are waited for.
+            static const bool earlyFlip = std::getenv("APS5_FLIP_EARLY") != nullptr;
+            waitedMs += earlyFlip ? presenting->RetirePresents(inFlight) : presenting->FinishPresent();
             timing.Mark("render_fence_wait");
         }
         if (submitted) {
