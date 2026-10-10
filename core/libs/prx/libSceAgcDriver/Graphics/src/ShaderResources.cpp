@@ -1609,7 +1609,8 @@ std::shared_ptr<ShaderResources> ShaderResources::AddressUse(const std::shared_p
         return std::shared_ptr<ShaderResources>{};
     };
     miss = AddressMiss::None;
-    const bool profile = BuildProfiled();
+    static const bool windowed = std::getenv("APS5_PROFILE_LOOKUP") != nullptr;
+    const bool profile = BuildProfiled() || windowed;
     auto lap = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::array<std::uint64_t, 5> spent{};
     const auto mark = [&](std::size_t phase) {
@@ -1686,6 +1687,20 @@ std::shared_ptr<ShaderResources> ShaderResources::AddressUse(const std::shared_p
     if (profile) {
         counts.timedHits.fetch_add(1, std::memory_order_relaxed);
         for (std::size_t phase = 0; phase < spent.size(); ++phase) counts.nanoseconds[phase].fetch_add(spent[phase], std::memory_order_relaxed);
+    }
+    if (windowed) {
+        static std::array<std::atomic<std::uint64_t>, 5> window{};
+        static std::atomic<std::uint64_t> windowHits{0};
+        static std::atomic<std::int64_t> windowReport{0};
+        for (std::size_t phase = 0; phase < spent.size(); ++phase) window[phase].fetch_add(spent[phase], std::memory_order_relaxed);
+        const auto hits = windowHits.fetch_add(1, std::memory_order_relaxed) + 1;
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto last = windowReport.load(std::memory_order_relaxed);
+        if (now - last > 10'000'000'000ll && windowReport.compare_exchange_strong(last, now)) {
+            const auto us = [&](std::size_t phase) { return static_cast<double>(window[phase].exchange(0)) / 1000.0 / static_cast<double>(hits); };
+            windowHits.store(0);
+            std::fprintf(stderr, "[use-split] %llu address uses, us per use: moved check %.1f space %.1f proof %.1f finish %.1f descriptor set %.1f%c", static_cast<unsigned long long>(hits), us(0), us(1), us(2), us(3), us(4), 10);
+        }
     }
     return use;
 }
@@ -2002,7 +2017,47 @@ void ShaderResources::captureValidation() {
 // registry mutex), so the pending-image checks are skipped; otherwise one scan answers them for
 // every surface at once. The stamp checks go through one tracker lock, the cache checks through
 // the images' cached flags and one touch of the cache.
+struct FastSplit {
+    std::atomic<std::uint64_t> calls{0}, collectNs{0}, scanNs{0}, unchangedNs{0}, cachedNs{0}, totalNs{0}, textures{0};
+    std::atomic<std::int64_t> reported{0};
+};
+
+FastSplit& FastSplitStats() {
+    static FastSplit stats;
+    return stats;
+}
+
+struct FastTimer {
+    bool on;
+    std::chrono::steady_clock::time_point at;
+    explicit FastTimer(bool on) : on(on), at(on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {}
+    std::uint64_t ns() const { return on ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - at).count()) : 0; }
+};
+
 bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted) {
+    static const bool fastSplit = std::getenv("APS5_PROFILE_LOOKUP") != nullptr;
+    auto& fastStats = FastSplitStats();
+    const FastTimer fastTotal(fastSplit);
+    struct FastReport {
+        bool on;
+        const FastTimer& total;
+        FastSplit& stats;
+        std::size_t textures;
+        ~FastReport() {
+            if (!on) return;
+            stats.totalNs.fetch_add(total.ns(), std::memory_order_relaxed);
+            stats.textures.fetch_add(textures, std::memory_order_relaxed);
+            const auto count = stats.calls.fetch_add(1, std::memory_order_relaxed) + 1;
+            const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+            auto last = stats.reported.load(std::memory_order_relaxed);
+            if (now - last > 10'000'000'000ll && stats.reported.compare_exchange_strong(last, now)) {
+                const auto us = [&](std::atomic<std::uint64_t>& value) { return static_cast<double>(value.exchange(0)) / 1000.0 / static_cast<double>(count); };
+                const auto textureCount = stats.textures.exchange(0);
+                stats.calls.store(0);
+                std::fprintf(stderr, "[fast-split] %llu fast proofs (%.1f textures each), us per proof: total %.1f collect %.1f scan %.1f unchanged %.1f cached %.1f%c", static_cast<unsigned long long>(count), static_cast<double>(textureCount) / static_cast<double>(count), us(stats.totalNs), us(stats.collectNs), us(stats.scanNs), us(stats.unchangedNs), us(stats.cachedNs), 10);
+            }
+        }
+    } fastReport{fastSplit, fastTotal, fastStats, textures.size() + storageTextures.size()};
     reason = FastFail::Count;
     overlapping.clear();
     accepted = false;
@@ -2078,7 +2133,11 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
-        surface.collected = GuestMemory::CollectWrites(address, bytes);
+        {
+            const FastTimer timer(fastSplit);
+            surface.collected = GuestMemory::CollectWrites(address, bytes);
+            if (fastSplit) fastStats.collectNs.fetch_add(timer.ns(), std::memory_order_relaxed);
+        }
         if (surface.collected == 0) return fail(FastFail::Collect);
         const auto* source = surface.source;
         if (source != nullptr && DepthSurfaceAt(address)) return fail(FastFail::Changed);
@@ -2139,7 +2198,12 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto& own = image->Descriptor();
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
-        if (GuestMemory::CollectWrites(address, bytes) == 0) return fail(FastFail::Collect);
+        {
+            const FastTimer timer(fastSplit);
+            const auto collected = GuestMemory::CollectWrites(address, bytes);
+            if (fastSplit) fastStats.collectNs.fetch_add(timer.ns(), std::memory_order_relaxed);
+            if (collected == 0) return fail(FastFail::Collect);
+        }
         if (own.dccAddress != 0) {
             // Refresh's unchanged branch (its key compare against the keys the content was
             // uploaded under, through the image's proof; the memory query below), minus its
@@ -2154,7 +2218,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         images.push_back(image);
     }
     if (!pending.empty()) {
-        if (!StorageTexture::ScanPending(pending)) return fail(FastFail::ClearedView);
+        const FastTimer scanTimer(fastSplit);
+        const bool scanned = StorageTexture::ScanPending(pending);
+        if (fastSplit) fastStats.scanNs.fetch_add(scanTimer.ns(), std::memory_order_relaxed);
+        if (!scanned) return fail(FastFail::ClearedView);
         // A foreign image over a view under uncompressed keys is no failure while FindPending
         // names the view's own source: the lookup views the source (cachedTexture's hit rule)
         // and touches nothing else. A surface whose own object T1 refreshed in this Revalidate
@@ -2187,8 +2254,18 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     } else if (unchanged && BuildProfiled()) {
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
-    if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
-    if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
+    {
+        const FastTimer timer(fastSplit);
+        const bool same = GuestMemory::UnchangedSinceAll(queries);
+        if (fastSplit) fastStats.unchangedNs.fetch_add(timer.ns(), std::memory_order_relaxed);
+        if (!same) return fail(FastFail::Changed);
+    }
+    {
+        const FastTimer timer(fastSplit);
+        const bool cached = StorageImagesCached(context, images);
+        if (fastSplit) fastStats.cachedNs.fetch_add(timer.ns(), std::memory_order_relaxed);
+        if (!cached) return fail(FastFail::Evicted);
+    }
     for (const auto* image : images) image->NoteProved();
     for (std::size_t i = 0; i < validatedTextures.size(); ++i) {
         if (fastSkip != nullptr && i < fastSkip->size() && (*fastSkip)[i]) continue;
@@ -2369,7 +2446,43 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
     return OwnRefreshFallback::Count;
 }
 
+struct ProofSplit {
+    std::atomic<std::uint64_t> calls{0}, fastNs{0}, fullNs{0}, importNs{0}, stagingNs{0}, fulls{0};
+    std::atomic<std::int64_t> reported{0};
+};
+
+ProofSplit& ProofSplitStats() {
+    static ProofSplit stats;
+    return stats;
+}
+
+struct ProofLap {
+    bool on = false;
+    std::chrono::steady_clock::time_point at{};
+    void lap(std::atomic<std::uint64_t>& into) {
+        if (!on) return;
+        const auto now = std::chrono::steady_clock::now();
+        into.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - at).count()), std::memory_order_relaxed);
+        at = now;
+    }
+    ~ProofLap() {
+        if (!on) return;
+        auto& stats = ProofSplitStats();
+        const auto count = stats.calls.fetch_add(1, std::memory_order_relaxed) + 1;
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto last = stats.reported.load(std::memory_order_relaxed);
+        if (now - last > 10'000'000'000ll && stats.reported.compare_exchange_strong(last, now)) {
+            const auto us = [&](std::atomic<std::uint64_t>& value) { return static_cast<double>(value.exchange(0)) / 1000.0 / static_cast<double>(count); };
+            const auto fulls = stats.fulls.exchange(0);
+            stats.calls.store(0);
+            std::fprintf(stderr, "[proof-split] %llu proofs (%llu full walks), us per proof: fast %.1f full %.1f imports %.1f staging %.1f\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(fulls), us(stats.fastNs), us(stats.fullNs), us(stats.importNs), us(stats.stagingNs));
+        }
+    }
+};
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report, bool movedImagesRebound) {
+    static const bool splitProfile = std::getenv("APS5_PROFILE_LOOKUP") != nullptr;
+    ProofLap proofLap{splitProfile, splitProfile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!(reusable || addressReusable) || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -2501,8 +2614,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
         if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
     }
+    proofLap.lap(ProofSplitStats().fastNs);
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
     if (!fast) {
+        if (splitProfile) ProofSplitStats().fulls.fetch_add(1, std::memory_order_relaxed);
         countFullWalk(reason);
         if (!fullWalk()) {
             const auto failure = [&] {
@@ -2546,6 +2661,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // epoch gate the flush runs only for regions one registry scan finds pending images over (none
     // while the serial is the memo's), and the serial loop only while the import table's identity
     // moved since the last proof (a retire bumps its epoch, a registry change its generation).
+    proofLap.lap(ProofSplitStats().fullNs);
     const auto serialLoop = [&] {
         for (const auto& region : directRegions) {
             auto serial = HostImportSerial(context, region.begin, static_cast<std::size_t>(region.end - region.begin), true);
@@ -2580,6 +2696,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // (3) Buffers staged in device memory (GuestBufferMemory::AllowDeviceStaging) are copied in
     // from their imports anew for this use, after the flushes above and before the work is
     // recorded; a failure to record leaves the object unusable for this dispatch, not the batch.
+    proofLap.lap(ProofSplitStats().importNs);
     if (auto* recorder = Recorder::Active(); recorder != nullptr) {
         try {
             guestMemory.RecordStagingCopies(*recorder);
@@ -2588,6 +2705,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             return finish(fast, false);
         }
     }
+    proofLap.lap(ProofSplitStats().stagingNs);
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
     if (StorageTexture::PendingSerial() != serialBefore) lookupMemo.epoch = 0;
     return finish(fast, true);

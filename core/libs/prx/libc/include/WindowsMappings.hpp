@@ -551,7 +551,8 @@ private:
                 continue;
             }
             if (view.armed || view.cleanStreak < 255) ++view.cleanStreak;
-            if (view.armed || view.cleanStreak < view.armAfter || !writable(view.protection) || view.hostWrites != 0 || view.page->pins != 0) continue;
+            static const bool armPinned = std::getenv("APS5_ARM_PINNED") != nullptr;
+            if (view.armed || view.cleanStreak < view.armAfter || !writable(view.protection) || view.hostWrites != 0 || (view.page->pins != 0 && !armPinned)) continue;
             DWORD previous;
             const DWORD protection = view.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
             if (!VirtualProtect(reinterpret_cast<void*>(base), pageBytes, protection, &previous)) fail("arm resident guest write tracking");

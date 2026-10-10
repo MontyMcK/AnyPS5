@@ -56,6 +56,27 @@
 #include <utility>
 
 namespace AgcDriver {
+
+namespace {
+
+// APS5_PRESENT_MODE=mailbox|immediate presents without waiting for the display's refresh when the
+// surface supports it (FIFO otherwise).
+template<typename TState>
+VkPresentModeKHR RequestedPresentMode(TState& state, VkPhysicalDevice physical, VkSurfaceKHR surface) {
+    const char* text = std::getenv("APS5_PRESENT_MODE");
+    if (text == nullptr) return VK_PRESENT_MODE_FIFO_KHR;
+    const std::string requested = text;
+    const auto wanted = requested == "immediate" ? VK_PRESENT_MODE_IMMEDIATE_KHR : requested == "mailbox" ? VK_PRESENT_MODE_MAILBOX_KHR : VK_PRESENT_MODE_FIFO_KHR;
+    const auto query = state.template InstanceFunction<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>("vkGetPhysicalDeviceSurfacePresentModesKHR");
+    std::uint32_t count = 0;
+    if (query(physical, surface, &count, nullptr) != VK_SUCCESS || count == 0) return VK_PRESENT_MODE_FIFO_KHR;
+    std::vector<VkPresentModeKHR> modes(count);
+    if (query(physical, surface, &count, modes.data()) != VK_SUCCESS) return VK_PRESENT_MODE_FIFO_KHR;
+    return std::find(modes.begin(), modes.end(), wanted) != modes.end() ? wanted : VK_PRESENT_MODE_FIFO_KHR;
+}
+
+}
+
 namespace {
 
 void check(VkResult result, const char* operation) {
@@ -1217,7 +1238,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         swapchain.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
         swapchain.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
         swapchain.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-        swapchain.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+        swapchain.presentMode = RequestedPresentMode(*state, selected, state->surface);
         swapchain.clipped = VK_FALSE;
         check(state->DeviceFunction<PFN_vkCreateSwapchainKHR>("vkCreateSwapchainKHR")(state->device, &swapchain, nullptr, &state->swapchain), "vkCreateSwapchainKHR");
         std::uint32_t imageCount = 0;
@@ -1875,7 +1896,7 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     create.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     create.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     create.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
-    create.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+    create.presentMode = RequestedPresentMode(*state, state->physical, state->surface);
     create.oldSwapchain = state->swapchain;
     state->retiredSwapchains.reserve(state->retiredSwapchains.size() + 1);
     VkSwapchainKHR replacement = VK_NULL_HANDLE;

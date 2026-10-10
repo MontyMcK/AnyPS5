@@ -1135,8 +1135,27 @@ struct ResolvedResources {
     const ShaderResources::BuildTiming* built = nullptr;
 };
 
+struct LookupSplit {
+    std::atomic<std::uint64_t> draws{0}, keyNs{0}, findNs{0}, proofNs{0}, aliasNs{0}, templateNs{0}, templates{0};
+    std::atomic<std::int64_t> reported{0};
+};
+
+LookupSplit& LookupSplitStats() {
+    static LookupSplit stats;
+    return stats;
+}
+
 ResolvedResources resolveDrawResources(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, bool recordable, DrawOutcome& outcome, DrawTimer& timer) {
     ResolvedResources resolved;
+    static const bool split = std::getenv("APS5_PROFILE_LOOKUP") != nullptr;
+    auto& splitStats = LookupSplitStats();
+    auto splitAt = split ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto splitLap = [&](std::atomic<std::uint64_t>& into) {
+        if (!split) return;
+        const auto now = std::chrono::steady_clock::now();
+        into.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - splitAt).count()), std::memory_order_relaxed);
+        splitAt = now;
+    };
     APS5_LOG_CHARS_OUT_DEBUG("Creating ShaderResources");
     // A recordable draw whose stages' compiled content repeats an earlier one binds that build's
     // descriptor set when it is still valid (see ResourceCache; the dispatch path does the same).
@@ -1152,11 +1171,16 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; });
     if (resolved.cacheable) {
         resolved.contentKey = DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
+        splitLap(splitStats.keyNs);
         auto cached = SharedResourceCache().Find(resolved.contentKey);
+        splitLap(splitStats.findNs);
         if (cached != nullptr && cached->AddressReusable()) {
             auto miss = ShaderResources::AddressMiss::None;
-            if (auto use = ShaderResources::AddressUse(cached, shaders, snapshots, miss)) {
+            auto use = ShaderResources::AddressUse(cached, shaders, snapshots, miss);
+            splitLap(splitStats.proofNs);
+            if (use != nullptr) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                splitLap(splitStats.aliasNs);
                 resolved.resources = std::move(use);
                 outcome.kind = KindBdaHit;
                 outcome.addressBased = true;
@@ -1172,8 +1196,15 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            if (split) {
+                splitStats.templates.fetch_add(1, std::memory_order_relaxed);
+                const auto before = splitAt;
+                splitLap(splitStats.proofNs);
+                splitStats.templateNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(splitAt - before).count()), std::memory_order_relaxed);
+            }
             if (moved.has_value()) {
                 if (trimKey) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
+                splitLap(splitStats.aliasNs);
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;
@@ -1189,6 +1220,19 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         countCache(&DrawProfile::uncacheable);
     }
     timer.phase(PhaseLookup);
+    if (split) {
+        const auto count = splitStats.draws.fetch_add(1, std::memory_order_relaxed) + 1;
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto last = splitStats.reported.load(std::memory_order_relaxed);
+        if (now - last > 10'000'000'000ll && splitStats.reported.compare_exchange_strong(last, now)) {
+            const auto us = [&](std::atomic<std::uint64_t>& value) { return static_cast<double>(value.exchange(0)) / 1000.0 / static_cast<double>(std::max<std::uint64_t>(count, 1)); };
+            splitStats.draws.store(0);
+            const auto templates = splitStats.templates.exchange(0);
+            const auto templateUs = templates != 0 ? static_cast<double>(splitStats.templateNs.exchange(0)) / 1000.0 / static_cast<double>(templates) : 0.0;
+            std::fprintf(stderr, "[lookup-split] %llu templates at %.1f us (revalidate + moved buffers); ", static_cast<unsigned long long>(templates), templateUs);
+            std::fprintf(stderr, "[lookup-split] %llu draws, us per draw: key %.1f find %.1f proof %.1f alias %.1f\n", static_cast<unsigned long long>(count), us(splitStats.keyNs), us(splitStats.findNs), us(splitStats.proofNs), us(splitStats.aliasNs));
+        }
+    }
     if (resolved.resources == nullptr) {
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
         resolved.built = &resolved.resources->Timing();

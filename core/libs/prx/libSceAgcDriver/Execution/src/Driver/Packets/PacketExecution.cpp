@@ -59,6 +59,7 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
 }
 
 void Driver::execute(const Submission& submission) {
+    if (submission.queue == 0) DrawPipeline::PipeTrace(DrawPipeline::Trace::QueuePacket, submission.suspend ? 0x201u : 0x200u);
     const bool pipelined = submission.queue == 0 && DrawPipeline::Depth() != 0;
     static const bool orderedWaits = std::getenv("APS5_PIPELINE_ORDERED_LABELS") != nullptr;
     DrawPipeline::Active() = pipelined;
@@ -101,6 +102,7 @@ void Driver::execute(const Submission& submission) {
         resetGraphics = true;
         return;
     }
+    if (submission.queue == 0) DrawPipeline::PipeTrace(DrawPipeline::Trace::QueuePacket, 0x202u);
     QueueState* state = nullptr;
     {
         std::lock_guard lock(mutex);
@@ -154,6 +156,7 @@ void Driver::execute(const Submission& submission) {
         const auto count = Pm4::PacketWords(header);
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
+        if (submission.queue == 0) DrawPipeline::PipeTrace(DrawPipeline::Trace::QueuePacket, header == FlipPacketHeader ? 0x1ffu : opcode);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
         if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue))) {
@@ -171,12 +174,16 @@ void Driver::execute(const Submission& submission) {
                 continue;
             }
         }
+        if (header == FlipPacketHeader) DrawPipeline::PipeTrace(DrawPipeline::Trace::QueueFlip, submission.queue);
         if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
         std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
-        if (opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader) deviceUse.lock();
+        if (opcode != 0x3c && opcode != 0x93 && header != RenderingWaitPacketHeader && header != FlipPacketHeader) {
+            const DrawPipeline::TraceScope lockTrace(DrawPipeline::Trace::QueueDeviceLock, DrawPipeline::Trace::QueueDeviceLockEnd);
+            deviceUse.lock();
+        }
 
         timing.Mark("device_lock");
         GuestMemory::SetCurrentPacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.queue);
@@ -194,7 +201,10 @@ void Driver::execute(const Submission& submission) {
         }
 
         const auto flushStart = profilePackets ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        flushBetweenPackets(submission.queue, header, opcode == 0x49 || opcode == 0x37);
+        {
+            const DrawPipeline::TraceScope flushTrace(DrawPipeline::Trace::QueueFlush, DrawPipeline::Trace::QueueFlushEnd);
+            flushBetweenPackets(submission.queue, header, opcode == 0x49 || opcode == 0x37);
+        }
         timing.Mark("flush_between_packets");
         PacketTimer packetTimer{profilePackets, header == FlipPacketHeader ? 0xffffu : opcode, submission.queue, packetProfile, std::chrono::steady_clock::now()};
 

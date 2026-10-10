@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -50,6 +51,7 @@ bool Driver::traceLateLabels() {
 }
 
 void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit) {
+    const DrawPipeline::ProducerScope producer(DrawPipeline::Producer::MemoryWait);
 
     auto start = std::chrono::steady_clock::now();
     auto lastDone = packetsDone.load();

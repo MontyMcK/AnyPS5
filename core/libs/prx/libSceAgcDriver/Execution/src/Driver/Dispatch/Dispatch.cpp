@@ -43,6 +43,7 @@ void noteDwordFillKernel(std::span<const std::uint32_t> code, const std::vector<
 }
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
+    const DrawPipeline::TraceScope pipeTrace(DrawPipeline::Trace::QueueDispatch, DrawPipeline::Trace::QueueDispatchEnd, submission.queue);
     PerformanceTimer timing("Driver.Dispatch");
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     auto it = submission.shaders->upper_bound(address);
@@ -392,7 +393,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 noteDwordFillKernel(std::span(registeredShader->code).subspan(codeOffset), userData, packetWords, 0, compute);
             };
             auto held = std::make_shared<decltype(commit)>(std::move(commit));
-            DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(*writes));
+            DrawPipeline::Queue0().EnqueueOrdered([held] { (*held)(); }, std::move(*writes));
             if (profile) {
                 auto& pending = pendingDispatchPhases();
                 pending.outcome = DispatchOutcome::Real;

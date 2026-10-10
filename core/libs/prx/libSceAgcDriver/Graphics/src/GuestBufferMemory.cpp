@@ -1671,7 +1671,9 @@ GuestBufferMemory::SpaceShare GuestBufferMemory::ShareSpace(std::uint64_t serial
     refreshHeapMirrors(heaps, blocks);
     compareBlocks(blocks);
     if (mirrorsEnabled()) {
-        sweepMirrors();
+        static const bool sweepEachUse = std::getenv("APS5_SWEEP_MIRRORS_EACH_USE") != nullptr;
+        static std::atomic<std::uint32_t> uses{0};
+        if (sweepEachUse || uses.fetch_add(1, std::memory_order_relaxed) % 256u == 0) sweepMirrors();
         reportMirrors();
     }
     return SpaceShare::Taken;

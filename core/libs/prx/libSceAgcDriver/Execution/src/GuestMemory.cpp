@@ -1035,6 +1035,19 @@ EpochCollectMap& epochCollectMap(std::uint64_t epoch) {
     return map;
 }
 
+constexpr std::uint64_t SharedEpochBit = std::uint64_t{1} << 62u;
+
+struct SharedEpochRanges {
+    std::mutex mutex;
+    std::uint64_t epoch = 0;
+    std::unordered_map<std::uintptr_t, WriteTracker::Memo> ranges;
+};
+
+SharedEpochRanges& SharedRanges() {
+    static SharedEpochRanges ranges;
+    return ranges;
+}
+
 bool epochCollectMapEnabled() {
     static const bool enabled = std::getenv("APS5_NO_EPOCH_COLLECT_MAP") == nullptr;
     return enabled;
@@ -1120,7 +1133,29 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #endif
 }
 
+struct CollectSplit {
+    std::atomic<std::uint64_t> mapHits{0}, ringHits{0}, walks{0}, ringNs{0}, walkNs{0}, walkBytes{0};
+    std::atomic<std::int64_t> reported{0};
+};
+
+CollectSplit& CollectSplitStats() {
+    static CollectSplit stats;
+    return stats;
+}
+
+void reportCollectSplit() {
+    auto& stats = CollectSplitStats();
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto last = stats.reported.load(std::memory_order_relaxed);
+    if (now - last <= 10'000'000'000ll || !stats.reported.compare_exchange_strong(last, now)) return;
+    const auto walks = stats.walks.exchange(0);
+    const auto ringHits = stats.ringHits.exchange(0);
+    std::fprintf(stderr, "[collect-split] (10 s) map hits %llu, ring hits %llu, walks %llu (%.1f us each, %.1f KiB each); ring scans %.0f ms%c", static_cast<unsigned long long>(stats.mapHits.exchange(0)), static_cast<unsigned long long>(ringHits), static_cast<unsigned long long>(walks), walks != 0 ? static_cast<double>(stats.walkNs.load()) / 1000.0 / static_cast<double>(walks) : 0.0, walks != 0 ? static_cast<double>(stats.walkBytes.exchange(0)) / 1024.0 / static_cast<double>(walks) : 0.0, static_cast<double>(stats.ringNs.exchange(0)) / 1e6, 10);
+    stats.walkNs.store(0);
+}
+
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
+    static const bool collectProfile = std::getenv("APS5_PROFILE_LOOKUP") != nullptr;
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
     constexpr std::uint64_t page = 4096;
@@ -1138,11 +1173,36 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             const auto& map = epochCollectMap(epoch);
             if (const auto found = map.ranges.find(first); found != map.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
                 collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                if (collectProfile) {
+                    CollectSplitStats().mapHits.fetch_add(1, std::memory_order_relaxed);
+                    reportCollectSplit();
+                }
                 return tracker.generation.load(std::memory_order_relaxed);
             }
         }
+        if ((epoch & SharedEpochBit) != 0) {
+            auto& shared = SharedRanges();
+            std::lock_guard sharedLock(shared.mutex);
+            if (shared.epoch == epoch) {
+                if (const auto found = shared.ranges.find(first); found != shared.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
+                    collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                    if (collectProfile) {
+                        CollectSplitStats().mapHits.fetch_add(1, std::memory_order_relaxed);
+                        reportCollectSplit();
+                    }
+                    return tracker.generation.load(std::memory_order_relaxed);
+                }
+            }
+        }
+        const auto ringStart = collectProfile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        struct RingTime {
+            bool on;
+            std::chrono::steady_clock::time_point start;
+            ~RingTime() { if (on) CollectSplitStats().ringNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed); }
+        } ringTime{collectProfile, ringStart};
         for (const auto& entry : threadCollectMemo.entries) {
             if (entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end) {
+                if (collectProfile) CollectSplitStats().ringHits.fetch_add(1, std::memory_order_relaxed);
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
                 // make every later UnchangedSince fail until the epoch ends.
@@ -1151,7 +1211,21 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             }
         }
     }
-    const auto lock = lockTracker(tracker);
+    const auto walkStart = collectProfile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    struct WalkTime {
+        bool on;
+        std::chrono::steady_clock::time_point start;
+        std::uint64_t bytes;
+        ~WalkTime() {
+            if (!on) return;
+            auto& stats = CollectSplitStats();
+            stats.walks.fetch_add(1, std::memory_order_relaxed);
+            stats.walkBytes.fetch_add(bytes, std::memory_order_relaxed);
+            stats.walkNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+            reportCollectSplit();
+        }
+    } walkTime{collectProfile && memoized, walkStart, stop - first};
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return 0;
     auto cursor = first;
@@ -1174,6 +1248,42 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
 #endif
+#ifdef _WIN32
+    static const bool singlePassWalk = std::getenv("APS5_NO_SINGLE_PASS_COLLECT") == nullptr;
+    if (singlePassWalk && SharedEpochMemo() && (epoch & SharedEpochBit) != 0) {
+        // A shared-epoch walk asks the kernel outside the tracker mutex (checks of other threads go on
+        // meanwhile) and stamps what it found under it: a write the kernel reported here is stamped
+        // before this thread's memo entry exists, and a write after the walk is the next epoch's.
+        thread_local std::vector<void*>* localSlot = nullptr;
+        auto& local = ShaderRecompiler::ThreadOwned(localSlot);
+        if (local.size() != 4096) local.resize(4096);
+        thread_local std::vector<std::uintptr_t>* dirtySlot = nullptr;
+        auto& dirtyPages = ShaderRecompiler::ThreadOwned(dirtySlot);
+        dirtyPages.clear();
+        lock.unlock();
+        bool complete = true;
+        for (auto at = first; at < stop;) {
+            std::size_t count = local.size();
+            if (!GuestArena::GuestArenaCollectWrites_nid_postfix(at, static_cast<std::size_t>(stop - at), local.data(), &count, true)) {
+                complete = false;
+                break;
+            }
+            for (std::size_t i = 0; i < count; ++i) dirtyPages.push_back(reinterpret_cast<std::uintptr_t>(local[i]));
+            if (count < local.size()) break;
+            at = reinterpret_cast<std::uintptr_t>(local[count - 1]) + 4096;
+        }
+        lock.lock();
+        ++tracker.generation;
+        const auto observer = dirtyPages.empty() ? nullptr : dirtyObserver.load(std::memory_order_acquire);
+        for (const auto page : dirtyPages) {
+            tracker.stamp(tracker.blockOf(page), tracker.generation, StampKind::Cpu);
+            tracker.noteCpuStore(page, page + WritePageBytes, tracker.generation);
+            if (observer != nullptr) observer(page, WritePageBytes);
+        }
+        if (!dirtyPages.empty()) collectDirty.fetch_add(1, std::memory_order_relaxed);
+        if (!complete) return 0;
+    } else
+#endif
     if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
@@ -1181,6 +1291,18 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
         else {
             threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
+            if ((epoch & SharedEpochBit) != 0) {
+                auto& shared = SharedRanges();
+                std::lock_guard sharedLock(shared.mutex);
+                if (shared.epoch < epoch) {
+                    shared.ranges.clear();
+                    shared.epoch = epoch;
+                }
+                if (shared.epoch == epoch) {
+                    auto& entry = shared.ranges[first];
+                    if (entry.unwatched != serial || entry.end < stop) entry = {first, stop, epoch, serial};
+                }
+            }
             if (epochCollectMapEnabled()) {
                 auto& entry = epochCollectMap(epoch).ranges[first];
                 if (entry.unwatched != serial || entry.end < stop) entry = {first, stop, epoch, serial};
@@ -1265,6 +1387,16 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
 
 void BumpCollectEpoch() {
     threadCollectEpoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
+    collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool SharedEpochMemo() {
+    static const bool enabled = std::getenv("APS5_SHARED_EPOCH_MEMO") != nullptr;
+    return enabled;
+}
+
+void FollowCollectEpoch(std::uint64_t token) {
+    threadCollectEpoch = SharedEpochBit | token;
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
 }
 

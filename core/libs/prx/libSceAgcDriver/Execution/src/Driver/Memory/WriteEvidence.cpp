@@ -219,6 +219,7 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
                 const auto [begin, limit] = pipeline.OverlapRange(address, bytes);
                 std::fprintf(stderr, "[capture-drain] read 0x%llx+0x%zx overlaps queued write 0x%llx+0x%llx\n", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(begin), static_cast<unsigned long long>(limit - begin));
             }
+            pipeline.WaitEarlierPreparations();
             pipeline.Drain(DrawPipeline::DrainReason::Capture);
         }
     }

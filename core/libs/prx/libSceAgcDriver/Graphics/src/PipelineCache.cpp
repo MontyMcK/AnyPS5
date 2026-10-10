@@ -108,10 +108,10 @@ void PipelineCache::save(bool final) {
     const auto getData = context.Function<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData");
     std::size_t size = 0;
     if (getData(context.device, cache, &size, nullptr) != VK_SUCCESS || size == 0 || size == savedBytes) return;
-    // A large cache is rewritten whole: between the teardown saves, only growth of a sixteenth (at
-    // least 16 MiB) or two minutes since the last save pays for another copy, hash and write.
+    // A large cache is rewritten whole: between the teardown saves, only growth of a quarter (at
+    // least 16 MiB) or ten minutes since the last save pays for another copy, hash and write.
     const auto now = std::chrono::steady_clock::now();
-    if (!final && size > savedBytes && size - savedBytes < std::max<std::size_t>(savedBytes / 16u, std::size_t{16} << 20u) && now - savedAt < std::chrono::minutes(2)) return;
+    if (!final && size - std::min(size, savedBytes) < std::max<std::size_t>(savedBytes / 4u, std::size_t{16} << 20u) && now - savedAt < std::chrono::minutes(10)) return;
     std::vector<std::byte> file(sizeof(FileHeader) + size);
     const auto result = getData(context.device, cache, &size, file.data() + sizeof(FileHeader));
     if (result != VK_SUCCESS && result != VK_INCOMPLETE) return;

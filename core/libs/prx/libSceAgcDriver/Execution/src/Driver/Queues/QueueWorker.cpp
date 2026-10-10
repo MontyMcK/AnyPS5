@@ -146,7 +146,10 @@ void Driver::run(std::uint32_t id) noexcept {
                 const auto poll = [&](const auto& done) {
 #ifdef _WIN32
                     lock.unlock();
-                    PollSleep();
+                    {
+                        const DrawPipeline::ProducerScope producer(DrawPipeline::Producer::Polling);
+                        PollSleep();
+                    }
                     lock.lock();
                     return done();
 #else

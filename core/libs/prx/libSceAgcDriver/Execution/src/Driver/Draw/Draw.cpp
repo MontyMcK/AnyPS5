@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -15,6 +17,7 @@ std::vector<std::shared_ptr<DispatchVariant>>& RebasedProbes();
 bool verifyRebasedHits();
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
+    const DrawPipeline::TraceScope pipeTrace(DrawPipeline::Trace::QueueDraw, DrawPipeline::Trace::QueueDrawEnd);
     PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::array<double, DrawDriverPhaseCount> phaseMs{};
@@ -297,11 +300,23 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowDecode);
     }
 
-    const bool splitDraw = DrawPipeline::SplitDraws() && pipelined && !drawParameters.indirect && !lockedPrepare && deferredLabels().labels.empty() && dumpTarget == 0 && dumpSlot1 == 0 && !verifyHit && !verifyDrawDataHits() && !verifyRebasedHits() && std::all_of(dataCandidates.begin(), dataCandidates.end(), [](const auto& candidates) { return candidates.empty(); });
+    static const bool splitDataHits = std::getenv("APS5_NO_SPLIT_DATA_HITS") == nullptr;
+    const bool splitDraw = DrawPipeline::SplitDraws() && pipelined && !drawParameters.indirect && !lockedPrepare && deferredLabels().labels.empty() && dumpTarget == 0 && dumpSlot1 == 0 && !verifyHit && !verifyDrawDataHits() && !verifyRebasedHits() && (splitDataHits || std::all_of(dataCandidates.begin(), dataCandidates.end(), [](const auto& candidates) { return candidates.empty(); }));
+    const auto clipControl = readRegister(queue.context, 0x207);
+    if (DrawPipeline::SplitDraws() && profile) {
+        static std::array<std::atomic<std::uint64_t>, 8> refusals{};
+        static std::atomic<std::int64_t> refusalReport{0};
+        const bool candidates = !std::all_of(dataCandidates.begin(), dataCandidates.end(), [](const auto& entries) { return entries.empty(); });
+        const std::size_t reason = splitDraw ? 0 : !pipelined ? 1 : drawParameters.indirect ? 2 : lockedPrepare ? 3 : !deferredLabels().labels.empty() ? 4 : candidates ? 5 : 6;
+        refusals[reason].fetch_add(1, std::memory_order_relaxed);
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto last = refusalReport.load(std::memory_order_relaxed);
+        if (now - last > 10'000'000'000ll && refusalReport.compare_exchange_strong(last, now)) std::fprintf(stderr, "[draw] split decisions (10 s): split %llu, not pipelined %llu, indirect %llu, locked prepare %llu, deferred labels %llu, data candidates %llu, other %llu%c", static_cast<unsigned long long>(refusals[0].exchange(0)), static_cast<unsigned long long>(refusals[1].exchange(0)), static_cast<unsigned long long>(refusals[2].exchange(0)), static_cast<unsigned long long>(refusals[3].exchange(0)), static_cast<unsigned long long>(refusals[4].exchange(0)), static_cast<unsigned long long>(refusals[5].exchange(0)), static_cast<unsigned long long>(refusals[6].exchange(0)), 10);
+    }
     auto splitRejected = std::make_shared<std::string>();
     std::string* rejectedOut = splitDraw ? splitRejected.get() : &rejected;
     const auto splitEpoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-    auto tail = [this, &queue, &submission, packet, rejectedOut, splitRejected, splitDraw, splitEpoch, phaseMsIn = phaseMs, phaseLapIn = phaseLap, capturesIn = captures, drawParameters, pipelined, traceIndirect, gpuLock = std::move(gpuLock), localDevice, useDrawEntries, registerKey, drawKey, entry = std::move(entry), decode = std::move(decode), dataEntry = std::move(dataEntry), shapeKey, programs = std::move(programs), memory = std::move(memory), linked = std::move(linked), vertexInfos = std::move(vertexInfos), decodeReads = std::move(decodeReads), results = std::move(results), compiledStages = std::move(compiledStages), stages = std::move(stages), pushCursorBytes, programResults = std::move(programResults), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), recompiled = std::move(recompiled), dataCandidates = std::move(dataCandidates), reused = std::move(reused), dataStagesReused, dataStagesCompiled, dataVerified, drawHit, verifyHit]() mutable -> DrawVerdict {
+    auto tail = [this, &queue, &submission, clipControl, packet, rejectedOut, splitRejected, splitDraw, splitEpoch, phaseMsIn = phaseMs, phaseLapIn = phaseLap, capturesIn = captures, drawParameters, pipelined, traceIndirect, gpuLock = std::move(gpuLock), localDevice, useDrawEntries, registerKey, drawKey, entry = std::move(entry), decode = std::move(decode), dataEntry = std::move(dataEntry), shapeKey, programs = std::move(programs), memory = std::move(memory), linked = std::move(linked), vertexInfos = std::move(vertexInfos), decodeReads = std::move(decodeReads), results = std::move(results), compiledStages = std::move(compiledStages), stages = std::move(stages), pushCursorBytes, programResults = std::move(programResults), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), recompiled = std::move(recompiled), dataCandidates = std::move(dataCandidates), reused = std::move(reused), dataStagesReused, dataStagesCompiled, dataVerified, drawHit, verifyHit]() mutable -> DrawVerdict {
     if (splitDraw) DrawPipeline::FollowEpoch(splitEpoch);
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
@@ -345,7 +360,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
         decodeReads[i].clear();
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i]);
-        if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = (readRegister(queue.context, 0x207) & (0xffffu | (1u << 21u) | (1u << 22u) | (1u << 23u))) | graphics.layerExports;
+        if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = (clipControl & (0xffffu | (1u << 21u) | (1u << 22u) | (1u << 23u))) | graphics.layerExports;
     };
     ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
     static_cast<void>(setMeshIndexBuffer);
@@ -683,6 +698,38 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto commitQueue = submission.queue;
         const auto commitPacket = (packet[0] >> 8u) & 0xffu;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        if (GuestMemory::SharedEpochMemo()) {
+            // The committer's collects of this draw's surfaces become memo hits of the shared epoch.
+            DrawPipeline::FollowEpoch(epoch);
+            for (const auto& stage : stages) {
+                if (stage.program == nullptr) continue;
+                for (const auto& binding : stage.program->bindings) {
+                    if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.count == 0 || binding.guestDescriptor.size() != static_cast<std::size_t>(binding.count) * 8u) continue;
+                    for (std::uint32_t element = 0; element < binding.count; ++element) {
+                        const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
+                        if (words[0] == 0u && (words[1] & 0xffu) == 0u) continue;
+                        try {
+                            const auto resource = Graphics::DecodeTextureResource(words);
+                            if (resource.baseAddress == 0) continue;
+                            const auto bytes = Graphics::DescribeSurface(resource).guestBytes;
+                            if (bytes != 0) static_cast<void>(GuestMemory::CollectWrites(resource.baseAddress, static_cast<std::size_t>(bytes)));
+                        } catch (const std::exception&) {
+                        }
+                    }
+                }
+            }
+            const auto prefetchTarget = [](const Graphics::ColorTarget& color) {
+                if (color.address == 0 || color.bytes == 0) return;
+                try {
+                    const auto surface = Graphics::SurfaceForTarget(color);
+                    const auto bytes = Graphics::DescribeSurface(surface).guestBytes;
+                    if (surface.baseAddress != 0 && bytes != 0) static_cast<void>(GuestMemory::CollectWrites(surface.baseAddress, static_cast<std::size_t>(bytes)));
+                } catch (const std::exception&) {
+                }
+            };
+            if (graphics.hasColorTarget) prefetchTarget(graphics.color);
+            for (const auto& color : graphics.colors) prefetchTarget(color);
+        }
         auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), compiledStages = std::move(compiledStages), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry)] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
