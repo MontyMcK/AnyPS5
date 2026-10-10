@@ -21,8 +21,10 @@ int Open(int userId, std::int32_t type, std::int32_t index, const MouseOpenParam
 int Close(std::int32_t handle);
 int Read(std::int32_t handle, MouseData* data, std::int32_t num);
 void Publish(const MouseInputEvent& event);
+bool IsOpen();
 }
 
 extern "C" void MousePublishInput_nid_postfix(const MouseInputEvent& event);
+extern "C" bool MouseIsOpen_nid_postfix();
 
 #endif

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "ThreadOwned.hpp"
 #include <cstdlib>
 
@@ -132,8 +133,14 @@ void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue
     }
 }
 
+bool Driver::labelsPending(VulkanDevice* localDevice) const {
+    static const bool packetFlush = !LabelBatchSubmit() && std::getenv("APS5_NO_LABEL_PACKET_FLUSH") == nullptr;
+    return !deferredLabels().labels.empty() || (localDevice != nullptr && packetFlush && Graphics::Recorder::PendingLabelSince().has_value());
+}
+
 bool Driver::recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queue) {
     static const bool packetFlush = !LabelBatchSubmit() && std::getenv("APS5_NO_LABEL_PACKET_FLUSH") == nullptr;
+    if (Graphics::CommitTrimEnabled() && deferredLabels().labels.empty() && (localDevice == nullptr || !packetFlush || !Graphics::Recorder::PendingLabelSince().has_value())) return false;
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

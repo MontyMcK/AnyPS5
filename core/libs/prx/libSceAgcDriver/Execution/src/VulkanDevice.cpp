@@ -4,6 +4,7 @@
 #include "BdaAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DebugControls.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSpeculation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
@@ -79,7 +80,32 @@ VkPresentModeKHR RequestedPresentMode(TState& state, VkPhysicalDevice physical, 
 
 namespace {
 
+VkDevice faultDevice = VK_NULL_HANDLE;
+PFN_vkGetDeviceFaultInfoEXT faultInfo = nullptr;
+
+void reportDeviceFault() {
+    static std::atomic<bool> reported{false};
+    if (faultInfo == nullptr || reported.exchange(true)) return;
+    VkDeviceFaultCountsEXT counts{VK_STRUCTURE_TYPE_DEVICE_FAULT_COUNTS_EXT};
+    if (faultInfo(faultDevice, &counts, nullptr) != VK_SUCCESS) {
+        std::fprintf(stderr, "[device-fault] no fault information\n");
+        return;
+    }
+    std::vector<VkDeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<VkDeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+    counts.vendorBinarySize = 0;
+    VkDeviceFaultInfoEXT info{VK_STRUCTURE_TYPE_DEVICE_FAULT_INFO_EXT};
+    info.pAddressInfos = addresses.empty() ? nullptr : addresses.data();
+    info.pVendorInfos = vendors.empty() ? nullptr : vendors.data();
+    const auto result = faultInfo(faultDevice, &counts, &info);
+    std::fprintf(stderr, "[device-fault] result %d, %u addresses, %u vendor records: %s\n", static_cast<int>(result), counts.addressInfoCount, counts.vendorInfoCount, info.description);
+    for (const auto& address : addresses) std::fprintf(stderr, "[device-fault] address type %d reported 0x%llx precision 0x%llx\n", static_cast<int>(address.addressType), static_cast<unsigned long long>(address.reportedAddress), static_cast<unsigned long long>(address.addressPrecision));
+    for (const auto& vendor : vendors) std::fprintf(stderr, "[device-fault] vendor %s code 0x%llx data 0x%llx\n", vendor.description, static_cast<unsigned long long>(vendor.vendorFaultCode), static_cast<unsigned long long>(vendor.vendorFaultData));
+    std::fflush(stderr);
+}
+
 void check(VkResult result, const char* operation) {
+    if (result == VK_ERROR_DEVICE_LOST) reportDeviceFault();
     if (result != VK_SUCCESS) {
         throw std::runtime_error(std::string(operation) + ": Vulkan result " + std::to_string(result));
     }
@@ -1174,7 +1200,28 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     deviceInfo.pNext = &bdaFeatures;
     auto shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
+    VkPhysicalDeviceFaultFeaturesEXT faultFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    bool deviceFault = false;
+    if (std::getenv("APS5_DEVICE_FAULT") != nullptr && hasExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &faultFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        if (faultFeatures.deviceFault == VK_TRUE) {
+            deviceFault = true;
+            faultFeatures.deviceFaultVendorBinary = VK_FALSE;
+            faultFeatures.pNext = bdaFeatures.pNext;
+            bdaFeatures.pNext = &faultFeatures;
+            deviceExtensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+            deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+            deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+        }
+    }
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
+    if (deviceFault) {
+        faultDevice = state->device;
+        faultInfo = state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT");
+        Graphics::DeviceLostReporter() = reportDeviceFault;
+        std::fprintf(stderr, "[device-fault] VK_EXT_device_fault enabled\n");
+    }
     state->shaderProfile = std::move(shaderProfile);
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
@@ -1560,12 +1607,10 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     // A queued label store over the range lands before the fill (program order).
     recorder.FlushStoresOverlapping(address, bytes);
     VkAccessFlags covered = 0;
-    const auto commands = recorder.Commands(&covered);
+    const std::pair<std::uint64_t, std::uint64_t> range{address, address + bytes};
+    bool elided = false;
+    const auto commands = Graphics::Recorder::BarrierTracking() ? recorder.Commands(CommandClass::Fill, Graphics::Recorder::Access{{}, std::span(&range, 1), {}, VK_PIPELINE_STAGE_TRANSFER_BIT, false, false, true}, elided, &covered) : recorder.Commands(&covered);
     const auto timing = recorder.BeginGpuTiming(CommandClass::Fill);
-    if (Graphics::Recorder::BarrierValidate()) {
-        const std::pair<std::uint64_t, std::uint64_t> range{address, address + bytes};
-        recorder.NoteAccess(CommandClass::Fill, Graphics::Recorder::Access{{}, std::span(&range, 1), {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
-    }
     // Every earlier recorded read or write of the range precedes the fill (WAR by the execution
     // dependency, WAW by the writes made available), whichever stage made it; the previous
     // command's trailing barrier already did that when it covered transfer writes.
@@ -1816,13 +1861,11 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     recorder.FlushStoresOverlapping(source, bytes);
     recorder.FlushStoresOverlapping(destination, bytes);
     VkAccessFlags covered = 0;
-    const auto commands = recorder.Commands(&covered);
+    const std::pair<std::uint64_t, std::uint64_t> read{source, source + bytes}, written{destination, destination + bytes};
+    bool elided = false;
+    const auto commands = Graphics::Recorder::BarrierTracking() ? recorder.Commands(CommandClass::Copy, Graphics::Recorder::Access{std::span(&read, 1), std::span(&written, 1), {}, VK_PIPELINE_STAGE_TRANSFER_BIT, false, false, true}, elided, &covered) : recorder.Commands(&covered);
     // The class range covers the barriers too; the program-keyed range inside it is the transfer.
     const auto classTiming = recorder.BeginGpuTiming(CommandClass::Copy);
-    if (Graphics::Recorder::BarrierValidate()) {
-        const std::pair<std::uint64_t, std::uint64_t> read{source, source + bytes}, written{destination, destination + bytes};
-        recorder.NoteAccess(CommandClass::Copy, Graphics::Recorder::Access{std::span(&read, 1), std::span(&written, 1), {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
-    }
     // Every earlier recorded read or write of either range precedes the transfer, whichever stage
     // made it, and host stores (the CPU copies above, the game's) are visible to it; the previous
     // command's trailing barrier already did that when it covered transfer reads and writes.
@@ -2616,8 +2659,28 @@ std::optional<std::string> VulkanDevice::KnownDrawRejection(const Graphics::Stat
     return Graphics::KnownValidationFailure(graphicsContext(), shaders, graphics);
 }
 
+std::shared_ptr<Graphics::DrawSpeculation> VulkanDevice::SpeculateDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots) const {
+    return Graphics::SpeculateDrawResources(graphicsContext(), graphics, draw, shaders, snapshots);
+}
+
+std::shared_ptr<Graphics::DrawPrebuild> VulkanDevice::PrebuildDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, bool keyed) const {
+    return Graphics::PrebuildDraw(graphicsContext(), graphics, draw, shaders, keyed);
+}
+
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
     Graphics::RunColorMetadataPass(graphicsContext(), pass);
+}
+
+Graphics::Context VulkanDevice::DrawContext() const {
+    return graphicsContext();
+}
+
+bool VulkanDevice::ApplyForkedDraw(const Graphics::Context& context, std::span<const Graphics::CompiledShader> shaders, Graphics::ForkedDraw& forked, const Graphics::ForkStamp& stamp, const std::function<void()>* quiesce) {
+    for (const auto& shader : shaders) {
+        require(shader.program != nullptr, "missing compiled shader");
+        ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
+    }
+    return Graphics::ApplyForkedDraw(context, forked, stamp, quiesce);
 }
 
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {
@@ -3340,7 +3403,22 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
     VkAccessFlags covered = 0;
-    const auto commands = recorder.Commands(&covered);
+    using CommandClass = Graphics::Recorder::CommandClass;
+    const bool refreshes = record.dataRefresh != RecordedDispatch::DataRefresh::None && (record.dataRefresh == RecordedDispatch::DataRefresh::Words || resources.DataWordsHash() != record.dataWordsHash);
+    bool argumentsElided = false;
+    bool elided = false;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    if (Graphics::Recorder::BarrierTracking()) {
+        if (argumentImport != nullptr) {
+            const std::pair<std::uint64_t, std::uint64_t> argumentRange{arguments, arguments + 12};
+            argumentsElided = recorder.NoteAccess(CommandClass::IndirectArguments, Graphics::Recorder::Access{std::span(&argumentRange, 1), {}, {}, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT});
+        }
+        const auto reads = resources.TrackedReads();
+        const auto images = resources.StorageImages();
+        commands = recorder.Commands(CommandClass::DispatchLeading, Graphics::Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, resources.HoldsLease(), refreshes}, elided, &covered);
+    } else {
+        commands = recorder.Commands(&covered);
+    }
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     recorder.Keep(record.resources);
@@ -3350,9 +3428,12 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         // barrier makes visible (so it is recorded whatever the previous command covered), ordered
         // after an earlier dispatch's reads of the buffers by that dispatch's trailing barrier. A
         // recipe compares the two 64-bit hashes first: equal hashes mean the buffers hold the words.
-        const bool differs = record.dataRefresh == RecordedDispatch::DataRefresh::Words || resources.DataWordsHash() != record.dataWordsHash;
-        if (differs && (record.resourceKeyMatched ? resources.refreshData(commands, *record.shader, &recorder) : resources.RefreshData(commands, *record.shader, &recorder))) {
+        if (refreshes && (record.resourceKeyMatched ? resources.refreshData(commands, *record.shader, &recorder) : resources.RefreshData(commands, *record.shader, &recorder))) {
             covered = 0;
+            if (elided) {
+                Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+                Graphics::Recorder::CountBarriers(CommandClass::TemplateDataRefresh);
+            }
             ++d.templateRefreshed;
             d.templateRevalidateMs += record.revalidateMs;
             record.refreshed = true;
@@ -3361,28 +3442,24 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         }
         recordStep(PhaseRecordDataRefresh);
     }
-    using CommandClass = Graphics::Recorder::CommandClass;
-    if (Graphics::Recorder::BarrierValidate()) {
-        if (argumentImport != nullptr) {
-            const std::pair<std::uint64_t, std::uint64_t> argumentRange{arguments, arguments + 12};
-            recorder.NoteAccess(CommandClass::IndirectArguments, Graphics::Recorder::Access{std::span(&argumentRange, 1), {}, {}, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT});
-        }
-        const auto reads = resources.InPlaceReads();
-        const auto images = resources.StorageImages();
-        recorder.NoteAccess(CommandClass::DispatchLeading, Graphics::Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, resources.HoldsLease()});
-    }
     if (argumentImport != nullptr) {
         // The group counts were stored by earlier recorded work (a dispatch in place, a fill) or the
         // host; the indirect read follows all of it.
         const auto timing = recorder.BeginGpuTiming(CommandClass::IndirectArguments);
-        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
-        Graphics::Recorder::CountBarriers(CommandClass::IndirectArguments);
+        if (argumentsElided) {
+            Graphics::Recorder::CountSkipped(CommandClass::IndirectArguments);
+        } else {
+            Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+            Graphics::Recorder::CountBarriers(CommandClass::IndirectArguments);
+        }
         recorder.EndGpuTiming(timing, 12);
         recorder.NotePendingRead(arguments, 12, Graphics::Recorder::ReadKind::Indirect);
     }
     // Results of earlier recorded work are visible to this dispatch, its own to everything after.
     constexpr VkAccessFlags shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    if ((covered & shaderAccess) == shaderAccess && barrierElision) {
+    if (elided) {
+        Graphics::Recorder::CountSkipped(CommandClass::DispatchLeading);
+    } else if ((covered & shaderAccess) == shaderAccess && barrierElision) {
         ++d.preBarriersSkipped;
         Graphics::Recorder::CountMerged(CommandClass::DispatchLeading);
     } else {
@@ -3401,12 +3478,16 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (argumentImport != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, arguments - argumentImport->base);
     else context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, record.x, record.y, record.z);
     recorder.EndGpuTiming(gpuTiming);
-    const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
-    constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
-    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
-    Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
-    recorder.EndGpuTiming(trailingTiming);
-    recorder.MarkCovered(dispatchedAccess);
+    if (elided) {
+        Graphics::Recorder::CountSkipped(CommandClass::DispatchTrailing);
+    } else {
+        const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
+        constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT, dispatchedAccess);
+        Graphics::Recorder::CountBarriers(CommandClass::DispatchTrailing);
+        recorder.EndGpuTiming(trailingTiming);
+        recorder.MarkCovered(dispatchedAccess);
+    }
     recordStep(PhaseRecordBind);
     resources.MarkGpuWrites(recorder);
     recordStep(PhaseRecordMarks);

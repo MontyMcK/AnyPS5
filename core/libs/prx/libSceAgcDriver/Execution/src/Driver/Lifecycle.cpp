@@ -40,6 +40,10 @@ void Driver::stop() {
     for (auto& [queue, worker] : workers) {
         if (worker.thread.joinable()) worker.thread.join();
     }
+    if (completionThread.joinable()) {
+        Graphics::Recorder::StopCompletionWork();
+        completionThread.join();
+    }
     StopWorkerSampler();
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     device.Reset();

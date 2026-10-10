@@ -98,6 +98,8 @@ void FollowCollectEpoch(std::uint64_t token);
 bool SharedEpochMemo();
 std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();
+void SetCollectHistoryFlag(bool (*flag)());
+std::uint64_t CollectedGeneration();
 std::uint64_t UnwatchSerial();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // Frame capture (FrameCapture.cpp). `dirty` is called for every page a walk of any thread reports
@@ -147,6 +149,7 @@ public:
     // current acquisition is the outermost, so code that releases the mutex around a wait
     // (Recorder::SyncThrough for the flush hook) gives up no caller's hold.
     std::uint32_t DepthOnThisThread() const;
+    std::uint32_t Contenders() const { return contenders.load(std::memory_order_relaxed); }
 
 private:
     void acquired();
@@ -155,6 +158,7 @@ private:
     // reads the owner just to see that it is not itself.
     std::atomic<const void*> owner{nullptr};
     std::uint32_t depth = 0;
+    std::atomic<std::uint32_t> contenders{0};
 };
 GpuMutexType& GpuMutex();
 // Called on the thread that just gave up its outermost hold, right after the mutex was released:
@@ -165,6 +169,7 @@ void SetGpuUnlockHook(void (*hook)());
 // thread does not hold GpuMutex. Recording, submits, command batches and the detiler's pools must
 // only be reached under it (a resource build's stage A runs without it, see ShaderResources).
 void AssertGpuLockHeld(const char* where);
+void SetForkTrap(void (*trap)(const char* site));
 void TagGpuLockThread(std::uint32_t queue);
 // The presenter stays untagged (its tag is a queue id to the recorder) but takes its own column
 // of the [lock] holder matrix, apart from the game threads.
@@ -178,7 +183,7 @@ std::uint32_t GpuLockThreadTag();
 // as acquisitions; the hold they start is timed under "try". Holds are timed per site as well (the
 // outermost acquisition of a thread until its unlock; APS5_NO_HOLD_PROFILE=1 turns that off), so
 // the line shows who holds the mutex, not only who waits for it.
-enum class GpuLockSite : std::uint8_t { Other = 0, Dispatch, Indirect, Draw, Hook, Wait, Label, Flush, Present, Fill, Copy, End, Try, Count };
+enum class GpuLockSite : std::uint8_t { Other = 0, Dispatch, Indirect, Draw, Hook, Wait, Label, Flush, Present, Fill, Copy, End, Try, Completion, Count };
 void TagGpuLockSite(GpuLockSite site);
 // A GPU wait (a fence or timeline wait that found its work unfinished) made while the calling
 // thread holds GpuMutex: counted on the thread's [lock] line as 'locked GPU waits' (APS5_PROFILE_DRAW).

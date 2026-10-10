@@ -47,6 +47,18 @@ private:
 
 PerformanceControls& LivePerformanceControls();
 
+bool LiveFlag(std::string_view name, bool fallback);
+bool ForkStatsEnabled();
+bool ForkLogEnabled();
+bool ForkBuildEnabled();
+bool ForkAheadEnabled();
+bool ForkStreamEnabled();
+bool ForkStreamWaitEnabled();
+bool ForkStreamLazyEnabled();
+bool CommitHoldEnabled();
+bool CommitTrimEnabled();
+bool VerifyForks();
+
 }
 
 #endif

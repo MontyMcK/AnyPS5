@@ -339,7 +339,11 @@ int APS5_VABI sceKernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int
         KernelTraceWait_nid_postfix("equeue", __builtin_return_address(0), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count()), *out == 0);
         static const bool traceEvents = std::getenv("APS5_TRACE_EQUEUE_EVENTS") != nullptr;
         const auto waitedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
-        if (traceEvents && waitedMs >= 10.0) {
+        static const double traceThresholdMs = [] {
+            const char* text = std::getenv("APS5_TRACE_EQUEUE_MS");
+            return text != nullptr ? std::strtod(text, nullptr) : 10.0;
+        }();
+        if (traceEvents && waitedMs >= traceThresholdMs) {
             const auto image = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
             char header[256];
             std::snprintf(header, sizeof(header), "[equeue] %.1f exe+0x%llx waited %.1f ms timeout %lld ->", std::fmod(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(), 1.0e7), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)) - image), waitedMs, timo ? static_cast<long long>(*timo) : -1LL);

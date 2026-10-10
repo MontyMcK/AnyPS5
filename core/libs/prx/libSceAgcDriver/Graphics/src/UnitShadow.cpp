@@ -221,10 +221,10 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkAccessFlags covered = 0;
     auto timing = Recorder::NoTiming;
+    bool elided = false;
     if (recorder != nullptr) {
-        commands = recorder->Commands(&covered);
+        commands = Recorder::BarrierTracking() ? recorder->Commands(CommandClass::ShadowPublish, Recorder::Access{ranges, ranges, {}, VK_PIPELINE_STAGE_TRANSFER_BIT}, elided, &covered) : recorder->Commands(&covered);
         timing = recorder->BeginGpuTiming(CommandClass::ShadowPublish);
-        if (Recorder::BarrierValidate()) recorder->NoteAccess(CommandClass::ShadowPublish, Recorder::Access{{}, ranges, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     } else {
         batch = std::make_unique<CommandBatch>(context);
         commands = batch->Handle();
@@ -232,7 +232,9 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     // The retile that filled the slab (its trailing barrier covers transfer reads and writes) and
     // every earlier import writer precede the copies; the CopyBuffer merge rule.
     constexpr VkAccessFlags transferAccess = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    if (recorder != nullptr && (covered & transferAccess) == transferAccess && Recorder::MergeBarriers()) {
+    if (elided) {
+        Recorder::CountSkipped(CommandClass::ShadowPublish);
+    } else if (recorder != nullptr && (covered & transferAccess) == transferAccess && Recorder::MergeBarriers()) {
         Recorder::CountMerged(CommandClass::ShadowPublish);
     } else {
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, transferAccess);
@@ -242,14 +244,18 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     for (const auto& entry : copies) copyBuffer(commands, entry.slab->buffer, shadow.importBuffer, static_cast<std::uint32_t>(entry.regions.size()), entry.regions.data());
     // The published bytes are visible to everything recorded after and to the host, as after a fill.
     constexpr VkAccessFlags publishedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, publishedAccess);
-    Recorder::CountBarriers(CommandClass::ShadowPublish);
+    if (elided) {
+        Recorder::CountSkipped(CommandClass::ShadowPublish);
+    } else {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, publishedAccess);
+        Recorder::CountBarriers(CommandClass::ShadowPublish);
+    }
     if (batch) {
         batch->SubmitAndWait();
         return;
     }
     recorder->EndGpuTiming(timing, bytes);
-    recorder->MarkCovered(publishedAccess);
+    if (!elided) recorder->MarkCovered(publishedAccess);
     for (const auto& entry : copies) recorder->Keep(entry.slab);
     // CPU readers reach the import's bytes only after the hook's SyncThrough waits by this note.
     recorder->NotePendingWrites(ranges);
@@ -462,6 +468,8 @@ ShadowSlabPin::~ShadowSlabPin() {
 }
 
 std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope scope, PublishReason reason) {
+    ForkTrap("shadow publish");
+    ForkQuiesce("shadow publish");
     if (!UnitShadowEnabled() || scope == PublishScope::None || bytes == 0) return 0;
     if (Recorder::InCompletion() && GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::Store) {
         // The store's own stamp makes the unit stale; a publish recorded now would land over the
@@ -729,6 +737,8 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
 }
 
 void RetireShadow(const Context& context, const HostImport& import, const std::function<bool(std::uint64_t, std::uint64_t)>& registered) {
+    ForkTrap("shadow retire");
+    ForkQuiesce("shadow retire");
     if (!UnitShadowEnabled()) return;
     auto& registry = Registry();
     std::shared_ptr<UnitShadow> shadow;

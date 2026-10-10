@@ -6,6 +6,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -248,6 +249,7 @@ public:
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> TrackedReads() const;
     // The same split: the cached address space's serial (0 without one) and its in-place regions,
     // and the regions of this build outside it.
     std::uint64_t AddressSpaceSerial() const;
@@ -260,6 +262,13 @@ public:
     std::optional<VkDescriptorBufferInfo> SpaceDescriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
     bool FinishSharedSpace();
     void TakeSpace(GuestBufferMemory& source);
+    struct SpaceView {
+        VkDescriptorBufferInfo info;
+        std::uint32_t adjustment;
+    };
+    static std::shared_ptr<const AddressSpace> SpeculatedSpace(const Context& context, std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::size_t>> ranges, std::vector<std::optional<SpaceView>>& views);
+    static bool SpaceCovers(const AddressSpace& space, std::uint64_t address, std::size_t bytes);
+    bool SharesSpace(const AddressSpace* candidate) const { return space != nullptr && space.get() == candidate; }
 
 private:
     struct Region {
@@ -314,6 +323,8 @@ private:
     // How [begin, end) lies against the space's base regions.
     enum class BaseOverlap { None, Inside, Partial };
     BaseOverlap baseOverlap(std::uint64_t begin, std::uint64_t end, const Region** owner) const;
+    static BaseOverlap baseOverlapIn(const AddressSpace& space, std::uint64_t begin, std::uint64_t end, const Region** owner);
+    static std::optional<VkDescriptorBufferInfo> spaceDescriptorIn(const Context& context, const AddressSpace& space, std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment);
     // Copies the space's base regions into this build's own regions (today's per-build form) and
     // drops the space: for a region that partially overlaps a base region, and for a build whose
     // imports changed under the space (`resolve`: the direct regions are re-resolved by UploadFinish).

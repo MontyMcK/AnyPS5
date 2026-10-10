@@ -12,6 +12,7 @@
 #include "SDL_vulkan.h"
 #include "prx/libSceVideoOut/include/PadInput.hpp"
 #include "prx/libSceVideoOut/include/MouseInput.hpp"
+#include "prx/libSceMouse/include/MouseState.hpp"
 #include "prx/libSceVideoOut/include/KeyboardInput.hpp"
 #include "prx/libScePad/include/PadState.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
@@ -483,6 +484,9 @@ void VideoOutDriver::presentLoop(std::stop_token token) {
         PadInput padInput;
         MouseInput mouseInput;
         KeyboardInput keyboardInput;
+        std::uint32_t sourceWidth = 1920;
+        std::uint32_t sourceHeight = 1080;
+        bool hostCursorHidden = false;
         while (!token.stop_requested()) {
             {
                 std::unique_lock lock(flipQueue->mutex);
@@ -493,6 +497,23 @@ void VideoOutDriver::presentLoop(std::stop_token token) {
                     current = std::move(flipQueue->requests.front());
                     flipQueue->requests.pop_front();
                 }
+            }
+
+            if (current) {
+                sourceWidth = current->width;
+                sourceHeight = current->height;
+            }
+            if (window.Handle() != nullptr) {
+                int windowWidth = 0;
+                int windowHeight = 0;
+                SDL_GetWindowSize(window.Handle(), &windowWidth, &windowHeight);
+                mouseInput.SetGeometry(sourceWidth, sourceHeight, windowWidth, windowHeight);
+            }
+            // A title that reads the mouse draws its own pointer; the host one over the window
+            // would only show where the title's pointer is not.
+            if (const bool hide = MouseIsOpen_nid_postfix(); hide != hostCursorHidden) {
+                SDL_ShowCursor(hide ? SDL_DISABLE : SDL_ENABLE);
+                hostCursorHidden = hide;
             }
 
             SDL_Event event;

@@ -6,6 +6,7 @@
 #include <map>
 #include <chrono>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
@@ -431,9 +432,17 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     submitDueAfterCommit(localDevice.get());
 }
 
+bool Driver::submitPending(VulkanDevice* localDevice) const {
+    if (localDevice == nullptr) return false;
+    const auto pending = Graphics::Recorder::PendingLabelSince();
+    const bool due = pending.has_value() && std::chrono::steady_clock::now() - *pending >= labelFlushDeadline();
+    return due || (batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap());
+}
+
 void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
     if (localDevice == nullptr) return;
     const auto pending = Graphics::Recorder::PendingLabelSince();
+    if (Graphics::CommitTrimEnabled() && !pending.has_value() && (batchCap() == 0 || Graphics::Recorder::RecordedWorkSinceSubmit() < batchCap())) return;
     const bool due = pending.has_value() && std::chrono::steady_clock::now() - *pending >= labelFlushDeadline();
     const bool capped = batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap();
     if (due || capped) localDevice->SubmitRecorded(true);

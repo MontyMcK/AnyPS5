@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include <cstring>
@@ -54,6 +55,7 @@ void Driver::noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint
 }
 
 void Driver::noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue) {
+    if (Graphics::CommitTrimEnabled() && !(foreignWriters() && (writeEvidenceEnabled() || traceCapSync()))) return;
     for (const auto& stage : stages) {
         forEachWrittenBuffer(*stage.program, [&](std::uint32_t, std::uint64_t begin, std::uint64_t end, bool) { noteForeignWriter(begin, end, queue); });
     }

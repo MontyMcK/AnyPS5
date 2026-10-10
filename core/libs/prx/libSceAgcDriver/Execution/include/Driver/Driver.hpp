@@ -40,9 +40,18 @@
 #include <utility>
 #include <vector>
 
+namespace AgcDriver::Graphics {
+struct DrawSpeculation;
+struct DrawPrebuild;
+struct ForkedDraw;
+struct ForkStamp;
+}
+
 namespace AgcDriver::DriverDetail {
 
 class ShaderPreparationTransaction;
+struct DrawForkJob;
+class DrawForkRunner;
 
 class Driver {
 public:
@@ -74,6 +83,7 @@ private:
     friend class SampledReadScope;
     friend struct PendingView;
     friend struct PacketTimer;
+    friend class DrawForkRunner;
     void stop();
     void registerSnapshot(ShaderSnapshot snapshot, ShaderPreparationTransaction& transaction, bool prepare);
     void publishNullPixelShader(const VulkanDevice& localDevice);
@@ -204,7 +214,11 @@ private:
     void noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint32_t queue);
     void noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue);
     static std::vector<std::pair<std::uint64_t, std::uint64_t>> drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages);
-    void commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey);
+    void commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, std::shared_ptr<Graphics::DrawSpeculation> speculation = nullptr, std::shared_ptr<Graphics::DrawPrebuild> prebuilt = nullptr);
+    void buildAhead(DrawForkJob& job);
+    void commitForked(const DrawForkJob& job, const Graphics::Context& context, Graphics::ForkedDraw* forked, const Graphics::ForkStamp& stamp, std::shared_ptr<const DrawRecipe>& built, bool& cut, const std::function<void()>* quiesce = nullptr);
+    bool labelsPending(VulkanDevice* localDevice) const;
+    bool submitPending(VulkanDevice* localDevice) const;
     bool enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue);
     bool enqueueDmaPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, const QueueState& state);
     void commitDmaStore(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes);
@@ -261,6 +275,7 @@ private:
     static const std::atomic<std::uint64_t>*& workerQueued();
     void reapCompletionLabels();
     void run(std::uint32_t id) noexcept;
+    void runCompletionThread() noexcept;
 
     std::mutex mutex;
     std::mutex shutdownMutex;
@@ -339,6 +354,7 @@ private:
     std::atomic<std::uint32_t> orderHolders{0};
     std::atomic<std::uint32_t> runningWorkers{0};
     std::atomic<std::uint64_t> queue0Awaited{0};
+    std::thread completionThread;
 
     std::atomic<std::uint64_t> evidenceReads{0};
     std::atomic<std::uint64_t> evidenceValidations{0};

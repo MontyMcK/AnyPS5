@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -8,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 // For the declaration of PendingStorageOverlaps, defined below.
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSpeculation.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -1039,6 +1041,7 @@ VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, s
     Require((depthSlice == 0 && layers == 1) || (mip == 0 && layers != 0 && depthSlice + layers - 1u <= descriptor.depthOrLastArray && (volume || descriptor.dimension == TextureDimension::k2DArray)), "attachment slice is outside the storage image");
     const auto found = attachmentViews.find({format, mip, depthSlice, layers});
     if (found != attachmentViews.end()) return found->second;
+    ForkTrap("attachment view");
     VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
     usage.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
@@ -1056,6 +1059,7 @@ VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, s
 
 VkImageView StorageTexture::AttachmentProxyView() {
     if (proxyView != VK_NULL_HANDLE) return proxyView;
+    ForkTrap("attachment proxy view");
     Require(storageFormat == VK_FORMAT_R8_UNORM && descriptor.dimension == TextureDimension::k2D && descriptor.mipCount == 1 && geometry.imageLayers == 1, "an RGBA8_SRGB attachment proxy is only modeled for a single-mip 2D R8 surface");
     try {
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
@@ -1229,7 +1233,12 @@ bool targetProofMemo() {
 
 std::atomic<std::uint64_t> targetProofHits{0};
 std::atomic<std::uint64_t> targetProofMisses{0};
+std::atomic<std::uint64_t> crossEpochProofs{0};
 
+}
+
+std::uint64_t TakeCrossEpochTargetProofs() {
+    return crossEpochProofs.exchange(0, std::memory_order_relaxed);
 }
 
 std::pair<std::uint64_t, std::uint64_t> StorageTexture::TargetProofCounts() {
@@ -1239,7 +1248,12 @@ std::pair<std::uint64_t, std::uint64_t> StorageTexture::TargetProofCounts() {
 bool StorageTexture::refreshProved() const {
     if (!targetProofMemo() || refreshProof.epoch == 0) return false;
     const auto epoch = GuestMemory::ThreadCollectEpoch();
-    if (epoch == 0 || epoch != refreshProof.epoch || GuestMemory::UnwatchSerial() != refreshProof.unwatched || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != refreshProof.registryGeneration) return false;
+    if (epoch == 0 || GuestMemory::UnwatchSerial() != refreshProof.unwatched || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != refreshProof.registryGeneration) return false;
+    if (epoch != refreshProof.epoch) {
+        if (!TargetTokensEnabled() || GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) == 0) return false;
+        if (descriptor.dccAddress != 0 && guestBytes / 256 != 0 && GuestMemory::CollectWrites(descriptor.dccAddress, static_cast<std::size_t>(guestBytes / 256)) == 0) return false;
+        if (GuestMemory::UnwatchSerial() != refreshProof.unwatched) return false;
+    }
     if (PendingSerial() != refreshProof.pendingSerial) {
         static const bool overlapCheck = std::getenv("APS5_NO_TARGET_PROOF_OVERLAP") == nullptr;
         if (!overlapCheck) return false;
@@ -1258,10 +1272,27 @@ bool StorageTexture::refreshProved() const {
 }
 
 bool StorageTexture::Refresh() {
+    ForkTrap("storage refresh");
+    ForkQuiesce("storage refresh");
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (targetProofMemo()) {
+        const auto provedEpoch = refreshProof.epoch;
         if (refreshProved()) {
+            if (const auto epoch = GuestMemory::ThreadCollectEpoch(); epoch != provedEpoch) {
+                refreshProof.epoch = epoch;
+                crossEpochProofs.fetch_add(1, std::memory_order_relaxed);
+            }
+            if (provedEpoch != refreshProof.epoch && VerifyDrawTokens()) {
+                bool current = ProvedKeys() == uploadedKeys;
+                if (current && blockUnits) current = GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generation);
+                for (std::uint32_t layer = 0; current && !blockUnits && layer < trackedLayers; ++layer) current = GuestMemory::UnchangedSince(layerBegin(layer), static_cast<std::size_t>(layerBytes(layer)), layerGeneration[layer]);
+                if (!current) {
+                    std::fprintf(stderr, "[tokens] APS5_VERIFY_DRAW_TOKENS: a cross-epoch target proof of 0x%llx is refused by the refresh check\n", static_cast<unsigned long long>(descriptor.baseAddress));
+                    std::fflush(stderr);
+                    std::abort();
+                }
+            }
             NoteProved();
             ++Profile().storageReused;
             const auto hits = targetProofHits.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1529,10 +1560,12 @@ DccKeys StorageTexture::ProvedKeys() const {
 bool StorageTexture::ServesKeysAt(std::uint64_t dccAddress) const {
     const bool locked = GuestMemory::GpuMutex().HeldByThisThread();
     const auto readFollowed = [&] {
+        ForkTrap("image keys");
         DccKeyProof unlocked;
         return ProvedClearKeys(descriptor, guestBytes, locked ? keyProof : unlocked);
     };
     const auto readNamed = [&] {
+        ForkTrap("image keys");
         auto named = descriptor;
         named.dccAddress = dccAddress;
         DccKeyProof unlocked;
@@ -1593,16 +1626,15 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         std::unique_ptr<CommandBatch> batch;
         VkCommandBuffer commands = VK_NULL_HANDLE;
         auto timing = Recorder::NoTiming;
+        bool elided = false;
         if (recorder != nullptr) {
-            commands = recorder->Commands();
+            const std::pair<VkImage, bool> cleared{image, true};
+            commands = Recorder::BarrierTracking() ? recorder->Commands(Recorder::CommandClass::DccClear, Recorder::Access{{}, {}, std::span(&cleared, 1), VK_PIPELINE_STAGE_TRANSFER_BIT}, elided) : recorder->Commands();
             timing = recorder->BeginGpuTiming(Recorder::CommandClass::DccClear);
             if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
             ++Profile().storageRecordedClears;
-            Recorder::CountBarriers(Recorder::CommandClass::DccClear, 2);
-            if (Recorder::BarrierValidate()) {
-                const std::pair<VkImage, bool> cleared{image, true};
-                recorder->NoteAccess(Recorder::CommandClass::DccClear, Recorder::Access{{}, {}, std::span(&cleared, 1), VK_PIPELINE_STAGE_TRANSFER_BIT});
-            }
+            Recorder::CountBarriers(Recorder::CommandClass::DccClear, elided ? 1 : 2);
+            if (elided) Recorder::CountSkipped(Recorder::CommandClass::DccClear);
         } else {
             batch = std::make_unique<CommandBatch>(context);
             commands = batch->Handle();
@@ -1617,14 +1649,21 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         toClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toClear.image = image;
         toClear.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
-        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
-        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &toClear.subresourceRange);
-        VkImageMemoryBarrier toGeneral = toClear;
-        toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+        if (elided) {
+            toClear.srcAccessMask = 0;
+            toClear.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
+            context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &clearValue, 1, &toClear.subresourceRange);
+        } else {
+            context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
+            context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &toClear.subresourceRange);
+            VkImageMemoryBarrier toGeneral = toClear;
+            toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+        }
         if (batch) batch->SubmitAndWait();
         else recorder->EndGpuTiming(timing, guestBytes);
         countStorageUpload(0, guestBytes);
@@ -1677,28 +1716,27 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         std::unique_ptr<CommandBatch> batch;
         VkCommandBuffer commands = VK_NULL_HANDLE;
         auto timing = Recorder::NoTiming;
+        bool elided = false;
         if (recorder != nullptr) {
             // A queued label store in the surface lands before the detile reads it.
             recorder->FlushStoresOverlapping(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-            commands = recorder->Commands();
+            const std::pair<std::uint64_t, std::uint64_t> read{descriptor.baseAddress, descriptor.baseAddress + guestBytes};
+            const std::pair<VkImage, bool> written{image, true};
+            commands = Recorder::BarrierTracking() ? recorder->Commands(Recorder::CommandClass::StorageUpload, Recorder::Access{std::span(&read, 1), {}, std::span(&written, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT}, elided) : recorder->Commands();
             timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
             recorder->Keep(linear, linear->Size());
             // The image itself must outlive the recorded copy: the cache may evict it right after.
             if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
             // The detile reads the tiled bytes from the import when the batch runs.
             recorder->NotePendingRead(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), Recorder::ReadKind::StorageUpload);
-            Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, 3);
-            if (Recorder::BarrierValidate()) {
-                const std::pair<std::uint64_t, std::uint64_t> read{descriptor.baseAddress, descriptor.baseAddress + guestBytes};
-                const std::pair<VkImage, bool> written{image, true};
-                recorder->NoteAccess(Recorder::CommandClass::StorageUpload, Recorder::Access{std::span(&read, 1), {}, std::span(&written, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT});
-            }
+            Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, elided ? 1 : 3);
+            if (elided) Recorder::CountSkipped(Recorder::CommandClass::StorageUpload, 2);
         } else {
             batch = std::make_unique<CommandBatch>(context);
             commands = batch->Handle();
         }
         const auto importOffset = descriptor.baseAddress - import->base;
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        if (!elided) RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
             if (layers != nullptr && !(*layers)[layer]) continue;
             for (std::uint32_t level = 0; level < mips.size(); ++level) {
@@ -1718,15 +1756,22 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toTransfer.image = image;
         toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
-        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearRead, 1, &toTransfer);
         const auto regions = CopyRegions(layers);
-        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
-        VkImageMemoryBarrier toGeneral = toTransfer;
-        toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+        if (elided) {
+            toTransfer.srcAccessMask = 0;
+            toTransfer.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearRead, layers != nullptr ? 0u : 1u, &toTransfer);
+            context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+        } else {
+            context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearRead, 1, &toTransfer);
+            context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+            VkImageMemoryBarrier toGeneral = toTransfer;
+            toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+            toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+        }
         if (batch) batch->SubmitAndWait();
         else recorder->EndGpuTiming(timing, uploadedBytes);
         countStorageUpload(1, uploadedBytes);
@@ -1948,6 +1993,8 @@ StorageTexture::PaddingSeeds StorageTexture::paddingSeeds(const HostImport& impo
                 const auto guestBegin = descriptor.baseAddress + from;
                 if (!seeds.importReads.empty() && seeds.importReads.back().second == guestBegin) seeds.importReads.back().second = descriptor.baseAddress + to;
                 else seeds.importReads.emplace_back(guestBegin, descriptor.baseAddress + to);
+            } else {
+                seeds.shadowReads.emplace_back(descriptor.baseAddress + from, descriptor.baseAddress + to);
             }
         }
         if (source.shadow && std::find(seeds.slabs.begin(), seeds.slabs.end(), source.slab) == seeds.slabs.end()) seeds.slabs.push_back(source.slab);
@@ -2000,6 +2047,7 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
     std::unique_ptr<CommandBatch> batch;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     auto timing = Recorder::NoTiming;
+    bool elided = false;
     if (recorder != nullptr) {
         // The import pieces are read in place when the batch runs; the slab pieces are the
         // device's own.
@@ -2009,7 +2057,10 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
         }
         // A queued label store in a run lands before the detile reads it.
         for (const auto& [begin, end] : reads) recorder->FlushStoresOverlapping(begin, static_cast<std::size_t>(end - begin));
-        commands = recorder->Commands();
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> tracked;
+        for (const auto& source : sources) tracked.emplace_back(descriptor.baseAddress + source.begin, descriptor.baseAddress + source.end);
+        const std::pair<VkImage, bool> written{image, true};
+        commands = Recorder::BarrierTracking() ? recorder->Commands(Recorder::CommandClass::StorageUpload, Recorder::Access{tracked, {}, std::span(&written, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT}, elided) : recorder->Commands();
         timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
         recorder->Keep(linear, linear->Size());
         for (const auto& source : sources) {
@@ -2017,17 +2068,14 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
         }
         if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
         if (!reads.empty()) recorder->NotePendingReads(reads, Recorder::ReadKind::StorageUpload);
-        Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, 3);
-        if (Recorder::BarrierValidate()) {
-            const std::pair<VkImage, bool> written{image, true};
-            recorder->NoteAccess(Recorder::CommandClass::StorageUpload, Recorder::Access{reads, {}, std::span(&written, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT});
-        }
+        Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, elided ? 1 : 3);
+        if (elided) Recorder::CountSkipped(Recorder::CommandClass::StorageUpload, 2);
     } else {
         batch = std::make_unique<CommandBatch>(context);
         commands = batch->Handle();
     }
     const auto importOffset = descriptor.baseAddress - import.base;
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    if (!elided) RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     std::vector<VkBufferImageCopy> regions;
     for (std::size_t i = 0; i < windows.size(); ++i) {
         const auto& window = windows[i];
@@ -2059,14 +2107,21 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
     toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toTransfer.image = image;
     toTransfer.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearRead, 1, &toTransfer);
-    context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
-    VkImageMemoryBarrier toGeneral = toTransfer;
-    toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+    if (elided) {
+        toTransfer.srcAccessMask = 0;
+        toTransfer.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearRead, discard ? 1u : 0u, &toTransfer);
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+    } else {
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &linearRead, 1, &toTransfer);
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, linear->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+        VkImageMemoryBarrier toGeneral = toTransfer;
+        toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+    }
     if (batch) batch->SubmitAndWait();
     else recorder->EndGpuTiming(timing, uploadedBytes);
     return uploadedBytes;
@@ -2172,24 +2227,31 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkAccessFlags covered = 0;
     auto timing = Recorder::NoTiming;
+    bool elided = false;
     if (recorder != nullptr) {
         recorder->FlushKeyStoresOverlapping(flushBegin, static_cast<std::size_t>(flushEnd - flushBegin));
         recorder->FlushStoresOverlapping(flushBegin, static_cast<std::size_t>(flushEnd - flushBegin));
-        commands = recorder->Commands(&covered);
+        if (Recorder::BarrierTracking()) {
+            const std::pair<VkImage, bool> read{image, false};
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> seedReads;
+            for (const auto& seed : seeds) seedReads.emplace_back(seed.begin, seed.end);
+            seedReads.insert(seedReads.end(), padding.importReads.begin(), padding.importReads.end());
+            seedReads.insert(seedReads.end(), padding.shadowReads.begin(), padding.shadowReads.end());
+            std::vector<std::pair<std::uint64_t, std::uint64_t>> written(imported.begin(), imported.end());
+            for (const auto& seed : seeds) written.emplace_back(seed.begin, seed.end);
+            for (const auto& range : shadowed) written.emplace_back(range.begin, range.end);
+            commands = recorder->Commands(Recorder::CommandClass::StorageWriteBack, Recorder::Access{seedReads, written, std::span(&read, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT}, elided, &covered);
+        } else {
+            commands = recorder->Commands(&covered);
+        }
         timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageWriteBack);
         recorder->Keep(linear, linear->Size());
         recorder->Keep(tiledScratch, tiledScratch->Size());
         for (const auto& pieces : slabPieces) recorder->Keep(pieces.slab);
         for (const auto& slab : padding.slabs) recorder->Keep(slab);
         if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
-        Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack, 4);
-        if (Recorder::BarrierValidate()) {
-            const std::pair<VkImage, bool> read{image, false};
-            std::vector<std::pair<std::uint64_t, std::uint64_t>> seedReads;
-            for (const auto& seed : seeds) seedReads.emplace_back(seed.begin, seed.end);
-            seedReads.insert(seedReads.end(), padding.importReads.begin(), padding.importReads.end());
-            recorder->NoteAccess(Recorder::CommandClass::StorageWriteBack, Recorder::Access{seedReads, imported, std::span(&read, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT});
-        }
+        Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack, elided ? 2 : 4);
+        if (elided) Recorder::CountSkipped(Recorder::CommandClass::StorageWriteBack, 2);
     } else {
         batch = std::make_unique<CommandBatch>(context);
         commands = batch->Handle();
@@ -2203,12 +2265,14 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
     toSource.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toSource.image = image;
     toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
+    if (!elided) context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
     if (!seeds.empty() || !padding.copies.empty()) {
         // The seeded units' import bytes (every earlier writer of them, host stores included)
         // precede the seed copies; the previous command's trailing barrier may have covered that.
         constexpr VkAccessFlags transferAccess = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-        if (recorder != nullptr && (covered & transferAccess) == transferAccess && Recorder::MergeBarriers()) {
+        if (elided) {
+            Recorder::CountSkipped(Recorder::CommandClass::StorageWriteBack);
+        } else if (recorder != nullptr && (covered & transferAccess) == transferAccess && Recorder::MergeBarriers()) {
             Recorder::CountMerged(Recorder::CommandClass::StorageWriteBack);
         } else {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, transferAccess);
@@ -2231,10 +2295,10 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
             regions.push_back(region);
         }
     }
-    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, elided ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
     const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-    const VkMemoryBarrier importReady{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 1, &linearRead, 0, nullptr);
+    const VkMemoryBarrier importReady{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, elided ? VkAccessFlags{VK_ACCESS_TRANSFER_WRITE_BIT} : VkAccessFlags{VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT}, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, elided ? VkPipelineStageFlags{VK_PIPELINE_STAGE_TRANSFER_BIT} : VkPipelineStageFlags{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT}, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 1, &linearRead, 0, nullptr);
     for (std::size_t i = 0; i < windows.size(); ++i) {
         const auto& window = windows[i];
         detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear->Handle(), linearPositions[i], tiledScratch->Handle(), scratchPositions[i], mips[window.level], true, window.layer, false, window.window);
@@ -2257,12 +2321,12 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
     // merges its leading barrier.
     constexpr VkAccessFlags storedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
     const VkMemoryBarrier stored{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, storedAccess};
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &stored, 0, nullptr, 1, &backToGeneral);
+    if (!elided) context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &stored, 0, nullptr, 1, &backToGeneral);
     if (batch) {
         batch->SubmitAndWait();
     } else {
         recorder->EndGpuTiming(timing, storedBytes);
-        recorder->MarkCovered(storedAccess);
+        if (!elided) recorder->MarkCovered(storedAccess);
         // Only the pieces written into the import are stores a CPU reader must wait for; the
         // shadowed ones reach it through a publish, which notes its own.
         if (!imported.empty()) recorder->NotePendingWrites(imported);
@@ -2295,7 +2359,21 @@ bool StorageTexture::overlaps(std::uint64_t address, std::size_t bytes) const {
     return address < descriptor.baseAddress + guestBytes && descriptor.baseAddress < address + bytes;
 }
 
+bool StorageTexture::DirtyQuiet() const {
+    static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    if (eager || (descriptor.dccAddress != 0 && IsDccClear(uploadedKeys) && !IsDccClear(filledKeys)) || !borrowedFrom.expired()) return false;
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    if (!dirty || lent || layerPending.size() < trackedLayers) return false;
+    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+        if (!layerPending[layer]) return false;
+    }
+    return true;
+}
+
 void StorageTexture::MarkDirty() {
+    ForkTrap("storage dirty");
+    if (ForkQuiescing() && !DirtyQuiet()) ForkQuiesce("storage dirty");
     if (descriptor.dccAddress != 0 && IsDccClear(uploadedKeys) && !IsDccClear(filledKeys)) {
         traceKeyStore("first write", descriptor, guestBytes);
         MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
@@ -2415,6 +2493,8 @@ void StorageTexture::DumpBaseLevel(const std::string& path) {
 }
 
 void StorageTexture::Flush() {
+    ForkTrap("storage flush");
+    ForkQuiesce("storage flush");
     {
         auto& live = Live();
         std::lock_guard lock(live.mutex);
@@ -2451,6 +2531,28 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
 
 bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except, const char* reason, PublishScope scope, bool* published) {
     if (published != nullptr) *published = false;
+    if (ForkLogged() != nullptr) {
+        {
+            auto& pending = Pending();
+            std::lock_guard lock(pending.mutex);
+            const auto* exempt = refreshing;
+            for (auto it = pending.textures.MayOverlap(address, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end(); ++it) {
+                const auto* texture = *it;
+                if (texture != except && texture != exempt && texture->overlaps(address, bytes) && texture->pendingUnitInside(address, bytes)) ForkRefuse("storage results flush");
+            }
+        }
+        if (scope != PublishScope::None && AnyShadowedOverlaps(address, bytes)) ForkRefuse("shadow publish");
+        return false;
+    }
+    if (ForkQuiescing()) {
+        bool mayFlush = false;
+        {
+            auto& pending = Pending();
+            std::lock_guard lock(pending.mutex);
+            mayFlush = pending.textures.MayOverlap(address, bytes);
+        }
+        if (mayFlush || (scope != PublishScope::None && AnyShadowedOverlaps(address, bytes))) ForkQuiesce("storage results flush");
+    }
     // The images stay alive across the scan: their last owner may be a batch's kept list, which
     // another thread releases outside the GPU mutex once the batch completed.
     std::vector<std::shared_ptr<StorageTexture>> flush;
@@ -2556,6 +2658,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
 }
 
 bool StorageTexture::PublishShadowsOnly(std::uint64_t address, std::size_t bytes, PublishScope scope, const char* reason) {
+    if (ForkLogged() != nullptr && scope != PublishScope::None && AnyShadowedOverlaps(address, bytes)) ForkRefuse("shadow publish");
     if (scope == PublishScope::None || !AnyShadowedOverlaps(address, bytes)) return false;
     std::lock_guard gpu(GuestMemory::GpuMutex());
     return PublishShadow(address, bytes, scope, PublishReasonFor(reason)) != 0;
@@ -3004,14 +3107,13 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
             BumpPendingSerial();
         }
     }
-    const auto commands = recorder->Commands();
+    const std::pair<VkImage, bool> clearedImage{image, true};
+    bool elided = false;
+    const auto commands = Recorder::BarrierTracking() ? recorder->Commands(Recorder::CommandClass::DccClear, Recorder::Access{{}, {}, std::span(&clearedImage, 1), VK_PIPELINE_STAGE_TRANSFER_BIT}, elided) : recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::DccClear);
     if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
-    Recorder::CountBarriers(Recorder::CommandClass::DccClear, 2);
-    if (Recorder::BarrierValidate()) {
-        const std::pair<VkImage, bool> clearedImage{image, true};
-        recorder->NoteAccess(Recorder::CommandClass::DccClear, Recorder::Access{{}, {}, std::span(&clearedImage, 1), VK_PIPELINE_STAGE_TRANSFER_BIT});
-    }
+    Recorder::CountBarriers(Recorder::CommandClass::DccClear, elided ? 1 : 2);
+    if (elided) Recorder::CountSkipped(Recorder::CommandClass::DccClear);
     VkImageMemoryBarrier toClear{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     toClear.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     toClear.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -3021,14 +3123,21 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
     toClear.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     toClear.image = image;
     toClear.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
-    context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &toClear.subresourceRange);
-    VkImageMemoryBarrier toGeneral = toClear;
-    toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+    if (elided) {
+        toClear.srcAccessMask = 0;
+        toClear.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &clearValue, 1, &toClear.subresourceRange);
+    } else {
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toClear);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clearValue, 1, &toClear.subresourceRange);
+        VkImageMemoryBarrier toGeneral = toClear;
+        toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+        toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+    }
     recorder->EndGpuTiming(timing, guestBytes);
     originalValid = false;
     uploadedKeys = keys;
@@ -3043,6 +3152,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
 }
 
 bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal) {
+    ForkTrap("storage clear");
     // Debug aid (APS5_TRACE_FILL_COVER=1): the first layer covers refused, with the surface, the
     // pattern and the generation the refusal was memoized at (ClassifyFill's layerRefusedGeneration).
     static const bool trace = std::getenv("APS5_TRACE_FILL_COVER") != nullptr;
@@ -3140,14 +3250,12 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
     // below makes those units stale (nothing for a 64 KiB-multiple surface).
     PublishShadow(begin, bytes, PublishScope::PartialUnits, PublishReason::FillClear);
     GuestMemory::MarkWritten(begin, bytes);
-    const auto commands = recorder->Commands();
+    const std::pair<VkImage, bool> cleared{image, true};
+    bool elided = false;
+    const auto commands = Recorder::BarrierTracking() ? recorder->Commands(Recorder::CommandClass::FillClear, Recorder::Access{{}, {}, std::span(&cleared, 1), VK_PIPELINE_STAGE_TRANSFER_BIT, false, false, true}, elided) : recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::FillClear);
     Recorder::CountBarriers(Recorder::CommandClass::FillClear, 2);
     if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
-    if (Recorder::BarrierValidate()) {
-        const std::pair<VkImage, bool> cleared{image, true};
-        recorder->NoteAccess(Recorder::CommandClass::FillClear, Recorder::Access{{}, {}, std::span(&cleared, 1), VK_PIPELINE_STAGE_TRANSFER_BIT});
-    }
     VkImageMemoryBarrier toClear{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
     toClear.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     toClear.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -3257,15 +3365,13 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
         }
     }
     GuestMemory::MarkWritten(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
-    const auto commands = recorder->Commands();
+    const std::array<std::pair<VkImage, bool>, 2> copiedImages{{{source.image, false}, {image, true}}};
+    bool elided = false;
+    const auto commands = Recorder::BarrierTracking() ? recorder->Commands(Recorder::CommandClass::Copy, Recorder::Access{{}, {}, copiedImages, VK_PIPELINE_STAGE_TRANSFER_BIT, false, false, true}, elided) : recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Copy);
     Recorder::CountBarriers(Recorder::CommandClass::Copy, 2);
     if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
     if (auto other = source.weak_from_this().lock()) recorder->Keep(std::move(other));
-    if (Recorder::BarrierValidate()) {
-        const std::array<std::pair<VkImage, bool>, 2> images{{{source.image, false}, {image, true}}};
-        recorder->NoteAccess(Recorder::CommandClass::Copy, Recorder::Access{{}, {}, images, VK_PIPELINE_STAGE_TRANSFER_BIT});
-    }
     VkImageMemoryBarrier barriers[2]{};
     for (auto& barrier : barriers) {
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -3385,12 +3491,15 @@ void StorageTexture::blockGenerations(std::vector<std::uint64_t>& generations) c
 std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
     static const bool disabled = std::getenv("APS5_NO_ALIAS_BORROW") != nullptr;
     if (disabled || !blockUnits) return nullptr;
+    static const bool subrectDefault = std::getenv("APS5_SUBRECT_BORROW") != nullptr;
+    const bool subrect = LiveFlag("subrect_borrow", subrectDefault) && descriptor.mipCount == 1 && geometry.imageLayers == 1 && geometry.imageDepth == 1;
     std::vector<std::shared_ptr<StorageTexture>> candidates;
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
         for (auto* texture : pending.textures) {
-            if (texture == this || texture->descriptor.baseAddress != descriptor.baseAddress || texture->guestBytes != guestBytes || !texture->blockUnits) continue;
+            if (texture == this || texture->descriptor.baseAddress != descriptor.baseAddress || !texture->blockUnits) continue;
+            if (texture->guestBytes != guestBytes && !(subrect && texture->guestBytes > guestBytes)) continue;
             if (auto alive = texture->weak_from_this().lock()) candidates.push_back(std::move(alive));
         }
     }
@@ -3400,7 +3509,8 @@ std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
         // The same texels under another format of the same size: the device copy moves them bit
         // for bit, as the guest bytes would.
         const bool sameShape = mine.width == theirs.width && mine.height == theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && mine.mipCount == theirs.mipCount && mine.tileMode == theirs.tileMode && mine.dimension == theirs.dimension && BytesPerElement(mine.format) == BytesPerElement(theirs.format) && geometry.imageLayers == candidate->geometry.imageLayers && geometry.imageDepth == candidate->geometry.imageDepth && trackedLayers == candidate->trackedLayers;
-        if (sameShape && candidate->Cached() && candidate->uploadedKeys == DccKeys::Uncompressed) return candidate;
+        const bool topRows = subrect && mine.width == theirs.width && mine.height <= theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && theirs.mipCount == 1 && mine.tileMode == theirs.tileMode && mine.dimension == theirs.dimension && BytesPerElement(mine.format) == BytesPerElement(theirs.format) && candidate->geometry.imageLayers == 1 && candidate->geometry.imageDepth == 1 && trackedLayers <= candidate->trackedLayers;
+        if ((sameShape || topRows) && candidate->Cached() && candidate->uploadedKeys == DccKeys::Uncompressed) return candidate;
     }
     return nullptr;
 }
@@ -3428,16 +3538,15 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     std::unique_ptr<CommandBatch> batch;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     auto timing = Recorder::NoTiming;
+    bool elided = false;
     if (recorder != nullptr) {
-        commands = recorder->Commands();
+        const std::array<std::pair<VkImage, bool>, 2> images{{{source.image, false}, {image, true}}};
+        commands = Recorder::BarrierTracking() ? recorder->Commands(Recorder::CommandClass::StorageUpload, Recorder::Access{{}, {}, images, VK_PIPELINE_STAGE_TRANSFER_BIT}, elided) : recorder->Commands();
         timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
         if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
         if (auto other = source.weak_from_this().lock()) recorder->Keep(std::move(other));
-        Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, 2);
-        if (Recorder::BarrierValidate()) {
-            const std::array<std::pair<VkImage, bool>, 2> images{{{source.image, false}, {image, true}}};
-            recorder->NoteAccess(Recorder::CommandClass::StorageUpload, Recorder::Access{{}, {}, images, VK_PIPELINE_STAGE_TRANSFER_BIT});
-        }
+        if (elided) Recorder::CountSkipped(Recorder::CommandClass::StorageUpload, 2);
+        else Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, 2);
     } else {
         batch = std::make_unique<CommandBatch>(context);
         commands = batch->Handle();
@@ -3457,12 +3566,12 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     barriers[1].srcAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barriers[1].image = image;
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
+    if (!elided) context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 2, barriers);
     context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, source.image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_GENERAL, static_cast<std::uint32_t>(regions.size()), regions.data());
     VkImageMemoryBarrier copied = barriers[1];
     copied.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     copied.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &copied);
+    if (!elided) context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &copied);
     if (batch) batch->SubmitAndWait();
     else recorder->EndGpuTiming(timing, bytes);
     countStorageUpload(3, bytes);
@@ -3672,21 +3781,26 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         auto timing = Recorder::NoTiming;
         std::uint64_t storedBytes = 0;
         for (const auto& [from, to] : keep) storedBytes += to - from;
+        bool elided = false;
         if (recorder != nullptr) {
             recorder->FlushKeyStoresOverlapping(firstStored, static_cast<std::size_t>(lastStored - firstStored));
             recorder->FlushStoresOverlapping(firstStored, static_cast<std::size_t>(lastStored - firstStored));
-            commands = recorder->Commands();
+            if (Recorder::BarrierTracking()) {
+                const std::pair<VkImage, bool> read{image, false};
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> paddingReads(padding.importReads.begin(), padding.importReads.end());
+                paddingReads.insert(paddingReads.end(), padding.shadowReads.begin(), padding.shadowReads.end());
+                commands = recorder->Commands(Recorder::CommandClass::StorageWriteBack, Recorder::Access{paddingReads, keep, std::span(&read, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT}, elided);
+            } else {
+                commands = recorder->Commands();
+            }
             timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageWriteBack);
             recorder->Keep(linear, linear->Size());
             recorder->Keep(tiledScratch, tiledScratch->Size());
             for (const auto& slab : padding.slabs) recorder->Keep(slab);
             // The image itself must outlive the recorded retile: the cache may evict it right after.
             if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
-            Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack, padding.copies.empty() ? 4 : 5);
-            if (Recorder::BarrierValidate()) {
-                const std::pair<VkImage, bool> read{image, false};
-                recorder->NoteAccess(Recorder::CommandClass::StorageWriteBack, Recorder::Access{padding.importReads, keep, std::span(&read, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT});
-            }
+            Recorder::CountBarriers(Recorder::CommandClass::StorageWriteBack, elided ? 2 : padding.copies.empty() ? 4 : 5);
+            if (elided) Recorder::CountSkipped(Recorder::CommandClass::StorageWriteBack, padding.copies.empty() ? 2 : 3);
         } else {
             batch = std::make_unique<CommandBatch>(context);
             commands = batch->Handle();
@@ -3704,19 +3818,19 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         toSource.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toSource.image = image;
         toSource.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
-        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
+        if (!elided) context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &toSource);
         if (!padding.copies.empty()) {
             // The current bytes of the copied ranges no element holds go under the retile (every
             // earlier writer of the import, host stores included, first; the import-ready barrier
             // below orders the scratch writes).
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            if (!elided) RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             for (const auto& [source, copies] : padding.copies) context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, source, tiledScratch->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
         }
         const auto regions = CopyRegions(storedLayers);
-        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, elided ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, linear->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
         const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
-        const VkMemoryBarrier importReady{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
-        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 1, &linearRead, 0, nullptr);
+        const VkMemoryBarrier importReady{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, elided ? VkAccessFlags{VK_ACCESS_TRANSFER_WRITE_BIT} : VkAccessFlags{VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT}, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT};
+        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, elided ? VkPipelineStageFlags{VK_PIPELINE_STAGE_TRANSFER_BIT} : VkPipelineStageFlags{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT}, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 1, &linearRead, 0, nullptr);
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
             if (storedLayers != nullptr && !(*storedLayers)[layer]) continue;
             for (std::uint32_t level = 0; level < mips.size(); ++level) {
@@ -3738,12 +3852,12 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         backToGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
         backToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         const VkMemoryBarrier stored{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT};
-        context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &stored, 0, nullptr, 1, &backToGeneral);
+        if (!elided) context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &stored, 0, nullptr, 1, &backToGeneral);
         if (batch) {
             batch->SubmitAndWait();
         } else {
             recorder->EndGpuTiming(timing, storedBytes);
-            recorder->MarkShaderReadsCovered();
+            if (!elided) recorder->MarkShaderReadsCovered();
             recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
         }
         countStorageWriteBack(storedBytes, true);

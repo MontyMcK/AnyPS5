@@ -200,6 +200,11 @@ public:
         else Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
     }
 
+    VkImageView FoundLayerView(std::uint32_t layer, std::uint32_t count) const {
+        const auto found = layerViews.find(layer | (count << 16u));
+        return found != layerViews.end() ? found->second : VK_NULL_HANDLE;
+    }
+
     VkImageView LayerView(std::uint32_t layer, std::uint32_t count) {
         const auto key = layer | (count << 16u);
         if (const auto found = layerViews.find(key); found != layerViews.end()) return found->second;
@@ -442,6 +447,28 @@ std::vector<std::unique_ptr<DepthSurface>>& surfaces() {
     return *list;
 }
 
+VkImageView settledDepthView(const Context& context, const DepthTarget& target) {
+    const ForkGuard lock(surfacesMutex());
+    const auto settled = [](const DepthSurface& surface) {
+        const auto aspects = VK_IMAGE_ASPECT_DEPTH_BIT | (surface.target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
+        return (surface.pendingClear & aspects) == 0 && surface.writer.expired();
+    };
+    if (target.arraySlices > 1u && DebugValue(DebugKey::SplitDepthSlices) == 0) {
+        const auto found = std::find_if(surfaces().begin(), surfaces().end(), [&](const auto& surface) {
+            const auto& existing = surface->target;
+            return surface->context.device == context.device && existing.address == target.arrayAddress && existing.stencilAddress == target.arrayStencilAddress && existing.extent.width == target.extent.width && existing.extent.height == target.extent.height && existing.format == target.format && existing.layers >= target.arraySlices;
+        });
+        if (found == surfaces().end() || !settled(**found)) return VK_NULL_HANDLE;
+        return (*found)->FoundLayerView(target.arraySlice, std::max(target.layers, 1u));
+    }
+    for (const auto& surface : surfaces()) {
+        if (surface->context.device != context.device || !sameSurface(surface->target, target)) continue;
+        if (const auto perFrame = DebugValue(DebugKey::ClearDepthPerFrame); perFrame != 0 && perFrame == target.address && surface->clearedAtPresent != Recorder::Presents()) return VK_NULL_HANDLE;
+        return settled(*surface) ? surface->view : VK_NULL_HANDLE;
+    }
+    return VK_NULL_HANDLE;
+}
+
 }
 
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
@@ -453,6 +480,14 @@ std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
 }
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
+    if (auto* log = ForkLogged()) {
+        const auto view = settledDepthView(context, target);
+        if (view == VK_NULL_HANDLE) ForkRefuse("depth surface");
+        log->Expect([context, target, view] { return settledDepthView(context, target) == view; });
+        log->Defer(ForkLog::Effect::Depth, target.address, 0, [context, target] { static_cast<void>(DepthSurfaceView(context, target)); });
+        return view;
+    }
+    if (auto* witness = ForkWitnessed()) witness->Note(ForkLog::Effect::Depth, target.address, 0);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
     if (target.arraySlices > 1u && DebugValue(DebugKey::SplitDepthSlices) == 0) {
@@ -633,12 +668,12 @@ void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
 }
 
 bool DepthSurfaceAt(std::uint64_t address) {
-    std::lock_guard lock(surfacesMutex());
+    const ForkGuard lock(surfacesMutex());
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->target.address == address || surface->target.stencilAddress == address; });
 }
 
 bool DepthStencilPlaneAt(std::uint64_t address) {
-    std::lock_guard lock(surfacesMutex());
+    const ForkGuard lock(surfacesMutex());
     return std::any_of(surfaces().begin(), surfaces().end(), [&](const auto& surface) { return surface->target.stencilAddress != 0 && surface->target.stencilAddress == address && surface->target.address != address; });
 }
 

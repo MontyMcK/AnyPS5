@@ -22,4 +22,8 @@ void MousePublishInput_nid_postfix(const MouseInputEvent& event) {
     Mouse::Publish(event);
 }
 
+bool MouseIsOpen_nid_postfix() {
+    return Mouse::IsOpen();
+}
+
 }

@@ -3,13 +3,39 @@
 
 #include "SDL_mouse.h"
 
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <utility>
+
+void MouseInput::SetGeometry(std::uint32_t sourceWidth, std::uint32_t sourceHeight, int windowWidth, int windowHeight) {
+    static const auto space = [] {
+        std::pair<std::uint32_t, std::uint32_t> size{0, 0};
+        if (const char* text = std::getenv("APS5_MOUSE_SPACE"); text != nullptr) std::sscanf(text, "%ux%u", &size.first, &size.second);
+        return size;
+    }();
+    if (space.first != 0 && space.second != 0) {
+        sourceWidth = space.first;
+        sourceHeight = space.second;
+    }
+    if (sourceWidth == 0 || sourceHeight == 0 || windowWidth <= 0 || windowHeight <= 0) return;
+    // The image is fitted inside the window, so one window pixel covers this many source pixels.
+    scale = std::max(static_cast<double>(sourceWidth) / windowWidth, static_cast<double>(sourceHeight) / windowHeight);
+}
+
 void MouseInput::HandleEvent(const SDL_Event& event, unsigned windowId) {
     MouseInputEvent input{};
     switch (event.type) {
         case SDL_MOUSEMOTION:
             if (event.motion.windowID != windowId || !focused) return;
-            input.x = event.motion.xrel;
-            input.y = event.motion.yrel;
+            remainderX += event.motion.xrel * scale;
+            remainderY += event.motion.yrel * scale;
+            input.x = static_cast<std::int32_t>(std::trunc(remainderX));
+            input.y = static_cast<std::int32_t>(std::trunc(remainderY));
+            remainderX -= input.x;
+            remainderY -= input.y;
+            if (input.x == 0 && input.y == 0) return;
             break;
         case SDL_MOUSEBUTTONDOWN:
         case SDL_MOUSEBUTTONUP:

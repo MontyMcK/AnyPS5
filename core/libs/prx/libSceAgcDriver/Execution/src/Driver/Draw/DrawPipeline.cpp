@@ -1,9 +1,13 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSpeculation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -17,6 +21,105 @@ std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
 }
 
+std::atomic<DrawPipeline::ForkRunner*> forkRunner{nullptr};
+
+bool forkStatsOn() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile && Graphics::ForkStatsEnabled();
+}
+
+class ForkPool {
+public:
+    using Job = std::function<void(std::size_t, std::size_t)>;
+
+    static ForkPool& Get() {
+        static auto* pool = new ForkPool();
+        return *pool;
+    }
+
+    void Run(std::size_t count, const Job& job) {
+        if (count == 0) return;
+        auto batch = std::make_shared<Batch>();
+        batch->job = &job;
+        batch->count = count;
+        std::unique_lock lock(mutex);
+        while (threads.size() < DrawPipeline::ForkWorkers()) threads.emplace_back([this, slot = threads.size() + 1] { work(slot); });
+        current = batch;
+        ++generation;
+        wake.notify_all();
+        done.wait(lock, [&] { return batch->finished == batch->count; });
+        current.reset();
+    }
+
+private:
+    struct Batch {
+        const Job* job = nullptr;
+        std::size_t count = 0;
+        std::atomic<std::size_t> next{0};
+        std::size_t finished = 0;
+    };
+
+    void work(std::size_t slot) {
+        PinWorkerThread("fork build");
+        std::uint64_t seen = 0;
+        for (;;) {
+            std::shared_ptr<Batch> batch;
+            {
+                std::unique_lock lock(mutex);
+                wake.wait(lock, [&] { return generation != seen; });
+                seen = generation;
+                batch = current;
+            }
+            if (batch == nullptr) continue;
+            std::size_t processed = 0;
+            for (auto index = batch->next.fetch_add(1, std::memory_order_relaxed); index < batch->count; index = batch->next.fetch_add(1, std::memory_order_relaxed)) {
+                try {
+                    (*batch->job)(index, slot);
+                } catch (...) {
+                }
+                ++processed;
+            }
+            if (processed == 0) continue;
+            std::lock_guard lock(mutex);
+            batch->finished += processed;
+            if (batch->finished == batch->count) done.notify_all();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable done;
+    std::shared_ptr<Batch> current;
+    std::uint64_t generation = 0;
+    std::vector<std::thread> threads;
+};
+
+}
+
+void DrawPipeline::SetForkRunner(ForkRunner* runner) {
+    forkRunner.store(runner, std::memory_order_release);
+}
+
+std::size_t DrawPipeline::ForkWorkers() {
+    static const std::size_t workers = [] {
+        const char* text = std::getenv("APS5_FORK_WORKERS");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 4ull;
+        return static_cast<std::size_t>(std::clamp<unsigned long long>(value, 1, 14));
+    }();
+    return workers;
+}
+
+std::size_t DrawPipeline::ForkRunLimit() {
+    static const std::size_t limit = [] {
+        const char* text = std::getenv("APS5_FORK_RUN");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 32ull;
+        return static_cast<std::size_t>(std::clamp<unsigned long long>(value, 2, 64));
+    }();
+    return limit;
+}
+
+void DrawPipeline::RunForkJobs(std::size_t count, const std::function<void(std::size_t index, std::size_t slot)>& job) {
+    ForkPool::Get().Run(count, job);
 }
 
 DrawPipeline& DrawPipeline::Queue0() {
@@ -32,7 +135,12 @@ std::size_t DrawPipeline::Depth() {
         const auto value = std::strtoull(text, nullptr, 10);
         return value == 0 ? std::size_t{0} : value == 1 ? std::size_t{8} : static_cast<std::size_t>(std::min<unsigned long long>(value, 256));
     }();
-    return depth;
+    static const std::size_t forkDepth = [] {
+        const char* text = std::getenv("APS5_FORK_DEPTH");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        return value == 0 ? std::size_t{0} : static_cast<std::size_t>(std::clamp<unsigned long long>(value, 8, 256));
+    }();
+    return depth != 0 && forkDepth != 0 && Graphics::ForkBuildEnabled() && Graphics::LiveFlag("fork_depth", true) ? std::max(depth, forkDepth) : depth;
 }
 
 bool& DrawPipeline::Active() {
@@ -50,8 +158,10 @@ struct PipeEvent {
 };
 
 struct PipeTraceState {
-    std::int64_t from = 0;
-    std::int64_t until = 0;
+    std::atomic<std::int64_t> from{0};
+    std::atomic<std::int64_t> until{0};
+    std::atomic<std::int64_t> nextLiveCheck{0};
+    bool live = false;
     std::vector<PipeEvent> events;
     std::atomic<std::size_t> next{0};
     std::atomic<bool> dumped{false};
@@ -65,8 +175,10 @@ PipeTraceState* PipeTracing() {
         auto* created = new PipeTraceState();
         created->events.resize(std::size_t{1} << 21u);
         const auto start = std::chrono::steady_clock::now().time_since_epoch().count();
-        created->from = start + static_cast<std::int64_t>(std::strtod(text, nullptr) * 1e9);
-        created->until = created->from + 2'000'000'000ll;
+        created->live = std::strcmp(text, "live") == 0;
+        const auto from = created->live ? std::numeric_limits<std::int64_t>::max() - 4'000'000'000ll : start + static_cast<std::int64_t>(std::strtod(text, nullptr) * 1e9);
+        created->from.store(from);
+        created->until.store(from + 2'000'000'000ll);
         return created;
     }();
     return state;
@@ -78,7 +190,7 @@ void dumpPipeTrace(PipeTraceState& state) {
     if (FILE* file = std::fopen("pipe-trace.txt", "w")) {
         for (std::size_t i = 0; i < count; ++i) {
             const auto& event = state.events[i];
-            std::fprintf(file, "%.3f %u %u %u%c", static_cast<double>(event.ns - state.from) / 1e3, event.thread, event.kind, event.argument, 10);
+            std::fprintf(file, "%.3f %u %u %u%c", static_cast<double>(event.ns - state.from.load()) / 1e3, event.thread, event.kind, event.argument, 10);
         }
         std::fclose(file);
     }
@@ -91,8 +203,15 @@ void DrawPipeline::PipeTrace(Trace kind, std::uint32_t argument) {
     auto* state = PipeTracing();
     if (state == nullptr || state->dumped.load(std::memory_order_relaxed)) return;
     const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-    if (now < state->from) return;
-    if (now > state->until) {
+    if (now < state->from.load(std::memory_order_relaxed)) {
+        auto check = state->nextLiveCheck.load(std::memory_order_relaxed);
+        if (!state->live || now < check || !state->nextLiveCheck.compare_exchange_strong(check, now + 250'000'000ll)) return;
+        if (!Graphics::LiveFlag("trace", false)) return;
+        state->until.store(now + 2'000'000'000ll);
+        state->from.store(now);
+        std::fprintf(stderr, "[pipe-trace] live capture started%c", 10);
+    }
+    if (now > state->until.load(std::memory_order_relaxed)) {
         dumpPipeTrace(*state);
         return;
     }
@@ -182,6 +301,64 @@ void DrawPipeline::finishPrepTurn(std::uint64_t sequence) {
     prepTurnChanged.notify_all();
 }
 
+bool DrawPipeline::PrepReorder() {
+    static const bool enabled = std::getenv("APS5_PREP_REORDER") != nullptr;
+    return Graphics::LiveFlag("prep_reorder", enabled);
+}
+
+void DrawPipeline::deliverPrepared(std::uint64_t sequence, std::optional<Item> item) {
+    {
+        std::lock_guard lock(prepMutex);
+        if (prepTurn != sequence || prepFlushing) {
+            prepParked.emplace(sequence, std::move(item));
+            ++prepParkedCount;
+            return;
+        }
+        prepFlushing = true;
+    }
+    for (;;) {
+        if (item.has_value()) pushItem(std::move(*item));
+        std::lock_guard lock(prepMutex);
+        std::erase_if(prepWrites, [&](const PrepWrites& entry) { return entry.sequence == sequence; });
+        prepOutstanding.fetch_sub(1, std::memory_order_release);
+        prepIdle.notify_all();
+        ++prepTurn;
+        prepTurnChanged.notify_all();
+        const auto next = prepParked.find(prepTurn);
+        if (next == prepParked.end()) {
+            prepFlushing = false;
+            return;
+        }
+        sequence = next->first;
+        item = std::move(next->second);
+        prepParked.erase(next);
+    }
+}
+
+void DrawPipeline::pushItem(Item item) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    std::vector<Commit> finished;
+    std::unique_lock lock(mutex);
+    finished.swap(retired);
+    if (items.size() >= Depth()) {
+        const auto start = std::chrono::steady_clock::now();
+        ++idleWaiters;
+        idle.wait(lock, [&] { return items.size() < Depth(); });
+        --idleWaiters;
+        fullWaitNs += elapsedNs(start);
+    }
+    depthSum += items.size();
+    ++enqueued;
+    item.sequence = ++nextItemSequence;
+    items.push_back(std::move(item));
+    outstanding.fetch_add(1, std::memory_order_release);
+    if (!thread.joinable()) thread = std::thread([this] { run(); });
+    if (committerWaiting) wake.notify_one();
+    if (!profile) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport >= std::chrono::seconds(10)) report(now);
+}
+
 void DrawPipeline::prepRun() {
     Active() = true;
     for (;;) {
@@ -207,29 +384,27 @@ void DrawPipeline::prepRun() {
             failed = true;
         }
         if (!PrepEnqueued()) {
-            waitPrepTurn(job.first);
-            finishPrepTurn(job.first);
+            if (!PrepReorder()) waitPrepTurn(job.first);
+            PrepEnqueued() = true;
+            deliverPrepared(job.first, std::nullopt);
         }
         PipeTrace(Trace::PrepEnd);
         PrepSequence() = 0;
         const auto spent = elapsedNs(start);
         std::lock_guard lock(prepMutex);
-        std::erase_if(prepWrites, [&](const PrepWrites& entry) { return entry.sequence == job.first; });
         ++prepJobs;
         prepNs += spent;
         if (failed) ++prepFailures;
-        prepOutstanding.fetch_sub(1, std::memory_order_release);
-        prepIdle.notify_all();
     }
 }
 
-void DrawPipeline::EnqueueOrdered(Commit commit, std::vector<Range> writes) {
+void DrawPipeline::EnqueueOrdered(Commit commit, std::vector<Range> writes, bool unknownWrites) {
     if (!SplitDraws() || OnPrepThread() || prepOutstanding.load(std::memory_order_acquire) == 0) {
-        Enqueue(std::move(commit), std::move(writes));
+        Enqueue(std::move(commit), std::move(writes), 0, {}, unknownWrites);
         return;
     }
     auto held = std::make_shared<std::pair<Commit, std::vector<Range>>>(std::move(commit), writes);
-    Prepare([this, held] { Enqueue(std::move(held->first), std::move(held->second)); }, std::move(writes));
+    Prepare([this, held, unknownWrites] { Enqueue(std::move(held->first), std::move(held->second), 0, {}, unknownWrites); }, std::move(writes));
 }
 
 void DrawPipeline::WaitEarlierPreparations() {
@@ -242,7 +417,7 @@ void DrawPipeline::drainPrep() {
     prepIdle.wait(lock, [&] { return prepOutstanding.load(std::memory_order_relaxed) == 0; });
 }
 
-void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
+void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, bool unknownWrites, std::shared_ptr<ForkJob> fork) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool orderedHandoff = std::getenv("APS5_NO_ORDERED_HANDOFF") == nullptr;
     if (orderedHandoff && SplitDraws() && !OnPrepThread() && prepOutstanding.load(std::memory_order_acquire) != 0) {
@@ -252,13 +427,27 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
             std::vector<Range> writes;
             std::uint64_t labelAddress;
             std::vector<std::byte> labelBytes;
+            bool unknownWrites;
+            std::shared_ptr<ForkJob> fork;
         };
-        auto held = std::make_shared<Held>(Held{std::move(commit), writes, labelAddress, labelBytes});
-        Prepare([this, held] { Enqueue(std::move(held->commit), std::move(held->writes), held->labelAddress, std::move(held->labelBytes)); }, std::move(writes), labelAddress, std::move(labelBytes));
+        auto held = std::make_shared<Held>(Held{std::move(commit), writes, labelAddress, labelBytes, unknownWrites, std::move(fork)});
+        Prepare([this, held] { Enqueue(std::move(held->commit), std::move(held->writes), held->labelAddress, std::move(held->labelBytes), held->unknownWrites, std::move(held->fork)); }, std::move(writes), labelAddress, std::move(labelBytes));
         return;
     }
     // Finished commits are destroyed here, off the committer (their captures are a draw's whole
     // front end), after the mutex and the preparation turn are released (declared before both).
+    const auto prepared = PrepSequence();
+    if (prepared != 0 && !PrepEnqueued()) {
+        rethrowFailure();
+        if (!PrepReorder()) waitPrepTurn(prepared);
+        PrepEnqueued() = true;
+        deliverPrepared(prepared, Item{std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), 0, unknownWrites, std::move(fork)});
+        return;
+    }
+    if (prepared != 0) {
+        std::unique_lock prepLock(prepMutex);
+        prepTurnChanged.wait(prepLock, [&] { return prepTurn > prepared; });
+    }
     std::vector<Commit> finished;
     drainPrep();
     const auto sequence = PrepSequence();
@@ -286,7 +475,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     }
     depthSum += items.size();
     ++enqueued;
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes)});
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), ++nextItemSequence, unknownWrites, std::move(fork)});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) thread = std::thread([this] { run(); });
     if (committerWaiting) wake.notify_one();
@@ -330,8 +519,20 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 }
 
 void DrawPipeline::run() {
+    static const auto holdBudget = [] {
+        const char* text = std::getenv("APS5_COMMIT_HOLD_US");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 300ull;
+        return std::chrono::microseconds(std::clamp<unsigned long long>(value, 10, 20000));
+    }();
+    std::vector<ForkJob*> forkJobs;
+    std::unique_lock<GuestMemory::GpuMutexType> hold(GuestMemory::GpuMutex(), std::defer_lock);
+    auto heldSince = std::chrono::steady_clock::time_point{};
     for (;;) {
+        if (hold.owns_lock() && (outstanding.load(std::memory_order_acquire) == 0 || GuestMemory::GpuMutex().Contenders() != 0 || std::chrono::steady_clock::now() - heldSince > holdBudget || !Graphics::CommitHoldEnabled())) hold.unlock();
         Commit* commit = nullptr;
+        std::uint64_t sequence = 0;
+        bool stream = false;
+        forkJobs.clear();
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
@@ -339,39 +540,168 @@ void DrawPipeline::run() {
                 const auto state = std::min<std::size_t>(ProducerState().load(std::memory_order_relaxed), idleNs.size() - 1);
                 const auto idleStart = std::chrono::steady_clock::now();
                 PipeTrace(Trace::CommitIdle);
+                committerIdle.store(true, std::memory_order_relaxed);
                 wake.wait(lock, [&] { return !items.empty(); });
+                committerIdle.store(false, std::memory_order_relaxed);
                 PipeTrace(Trace::CommitIdleEnd);
                 idleNs[state] += elapsedNs(idleStart);
             }
             committerWaiting = false;
             commit = &items.front().commit;
+            sequence = items.front().sequence;
+            gatherForkRun(forkJobs);
+            stream = forkRunner.load(std::memory_order_acquire) != nullptr && items.front().fork != nullptr && items.front().fork->eligible && Graphics::ForkStreamEnabled();
         }
-        const auto start = std::chrono::steady_clock::now();
-        std::exception_ptr fatal;
-        bool failed = false;
-        PipeTrace(Trace::Commit);
-        try {
-            (*commit)();
-        } catch (const std::exception& error) {
-            failed = true;
-            static std::atomic<std::uint64_t> reported{0};
-            if (reported.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[draw] pipelined commit failed: %.200s\n", error.what());
-        } catch (...) {
-            fatal = std::current_exception();
+        if (stream) {
+            if (runStream() != 0) continue;
+        } else if (forkJobs.size() >= 2 && runForked(forkJobs) != 0) {
+            continue;
         }
-        PipeTrace(Trace::CommitEnd);
-        const auto spent = elapsedNs(start);
-        std::lock_guard lock(mutex);
-        static const bool retireOffCommitter = std::getenv("APS5_NO_RETIRED_COMMITS") == nullptr;
-        if (retireOffCommitter && retired.size() < 4096) retired.push_back(std::move(items.front().commit));
-        items.pop_front();
-        ++commits;
-        commitNs += spent;
-        if (failed) ++commitErrors;
-        if (fatal != nullptr && failure == nullptr) failure = fatal;
-        outstanding.fetch_sub(1, std::memory_order_release);
-        if (idleWaiters != 0) idle.notify_all();
+        if (!hold.owns_lock() && Graphics::CommitHoldEnabled()) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+            hold.lock();
+            heldSince = std::chrono::steady_clock::now();
+        }
+        static_cast<void>(runCommit(*commit, sequence));
     }
+}
+
+bool DrawPipeline::runCommit(const Commit& commit, std::uint64_t sequence) {
+    const auto start = std::chrono::steady_clock::now();
+    std::exception_ptr fatal;
+    bool failed = false;
+    PipeTrace(Trace::Commit);
+    CommittingSequence() = sequence;
+    try {
+        commit();
+    } catch (const std::exception& error) {
+        failed = true;
+        static std::atomic<std::uint64_t> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[draw] pipelined commit failed: %.200s\n", error.what());
+    } catch (...) {
+        fatal = std::current_exception();
+    }
+    CommittingSequence() = 0;
+    PipeTrace(Trace::CommitEnd);
+    const auto spent = elapsedNs(start);
+    std::lock_guard lock(mutex);
+    if (Graphics::DrawTokensEnabled()) {
+        std::lock_guard appliedLock(appliedMutex);
+        if (applied.size() != AppliedCapacity) applied.resize(AppliedCapacity);
+        auto& slot = applied[static_cast<std::size_t>(sequence % AppliedCapacity)];
+        slot.sequence = sequence;
+        slot.unknown = items.front().unknown;
+        slot.writes = std::move(items.front().writes);
+        appliedFrontier.store(sequence, std::memory_order_release);
+    }
+    static const bool retireOffCommitter = std::getenv("APS5_NO_RETIRED_COMMITS") == nullptr;
+    if (retireOffCommitter && retired.size() < 4096) retired.push_back(std::move(items.front().commit));
+    items.pop_front();
+    ++commits;
+    commitNs += spent;
+    if (failed) ++commitErrors;
+    if (fatal != nullptr && failure == nullptr) failure = fatal;
+    outstanding.fetch_sub(1, std::memory_order_release);
+    if (idleWaiters != 0) idle.notify_all();
+    return !failed && fatal == nullptr;
+}
+
+void DrawPipeline::gatherForkRun(std::vector<ForkJob*>& jobs) {
+    const bool stats = forkStatsOn();
+    const bool build = forkRunner.load(std::memory_order_acquire) != nullptr && Graphics::ForkBuildEnabled();
+    if (!stats && !build) return;
+    const auto& front = items.front();
+    if (front.fork == nullptr || !front.fork->eligible) {
+        lastHinted = false;
+        return;
+    }
+    const auto hint = front.fork->passHint;
+    const bool continuing = lastHinted && lastHint == hint;
+    const auto limit = ForkRunLimit();
+    std::size_t length = 0;
+    for (const auto& item : items) {
+        if (item.fork == nullptr || !item.fork->eligible || item.fork->passHint != hint) break;
+        if (build && continuing && jobs.size() < limit) jobs.push_back(item.fork.get());
+        ++length;
+        if (!stats && (!continuing || jobs.size() >= limit)) break;
+    }
+    if (stats && !continuing) {
+        std::size_t bucket = 0;
+        while (bucket + 1 < runLengths.size() && length >= (std::size_t{2} << bucket)) ++bucket;
+        ++runLengths[bucket];
+        ++runStarts;
+    }
+    lastHinted = true;
+    lastHint = hint;
+}
+
+std::size_t DrawPipeline::runForked(std::span<ForkJob* const> jobs) {
+    auto* runner = forkRunner.load(std::memory_order_acquire);
+    if (runner == nullptr) return 0;
+    std::size_t committed = 0;
+    std::size_t handled = 0;
+    try {
+        handled = runner->Run(jobs, [this, &committed](std::size_t, const Commit* body) {
+            const Commit* own = nullptr;
+            std::uint64_t sequence = 0;
+            {
+                std::lock_guard lock(mutex);
+                own = &items.front().commit;
+                sequence = items.front().sequence;
+            }
+            ++committed;
+            return runCommit(body != nullptr ? *body : *own, sequence);
+        });
+    } catch (...) {
+        handled = committed;
+    }
+    std::lock_guard lock(mutex);
+    ++forkRuns;
+    forkRunItems += jobs.size();
+    forkHandled += handled;
+    return handled;
+}
+
+std::size_t DrawPipeline::runStream() {
+    auto* runner = forkRunner.load(std::memory_order_acquire);
+    if (runner == nullptr) return 0;
+    std::size_t committed = 0;
+    std::size_t handled = 0;
+    try {
+        handled = runner->Stream([this](std::size_t limit) {
+            std::vector<std::shared_ptr<ForkJob>> jobs;
+            std::lock_guard lock(mutex);
+            for (const auto& item : items) {
+                if (item.fork == nullptr || jobs.size() >= limit) break;
+                jobs.push_back(item.fork);
+            }
+            return jobs;
+        }, [this, &committed](const Commit* body) {
+            const Commit* own = nullptr;
+            std::uint64_t sequence = 0;
+            {
+                std::lock_guard lock(mutex);
+                own = &items.front().commit;
+                sequence = items.front().sequence;
+            }
+            ++committed;
+            return runCommit(body != nullptr ? *body : *own, sequence);
+        });
+    } catch (...) {
+        handled = committed;
+    }
+    return handled;
+}
+
+std::string DrawPipeline::TakeForkRuns() {
+    std::lock_guard lock(mutex);
+    constexpr std::array<const char*, 7> names{"1", "2-3", "4-7", "8-15", "16-31", "32-63", "64+"};
+    std::string line = "visible runs " + std::to_string(runStarts) + " (";
+    for (std::size_t index = 0; index < runLengths.size(); ++index) line += std::string(index == 0 ? "" : " ") + names[index] + ":" + std::to_string(runLengths[index]);
+    line += "), forked runs " + std::to_string(forkRuns) + " of " + std::to_string(forkRunItems) + " draws, " + std::to_string(forkHandled) + " committed by the runner";
+    runLengths = {};
+    runStarts = forkRuns = forkRunItems = forkHandled = 0;
+    return line;
 }
 
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
@@ -389,6 +719,32 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
     drainWaitNs[index] += elapsedNs(start);
     rethrowFailure();
+}
+
+std::uint64_t& DrawPipeline::CommittingSequence() {
+    static thread_local std::uint64_t sequence = 0;
+    return sequence;
+}
+
+DrawPipeline::Window DrawPipeline::CheckWindow(std::uint64_t fromExclusive, std::uint64_t toExclusive, std::span<const Range> reads) {
+    if (toExclusive == 0 || toExclusive <= fromExclusive) return Window::Overflow;
+    if (toExclusive - fromExclusive - 1 > AppliedCapacity) return Window::Overflow;
+    std::lock_guard lock(appliedMutex);
+    if (applied.size() != AppliedCapacity || appliedFrontier.load(std::memory_order_relaxed) + 1 < toExclusive) return Window::Overflow;
+    auto verdict = Window::Clear;
+    for (auto sequence = fromExclusive + 1; sequence < toExclusive; ++sequence) {
+        const auto& slot = applied[static_cast<std::size_t>(sequence % AppliedCapacity)];
+        if (slot.sequence != sequence) return Window::Overflow;
+        if (slot.unknown) {
+            verdict = Window::Unknown;
+            continue;
+        }
+        for (const auto& [begin, end] : slot.writes) {
+            const bool overlaps = std::any_of(reads.begin(), reads.end(), [&](const Range& read) { return read.first < end && begin < read.second; });
+            if (overlaps && verdict == Window::Clear) verdict = Window::Overlap;
+        }
+    }
+    return verdict;
 }
 
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {

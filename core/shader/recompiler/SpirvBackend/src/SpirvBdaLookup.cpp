@@ -44,6 +44,53 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto pointer = TypePointer(state, spv::StorageClassFunction, u32);
     state.module.AddFunction(spv::OpVariable, pointer, low, spv::StorageClassFunction);
     state.module.AddFunction(spv::OpVariable, pointer, high, spv::StorageClassFunction);
+    if (state.bdaHintVariable == 0) state.bdaHintVariable = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, u32), spv::StorageClassPrivate, constant(0));
+    if (BdaHintFastPath()) {
+        const auto tableWords = state.module.AllocateId();
+        state.module.AddFunction(spv::OpArrayLength, u32, tableWords, state.bdaPagetableVariable, 0u);
+        const auto headerOk = binary(spv::OpUGreaterThanEqual, boolean, tableWords, constant(4));
+        const auto headerBlock = state.module.AllocateId();
+        const auto headerDone = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, headerDone, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, headerOk, headerBlock, headerDone);
+        EmitLabel(state, headerBlock);
+        const auto hinted = load(state.bdaHintVariable);
+        const auto entries = BdaLoadWord(state, constant(1));
+        auto valid = binary(spv::OpLogicalAnd, boolean, binary(spv::OpINotEqual, boolean, hinted, constant(0)), binary(spv::OpULessThanEqual, boolean, hinted, entries));
+        valid = binary(spv::OpLogicalAnd, boolean, valid, binary(spv::OpULessThanEqual, boolean, entries, binary(spv::OpShiftRightLogical, u32, binary(spv::OpISub, u32, tableWords, constant(4)), constant(3))));
+        const auto entryBlock = state.module.AllocateId();
+        const auto entryDone = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, entryDone, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, valid, entryBlock, entryDone);
+        EmitLabel(state, entryBlock);
+        const auto slot = binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, hinted, constant(1)), constant(8)));
+        const auto stop = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
+        const auto first = BdaLoadAddress(state, slot);
+        const auto last = BdaLoadAddress(state, binary(spv::OpIAdd, u32, slot, constant(2)));
+        const auto origin = BdaLoadAddress(state, binary(spv::OpIAdd, u32, slot, constant(4)));
+        const auto allowed = BdaLoadWord(state, binary(spv::OpIAdd, u32, slot, constant(6)));
+        const auto reserved = BdaLoadWord(state, binary(spv::OpIAdd, u32, slot, constant(7)));
+        const auto translated = binary(spv::OpIAdd, u64, origin, binary(spv::OpISub, u64, address, first));
+        auto quick = binary(spv::OpULessThanEqual, boolean, first, address);
+        quick = binary(spv::OpLogicalAnd, boolean, quick, binary(spv::OpULessThan, boolean, address, stop));
+        quick = binary(spv::OpLogicalAnd, boolean, quick, binary(spv::OpULessThanEqual, boolean, stop, last));
+        quick = binary(spv::OpLogicalAnd, boolean, quick, binary(spv::OpIEqual, boolean, binary(spv::OpBitwiseAnd, u32, allowed, constant(permission)), constant(permission)));
+        quick = binary(spv::OpLogicalAnd, boolean, quick, binary(spv::OpINotEqual, boolean, origin, BdaConstant(state, 0)));
+        quick = binary(spv::OpLogicalAnd, boolean, quick, binary(spv::OpIEqual, boolean, reserved, constant(0)));
+        quick = binary(spv::OpLogicalAnd, boolean, quick, binary(spv::OpULessThan, boolean, first, last));
+        quick = binary(spv::OpLogicalAnd, boolean, quick, binary(spv::OpUGreaterThanEqual, boolean, translated, origin));
+        const auto taken = state.module.AllocateId();
+        const auto quickDone = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, quickDone, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, quick, taken, quickDone);
+        EmitLabel(state, taken);
+        state.module.AddFunction(spv::OpReturnValue, translated);
+        EmitLabel(state, quickDone);
+        state.module.AddFunction(spv::OpBranch, entryDone);
+        EmitLabel(state, entryDone);
+        state.module.AddFunction(spv::OpBranch, headerDone);
+        EmitLabel(state, headerDone);
+    }
     const auto fail = [&](std::uint32_t condition, BdaAbi::FaultReason reason) {
         if (recordFaults) {
             ReturnBdaFailureIf(state, condition, address, bytes, instruction, reason);
@@ -71,7 +118,6 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     fail(binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow);
     state.module.AddFunction(spv::OpStore, low, constant(0));
     state.module.AddFunction(spv::OpStore, high, count);
-    if (state.bdaHintVariable == 0) state.bdaHintVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, u32), spv::StorageClassPrivate);
     const auto hint = load(state.bdaHintVariable);
     const auto hinted = binary(spv::OpLogicalAnd, boolean, binary(spv::OpINotEqual, boolean, hint, constant(0)), binary(spv::OpULessThanEqual, boolean, hint, count));
     EmitIfCondition(state, hinted, [&] {

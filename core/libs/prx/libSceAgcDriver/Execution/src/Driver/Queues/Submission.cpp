@@ -381,6 +381,7 @@ void Driver::enqueue(Submission submission) {
     worker.pending.push_back(std::move(submission));
     worker.queued.fetch_add(1, std::memory_order_acq_rel);
     if (!worker.thread.joinable()) worker.thread = std::thread([this, queue] { run(queue); });
+    if (!completionThread.joinable() && Graphics::Recorder::CompletionWorkTracked()) completionThread = std::thread([this] { runCompletionThread(); });
 }
 
 void Driver::noteHeldAtSubmit(Submission& submission, std::size_t cursor) {

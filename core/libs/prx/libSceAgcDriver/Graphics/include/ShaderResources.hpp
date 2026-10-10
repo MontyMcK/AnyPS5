@@ -24,6 +24,8 @@ namespace AgcDriver { class VulkanDevice; }
 namespace AgcDriver::Graphics {
 
 class Recorder;
+struct DrawSpeculation;
+struct ProofLap;
 
 void FlushCachedTextures(VkDevice device);
 // Debug aid: every cached storage image's first mip into `directory` (see StorageTexture::DumpBaseLevel).
@@ -158,6 +160,7 @@ public:
     // ranges, the regions read in place, and the storage images with whether each is written.
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& GpuWrites() const { return guestMemory.Writes(); }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const { return guestMemory.InPlaceReads(); }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> TrackedReads() const { return guestMemory.TrackedReads(); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
     // Whether a use writes guest memory beyond a draw's attachments (storage images, written or
     // copied buffers, an address-based build's unknown writes), or reads `image` (a view of it
@@ -262,6 +265,54 @@ public:
     // compiled shader's bindings itself when stage A has not run), and on a completed object from
     // the resource cache (its Revalidate repeats the same lookups), without the device lock.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> PresyncSurfaces() const;
+
+    enum class SpeculationMiss : std::size_t { None, Uncacheable, NoEntry, ImageWords, Record, Collect, Depth, Keys, Evicted, Pending, Changed, Moved, Space, Outside, Set, Thrown, Device, Identity, Version, MovedRecheck, Shared, Finish, Tail, NoRecorder, MovedImage, Count };
+    enum class TokenFallback : std::uint8_t { None, NoTokens, Epoch, Unwatch, Allocations, Pending, Publish, WindowOverlap, WindowUnknown, WindowOverflow, Count };
+    struct ProofSpeculation {
+        struct Surface {
+            std::uint64_t address;
+            std::size_t bytes;
+            const StorageTexture* image;
+            std::uint64_t generation;
+            std::size_t element;
+            bool storage;
+        };
+        std::uint64_t version = 0;
+        std::uint64_t pendingSerial = 0;
+        bool scanned = false;
+        std::vector<Surface> surfaces;
+        std::vector<StorageTexture::PendingQuery> pending;
+        std::vector<bool> skip;
+        std::vector<std::size_t> depths;
+        bool tokens = false;
+        std::uint64_t collectEpoch = 0;
+        std::uint64_t unwatchSerial = 0;
+        std::uint64_t allocations = 0;
+        TokenFallback window = TokenFallback::None;
+    };
+    struct MovedProof {
+        bool tokens = false;
+        std::uint64_t publish = 0;
+        std::uint64_t pendingSerial = 0;
+        std::uint64_t allocations = 0;
+        std::uint64_t forget = 0;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        TokenFallback window = TokenFallback::None;
+    };
+    struct SpeculatedImage {
+        std::size_t at;
+        std::size_t slot;
+        bool firstLayer;
+        std::array<std::uint32_t, 8> words;
+    };
+    SpeculationMiss SpeculateProof(ProofSpeculation& speculation) const;
+    SpeculationMiss ProveSpeculated(const ProofSpeculation& speculation);
+    bool MovedStillFree(std::span<const MovedBuffer> moved, Recorder* recorder, const MovedProof* proof = nullptr) const;
+    void SpeculateMovedFree(std::span<const MovedBuffer> moved, MovedProof& proof) const;
+    bool SpeculateTemplate(std::span<const CompiledShader> shaders, DrawSpeculation& speculation) const;
+    static bool SpeculateAddressUse(const std::shared_ptr<ShaderResources>& source, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, DrawSpeculation& speculation);
+    static std::shared_ptr<ShaderResources> UseAddressSpeculation(const std::shared_ptr<ShaderResources>& source, DrawSpeculation& speculation);
+    std::optional<std::vector<MovedBuffer>> MovedBuffersNow(std::span<const CompiledShader> shaders, Recorder* recorder) const { return movedBuffers(shaders, recorder, false); }
 
 private:
     friend class AgcDriver::VulkanDevice;
@@ -373,7 +424,7 @@ private:
     struct AddressUseTag {};
     ShaderResources(AddressUseTag, const std::shared_ptr<ShaderResources>& source);
     void noteAddressReusable();
-    bool writeAddressSet(std::span<const MovedBuffer> moved);
+    bool writeAddressSet(std::span<const MovedBuffer> moved, std::span<const std::optional<GuestBufferMemory::SpaceView>> planned = {}, std::size_t* movedGuestOut = nullptr);
     std::optional<std::vector<MovedBuffer>> movedBuffers(std::span<const CompiledShader> shaders, Recorder* recorder, bool dataOnly) const;
     struct AddressWrite {
         VkWriteDescriptorSet write;
@@ -392,6 +443,7 @@ private:
     std::vector<std::size_t> addressInfos;
     std::vector<std::size_t> addressTextureSlots;
     std::vector<std::pair<std::size_t, VkDescriptorImageInfo>> movedImageViews;
+    bool rebindSpeculatedImages(std::span<const SpeculatedImage> images);
     std::vector<std::shared_ptr<Buffer>> addressData;
     void reportDescriptorCaches() const;
     // What a sampled texture was proved current against when the build (or the last full Revalidate)
@@ -489,6 +541,9 @@ private:
     bool reusable = false;
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
+    mutable std::mutex proofMutex;
+    std::uint64_t proofVersion = 0;
+    ProofFailure proofTail(std::uint64_t serialBefore, ProofLap* lap);
     // The pending registry's serial at the last Revalidate that proved this object, taken before
     // its checks and kept only when unchanged after them (0: none): while it is still the serial,
     // no image other than the object's own sources has results pending over its surfaces and
@@ -564,6 +619,7 @@ class ResourceCache {
 public:
     using Key = std::vector<std::uint32_t>;
     std::shared_ptr<ShaderResources> Find(const Key& key);
+    std::shared_ptr<ShaderResources> Peek(const Key& key) const;
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).

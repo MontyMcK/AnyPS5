@@ -177,6 +177,7 @@ void ForgetStores(std::uint64_t begin, std::uint64_t end) {
 std::optional<DccKeys> MemoizedKeys(std::uint64_t begin, std::uint64_t end) {
     auto& memo = Memo();
     std::lock_guard lock(memo.mutex);
+    if (ForkLogged() != nullptr && (!memo.entries.empty() || memo.recorder != Recorder::Active())) ForkRefuse("dcc key memo");
     auto* recorder = MemoRecorder(memo);
     for (auto it = memo.entries.begin(); it != memo.entries.end(); ++it) {
         if (it->begin > begin || it->end < end) continue;
@@ -267,6 +268,8 @@ void StoreUncompressedOnCpu(std::uint64_t begin, std::size_t count) {
 }
 
 void NoteKeysFillOnGpu(std::uint64_t begin, std::size_t count, DccKeys keys) {
+    ForkTrap("dcc key fill memo");
+    ForkQuiesce("dcc key fill memo");
     static const bool disabled = std::getenv("APS5_NO_KEYS_FILL_MEMO") != nullptr;
     if (disabled || count == 0) return;
     auto& memo = Memo();
@@ -424,6 +427,7 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
     // device lock they are published and waited for; a build's unlocked stage answers "unstable"
     // so its stage B reads them under the lock.
     if (AnyShadowedOverlaps(metaAddress, count)) {
+        ForkTrap("dcc keys shadowed");
         if (!GuestMemory::GpuMutex().HeldByThisThread()) {
             memoized = true;
             return DccKeys::Mixed;
@@ -476,6 +480,7 @@ DccKeys textureClearKeys(const GuestTextureResource& resource, std::uint64_t gue
 }
 
 DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count) {
+    ForkTrap("current dcc keys");
     if (metaAddress != 0 && count != 0 && GuestMemory::GpuMutex().HeldByThisThread()) {
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
             if (const auto keys = PendingStoreKeys(*recorder, metaAddress, count)) return *keys;
@@ -523,6 +528,8 @@ void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes) 
 }
 
 void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes, std::size_t keyCount) {
+    ForkTrap("dcc keys store");
+    ForkQuiesce("dcc keys store");
     const auto count = StoredKeyCount(metaAddress, surfaceBytes, keyCount);
     if (count == 0) return;
     // The bytes are trusted only when no recorded work writes them (lock-free, with or without
@@ -538,6 +545,8 @@ void MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std:
 }
 
 void MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std::uint64_t surfaceBytes, std::size_t keyCount) {
+    ForkTrap("dcc keys store");
+    ForkQuiesce("dcc keys store");
     const auto count = StoredKeyCount(metaAddress, surfaceBytes, keyCount);
     if (count == 0) return;
     auto* recorder = CpuKeysOnly() || !GuestMemory::GpuMutex().HeldByThisThread() ? nullptr : Recorder::Active();
@@ -612,6 +621,7 @@ DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t gues
         counters.proved.fetch_add(1, std::memory_order_relaxed);
         return proof.keys;
     }
+    ForkTrap("dcc key scan");
     bool memoized = false;
     const auto keys = textureClearKeys(resource, guestBytes, memoized);
     bool stable = collected != 0 && !memoized;
@@ -693,6 +703,7 @@ bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureR
 }
 
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes) {
+    ForkTrap("dcc key writers");
     const auto count = static_cast<std::size_t>(guestBytes / KeyBytes);
     const auto metaAddress = resource.dccAddress;
     if (metaAddress == 0 || count == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return std::nullopt;

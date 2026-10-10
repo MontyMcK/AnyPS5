@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <cstring>
@@ -685,6 +686,7 @@ void compileInBackground(PipelineStore& store, const Context& context, const Sta
 
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool mayDefer) {
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
+    if (disabled) ForkTrap("pipeline uncached");
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     auto& store = Pipelines();
     std::unique_lock lock(store.mutex);
@@ -711,6 +713,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         last->generation = store.generation;
     };
     if (key.empty()) {
+        ForkTrap("pipeline uncached");
         ++store.uncached;
         return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     }
@@ -726,13 +729,16 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
                 remember(it);
                 return it->pipeline;
             }
+            ForkTrap("pipeline abandoned");
             abandon(store, it);
         } else {
             // A different configuration with the same hash keeps the resident entry; this one stays private.
+            ForkTrap("pipeline collision");
             ++store.uncached;
             return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
         }
     }
+    ForkTrap("pipeline miss");
     if (const auto found = store.pending.find(hash); found != store.pending.end() && (!mayDefer || found->second != key)) {
         ++store.uncached;
         return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);

@@ -13,6 +13,8 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <span>
+#include <string>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -55,14 +57,33 @@ public:
         }
     };
 
-    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {});
+    struct ForkJob {
+        virtual ~ForkJob() = default;
+        std::uint64_t passHint = 0;
+        bool eligible = false;
+    };
+    class ForkRunner {
+    public:
+        virtual ~ForkRunner() = default;
+        virtual std::size_t Run(std::span<ForkJob* const> jobs, const std::function<bool(std::size_t index, const Commit* body)>& commit) = 0;
+        virtual std::size_t Stream(const std::function<std::vector<std::shared_ptr<ForkJob>>(std::size_t limit)>& peek, const std::function<bool(const Commit* body)>& commit) = 0;
+    };
+    static void SetForkRunner(ForkRunner* runner);
+    static std::size_t ForkWorkers();
+    static std::size_t ForkRunLimit();
+    static void RunForkJobs(std::size_t count, const std::function<void(std::size_t index, std::size_t slot)>& job);
+    std::string TakeForkRuns();
+    bool CommitterIdle() const { return committerIdle.load(std::memory_order_relaxed); }
+    static constexpr std::size_t AheadSlot = 15;
+
+    void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, bool unknownWrites = false, std::shared_ptr<ForkJob> fork = {});
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0 || prepOutstanding.load(std::memory_order_acquire) != 0; }
     static bool SplitDraws();
     void Prepare(Commit job, std::vector<Range> writes = {}, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {});
     // A job of the queue thread itself: in order behind the outstanding preparations, without
     // waiting for them (its writes are visible to Overlaps from here on).
-    void EnqueueOrdered(Commit commit, std::vector<Range> writes);
+    void EnqueueOrdered(Commit commit, std::vector<Range> writes, bool unknownWrites = false);
     // A preparation reading memory an earlier job writes: every earlier job is enqueued first.
     void WaitEarlierPreparations();
     void DrainPrep() { drainPrep(); }
@@ -73,6 +94,11 @@ public:
     bool Overlaps(std::uint64_t address, std::size_t bytes);
     std::pair<std::uint64_t, std::uint64_t> OverlapRange(std::uint64_t address, std::size_t bytes);
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
+    enum class Window : std::uint8_t { Clear, Overlap, Unknown, Overflow };
+    std::uint64_t AppliedFrontier() const { return appliedFrontier.load(std::memory_order_acquire); }
+    Window CheckWindow(std::uint64_t fromExclusive, std::uint64_t toExclusive, std::span<const Range> reads);
+    bool WindowClear(std::uint64_t fromExclusive, std::uint64_t toExclusive, std::span<const Range> reads) { return CheckWindow(fromExclusive, toExclusive, reads) == Window::Clear; }
+    static std::uint64_t& CommittingSequence();
 
 private:
     struct Item {
@@ -80,13 +106,29 @@ private:
         std::vector<Range> writes;
         std::uint64_t labelAddress = 0;
         std::vector<std::byte> labelBytes;
+        std::uint64_t sequence = 0;
+        bool unknown = false;
+        std::shared_ptr<ForkJob> fork;
     };
+    struct Applied {
+        std::uint64_t sequence = 0;
+        bool unknown = false;
+        std::vector<Range> writes;
+    };
+    static constexpr std::size_t AppliedCapacity = 4096;
     DrawPipeline() = default;
     void run();
+    bool runCommit(const Commit& commit, std::uint64_t sequence);
+    void gatherForkRun(std::vector<ForkJob*>& jobs);
+    std::size_t runForked(std::span<ForkJob* const> jobs);
+    std::size_t runStream();
     void prepRun();
     void drainPrep();
     void waitPrepTurn(std::uint64_t sequence);
     void finishPrepTurn(std::uint64_t sequence);
+    void deliverPrepared(std::uint64_t sequence, std::optional<Item> item);
+    void pushItem(Item item);
+    static bool PrepReorder();
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
 
@@ -99,6 +141,7 @@ private:
     std::atomic<std::size_t> outstanding{0};
     std::uint32_t idleWaiters = 0;
     bool committerWaiting = false;
+    std::atomic<bool> committerIdle{false};
     std::thread thread;
     std::uint64_t commits = 0;
     std::uint64_t commitNs = 0;
@@ -127,10 +170,24 @@ private:
     std::uint64_t prepNextSequence = 1;
     std::uint64_t prepTurn = 1;
     std::condition_variable prepTurnChanged;
+    std::map<std::uint64_t, std::optional<Item>> prepParked;
+    bool prepFlushing = false;
+    std::uint64_t prepParkedCount = 0;
     std::uint64_t prepJobs = 0;
     std::uint64_t prepNs = 0;
     std::uint64_t prepWaitNs = 0;
     std::uint64_t prepFailures = 0;
+    std::uint64_t nextItemSequence = 0;
+    std::mutex appliedMutex;
+    std::vector<Applied> applied;
+    std::atomic<std::uint64_t> appliedFrontier{0};
+    std::array<std::uint64_t, 7> runLengths{};
+    std::uint64_t runStarts = 0;
+    std::uint64_t lastHint = 0;
+    bool lastHinted = false;
+    std::uint64_t forkRuns = 0;
+    std::uint64_t forkRunItems = 0;
+    std::uint64_t forkHandled = 0;
 };
 
 }

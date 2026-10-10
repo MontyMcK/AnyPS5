@@ -1041,11 +1041,50 @@ struct SharedEpochRanges {
     std::mutex mutex;
     std::uint64_t epoch = 0;
     std::unordered_map<std::uintptr_t, WriteTracker::Memo> ranges;
+    struct Earlier {
+        std::uint64_t epoch = 0;
+        std::unordered_map<std::uintptr_t, WriteTracker::Memo> ranges;
+    };
+    std::array<Earlier, 15> earlier;
+
+    std::unordered_map<std::uintptr_t, WriteTracker::Memo>* find(std::uint64_t wanted, bool history) {
+        if (epoch == wanted) return &ranges;
+        if (!history) return nullptr;
+        for (auto& entry : earlier) {
+            if (entry.epoch == wanted) return &entry.ranges;
+        }
+        return nullptr;
+    }
+
+    std::unordered_map<std::uintptr_t, WriteTracker::Memo>* claim(std::uint64_t wanted) {
+        if (auto* found = find(wanted, true)) return found;
+        auto oldest = std::min_element(earlier.begin(), earlier.end(), [](const Earlier& a, const Earlier& b) { return a.epoch < b.epoch; });
+        if (wanted > epoch) {
+            if (oldest->epoch < epoch) {
+                oldest->epoch = epoch;
+                oldest->ranges.swap(ranges);
+            }
+            ranges.clear();
+            epoch = wanted;
+            return &ranges;
+        }
+        if (oldest->epoch >= wanted) return nullptr;
+        oldest->epoch = wanted;
+        oldest->ranges.clear();
+        return &oldest->ranges;
+    }
 };
 
 SharedEpochRanges& SharedRanges() {
     static SharedEpochRanges ranges;
     return ranges;
+}
+
+std::atomic<bool (*)()> collectHistoryFlag{nullptr};
+
+bool collectHistory() {
+    const auto flag = collectHistoryFlag.load(std::memory_order_acquire);
+    return flag != nullptr && flag();
 }
 
 bool epochCollectMapEnabled() {
@@ -1182,9 +1221,10 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
         if ((epoch & SharedEpochBit) != 0) {
             auto& shared = SharedRanges();
+            const bool history = collectHistory();
             std::lock_guard sharedLock(shared.mutex);
-            if (shared.epoch == epoch) {
-                if (const auto found = shared.ranges.find(first); found != shared.ranges.end() && found->second.unwatched == unwatched && stop <= found->second.end) {
+            if (const auto* ranges = shared.find(epoch, history)) {
+                if (const auto found = ranges->find(first); found != ranges->end() && found->second.unwatched == unwatched && stop <= found->second.end) {
                     collectMemoHits.fetch_add(1, std::memory_order_relaxed);
                     if (collectProfile) {
                         CollectSplitStats().mapHits.fetch_add(1, std::memory_order_relaxed);
@@ -1293,13 +1333,18 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
             if ((epoch & SharedEpochBit) != 0) {
                 auto& shared = SharedRanges();
+                const bool history = collectHistory();
                 std::lock_guard sharedLock(shared.mutex);
-                if (shared.epoch < epoch) {
-                    shared.ranges.clear();
-                    shared.epoch = epoch;
+                auto* ranges = history ? shared.claim(epoch) : nullptr;
+                if (ranges == nullptr) {
+                    if (shared.epoch < epoch) {
+                        shared.ranges.clear();
+                        shared.epoch = epoch;
+                    }
+                    if (shared.epoch == epoch) ranges = &shared.ranges;
                 }
-                if (shared.epoch == epoch) {
-                    auto& entry = shared.ranges[first];
+                if (ranges != nullptr) {
+                    auto& entry = (*ranges)[first];
                     if (entry.unwatched != serial || entry.end < stop) entry = {first, stop, epoch, serial};
                 }
             }
@@ -1402,6 +1447,14 @@ void FollowCollectEpoch(std::uint64_t token) {
 
 std::uint64_t ThreadCollectEpoch() {
     return collectMemoEnabled() ? threadCollectEpoch : 0;
+}
+
+void SetCollectHistoryFlag(bool (*flag)()) {
+    collectHistoryFlag.store(flag, std::memory_order_release);
+}
+
+std::uint64_t CollectedGeneration() {
+    return Tracker().generation.load(std::memory_order_relaxed);
 }
 
 std::uint64_t UnwatchSerial() {
@@ -1634,7 +1687,7 @@ namespace {
 // Per-thread GpuMutex wait accounting (APS5_PROFILE_DRAW): a queue worker tags its thread, other
 // threads (the presenter) report untagged.
 constexpr std::size_t GpuLockSiteCount = static_cast<std::size_t>(GpuLockSite::Count);
-constexpr const char* GpuLockSiteNames[GpuLockSiteCount] = {"other", "dispatch", "indirect", "draw", "hook", "wait", "label", "flush", "present", "fill", "copy", "end", "try"};
+constexpr const char* GpuLockSiteNames[GpuLockSiteCount] = {"other", "dispatch", "indirect", "draw", "hook", "wait", "label", "flush", "present", "fill", "copy", "end", "try", "completion"};
 
 // Hold-side holder matrix: nanoseconds held per (holder thread, site), added by EndHold. Column 0
 // is every untagged thread (the presenter, game threads); the queue workers take a column each on
@@ -1777,6 +1830,11 @@ const void* ThreadToken() {
     thread_local char token;
     return &token;
 }
+thread_local void (*forkTrap)(const char*) = nullptr;
+}
+
+void SetForkTrap(void (*trap)(const char* site)) {
+    forkTrap = trap;
 }
 
 void GpuMutexType::acquired() {
@@ -1785,6 +1843,7 @@ void GpuMutexType::acquired() {
 }
 
 bool GpuMutexType::try_lock() {
+    if (forkTrap != nullptr) forkTrap("gpu mutex try");
     if (!GpuLockProfiled()) {
         if (!mutex.try_lock()) return false;
         acquired();
@@ -1837,6 +1896,7 @@ std::uint32_t GpuMutexType::DepthOnThisThread() const {
 }
 
 void AssertGpuLockHeld(const char* where) {
+    if (forkTrap != nullptr) forkTrap(where);
     static const bool enabled = std::getenv("APS5_ASSERT_GPU_LOCK") != nullptr;
     if (!enabled || GpuMutex().HeldByThisThread()) return;
     std::fprintf(stderr, "[lock] ASSERT: %s reached without GuestMemory::GpuMutex on thread tagged 0x%x\n", where, GpuLockThreadTag());
@@ -1844,8 +1904,13 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
+    if (forkTrap != nullptr) forkTrap("gpu mutex");
     if (!GpuLockProfiled()) {
-        mutex.lock();
+        if (!mutex.try_lock()) {
+            contenders.fetch_add(1, std::memory_order_relaxed);
+            mutex.lock();
+            contenders.fetch_sub(1, std::memory_order_relaxed);
+        }
         acquired();
         return;
     }
@@ -1860,7 +1925,9 @@ void GpuMutexType::lock() {
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
+        contenders.fetch_add(1, std::memory_order_relaxed);
         mutex.lock();
+        contenders.fetch_sub(1, std::memory_order_relaxed);
         acquired();
         const auto now = std::chrono::steady_clock::now();
         if (holders) {

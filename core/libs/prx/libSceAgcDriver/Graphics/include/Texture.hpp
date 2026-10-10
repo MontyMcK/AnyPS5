@@ -162,6 +162,7 @@ public:
     void WriteBack();
     // Deferred write-back (APS5_EAGER_WRITEBACK=1 stores at once instead).
     void MarkDirty();
+    bool DirtyQuiet() const;
     void Flush();
     // Debug aid (APS5_DUMP_IMAGES_AT): saves the first mip of the first layer to `path` as
     // u32 magic 'IMG1', width, height, row pitch in bytes, VkFormat, then the rows.
@@ -374,6 +375,7 @@ private:
         std::vector<std::shared_ptr<ShadowSlab>> slabs;
         // Guest ranges read from the import.
         std::vector<std::pair<std::uint64_t, std::uint64_t>> importReads;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> shadowReads;
     };
     PaddingSeeds paddingSeeds(const HostImport& import, std::vector<CopiedBytes> copied) const;
     // The direct upload and GPU-direct write-back of the runs through their windows (block units);

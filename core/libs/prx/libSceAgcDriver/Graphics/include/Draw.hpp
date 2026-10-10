@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <functional>
 #include <memory>
 #include <vector>
 
@@ -19,6 +20,31 @@ struct HostImport;
 // APS5_NO_DRAW_RECIPE=1).
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
 std::optional<std::string> KnownValidationFailure(const Context& context, std::span<const CompiledShader> shaders, const State& state);
+
+struct DrawPrebuild;
+bool DrawPlansEnabled();
+bool ParallelDrawBuild();
+struct ForkSeed;
+struct ForkedDraw;
+struct ForkStamp;
+std::shared_ptr<const ForkSeed> TakeForkSeed();
+std::shared_ptr<ForkedDraw> ForkDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const std::shared_ptr<DrawPrebuild>& prebuilt, std::shared_ptr<const DrawRecipe>* recipe, const ForkSeed* seed, bool seedCurrent, std::size_t slot);
+std::shared_ptr<const ForkStamp> TakeForkStamp(const Context& context);
+const char* ForkedDrawRefusal(const ForkedDraw& forked);
+const char* ForkedDrawCut(const ForkedDraw& forked);
+bool ApplyForkedDraw(const Context& context, ForkedDraw& forked, const ForkStamp& stamp, const std::function<void()>* quiesce = nullptr);
+bool ForkedDrawNeedsFinish(const ForkedDraw& forked);
+bool PrepareForkedDraw(ForkedDraw& forked);
+void CountForkCut(const char* reason);
+std::string TakeForkReport();
+std::shared_ptr<DrawPrebuild> PrebuildDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, bool keyed);
+class DrawPrebuildScope {
+public:
+    explicit DrawPrebuildScope(std::shared_ptr<DrawPrebuild> prebuilt);
+    ~DrawPrebuildScope();
+    DrawPrebuildScope(const DrawPrebuildScope&) = delete;
+    DrawPrebuildScope& operator=(const DrawPrebuildScope&) = delete;
+};
 
 struct DrawInputCopy {
     std::shared_ptr<Buffer> buffer;

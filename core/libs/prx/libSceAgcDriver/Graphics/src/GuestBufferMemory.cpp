@@ -477,6 +477,8 @@ const GuestAllocations::Range* containingRange(const GuestAllocations::Lease& le
 // Drops imports whose registered range changed or disappeared: their pages may no longer back the
 // guest addresses. Walks the imports only when the registry changed since the last walk.
 void refreshImports(const Context& context, HostImports& state, const GuestAllocations::Lease& lease) {
+    ForkTrap("import refresh");
+    ForkQuiesce("import refresh");
     if (state.device != context.device) {
         for (const auto& [address, entry] : state.imports) {
             if (state.device != VK_NULL_HANDLE && state.destroyBuffer != nullptr && state.freeMemory != nullptr) {
@@ -733,6 +735,7 @@ private:
 // writes a block being replaced; GPU reads of the mirror by earlier recorded work (an address-based
 // dispatch whose lease is released at completion) see the newer bytes, as they would on hardware.
 void prepareRange(std::uint64_t address, std::uint64_t bytes, bool flushStorage = true) {
+    ForkTrap("mirror refresh");
     // The compare reads the pages directly; a mirror is only reused while its Range exists, but a
     // lease of a build in flight can keep a replaced Range alive past a protection change.
     Require(GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes)), "image mirror range became inaccessible");
@@ -1351,10 +1354,19 @@ void SetImportWatch(const Context& context, ImportWatch watch) {
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     auto& state = Imports();
-    std::lock_guard lock(state.mutex);
+    const ForkGuard lock(state.mutex);
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
         if (const auto* entry = findImport(state, address, address + bytes)) return entry;
+    }
+    if (ForkLogged() != nullptr) {
+        static const bool forkNegative = std::getenv("APS5_NO_UNIMPORTABLE_MEMO") == nullptr;
+        const auto end = address + bytes;
+        if (forkNegative && state.unimportableDevice == context.device && state.unimportableGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && state.unimportableEpoch == state.epoch && std::any_of(state.unimportable.begin(), state.unimportable.end(), [&](const auto& range) { return range.first <= address && end <= range.second; })) {
+            ++state.unimportableHits;
+            return nullptr;
+        }
+        ForkRefuse("host import");
     }
     static const bool negativeCache = std::getenv("APS5_NO_UNIMPORTABLE_MEMO") == nullptr;
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
@@ -1419,7 +1431,7 @@ bool RegisteredReadableCovers(std::uint64_t address, std::size_t bytes) {
 bool HostImportCovers(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& state = Imports();
-    std::lock_guard lock(state.mutex);
+    const ForkGuard lock(state.mutex);
     // Imports of a replaced device are not this device's; a stale registry only means an import
     // may be dropped at the next reconcile, which the binding path handles.
     return state.device == context.device && findImport(state, address, address + bytes) != nullptr;
@@ -1645,6 +1657,7 @@ void GuestBufferMemory::AcquireRegistered() {
 }
 
 GuestBufferMemory::SpaceShare GuestBufferMemory::ShareSpace(std::uint64_t serial, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& sourceWrites) {
+    ForkTrap("address space");
     Require(!prepared && !uploaded && regions.empty() && lease.empty() && space == nullptr, "an address template use must start from an empty upload");
     if (!addressSpaceCacheEnabled() || serial == 0) return SpaceShare::Replaced;
     ensurePinWaiter();
@@ -1684,12 +1697,41 @@ bool GuestBufferMemory::SpaceCovers(std::uint64_t address, std::size_t bytes) co
     return baseOverlap(address, address + bytes, nullptr) == BaseOverlap::Inside;
 }
 
+bool GuestBufferMemory::SpaceCovers(const AddressSpace& space, std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    return baseOverlapIn(space, address, address + bytes, nullptr) == BaseOverlap::Inside;
+}
+
+std::shared_ptr<const GuestBufferMemory::AddressSpace> GuestBufferMemory::SpeculatedSpace(const Context& context, std::uint64_t serial, std::span<const std::pair<std::uint64_t, std::size_t>> ranges, std::vector<std::optional<SpaceView>>& views) {
+    views.clear();
+    if (!addressSpaceCacheEnabled() || serial == 0) return nullptr;
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    auto current = Spaces().current.load();
+    if (current == nullptr || current->serial != serial || current->device != context.device || current->generation != generation) return nullptr;
+    auto& state = Imports();
+    const ForkGuard lock(state.mutex);
+    if (current->importsEpoch != state.epoch) return nullptr;
+    views.reserve(ranges.size());
+    for (const auto& [address, bytes] : ranges) {
+        std::uint32_t adjustment = 0;
+        const auto info = spaceDescriptorIn(context, *current, address, bytes, adjustment);
+        if (info.has_value()) views.push_back(SpaceView{*info, adjustment});
+        else views.push_back(std::nullopt);
+    }
+    return current;
+}
+
 std::optional<VkDescriptorBufferInfo> GuestBufferMemory::SpaceDescriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const {
-    if (!uploaded || committed || space == nullptr || !regions.empty() || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address - 3) return std::nullopt;
+    if (!uploaded || committed || space == nullptr || !regions.empty()) return std::nullopt;
+    return spaceDescriptorIn(context, *space, address, bytes, adjustment);
+}
+
+std::optional<VkDescriptorBufferInfo> GuestBufferMemory::spaceDescriptorIn(const Context& context, const AddressSpace& space, std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address - 3) return std::nullopt;
     const auto begin = address & ~std::uint64_t{3};
     const auto end = begin == address ? address + bytes : (address + bytes + 3) & ~std::uint64_t{3};
     const Region* found = nullptr;
-    if (baseOverlap(begin, end, &found) != BaseOverlap::Inside || found == nullptr || (found->direct == nullptr && found->mirror == nullptr)) return std::nullopt;
+    if (baseOverlapIn(space, begin, end, &found) != BaseOverlap::Inside || found == nullptr || (found->direct == nullptr && found->mirror == nullptr)) return std::nullopt;
     const auto base = found->direct != nullptr ? found->direct->base : found->mirror->base;
     if (base % 4 != 0 || context.limits.minStorageBufferOffsetAlignment == 0 || address < base) return std::nullopt;
     const auto offset = address - base;
@@ -1702,6 +1744,7 @@ std::optional<VkDescriptorBufferInfo> GuestBufferMemory::SpaceDescriptor(std::ui
 }
 
 bool GuestBufferMemory::FinishSharedSpace() {
+    ForkTrap("address space");
     Require(prepared && !uploaded && space != nullptr && regions.empty() && lease.empty(), "an address template use finished without its address space");
     if (context.hostImportAlignment != 0) {
         auto& state = Imports();
@@ -1749,8 +1792,13 @@ void GuestBufferMemory::addCopiedRange(const CopiedRange& range) {
 }
 
 GuestBufferMemory::BaseOverlap GuestBufferMemory::baseOverlap(std::uint64_t begin, std::uint64_t end, const Region** owner) const {
-    if (space == nullptr || space->base.empty()) return BaseOverlap::None;
-    const auto& base = space->base;
+    if (space == nullptr) return BaseOverlap::None;
+    return baseOverlapIn(*space, begin, end, owner);
+}
+
+GuestBufferMemory::BaseOverlap GuestBufferMemory::baseOverlapIn(const AddressSpace& space, std::uint64_t begin, std::uint64_t end, const Region** owner) {
+    if (space.base.empty()) return BaseOverlap::None;
+    const auto& base = space.base;
     const auto found = std::upper_bound(base.begin(), base.end(), begin, [](std::uint64_t value, const Region& region) { return value < region.begin; });
     if (found != base.begin()) {
         const auto& previous = *std::prev(found);
@@ -2376,7 +2424,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // in the same batch. The batch is opened first so that an import the flush's own
             // reconcile retires is handed to it (retireImport keeps nothing while the recorder is
             // idle) and outlives the copy.
-            static_cast<void>(recorder->Commands());
+            static_cast<void>(recorder->OpenBatch());
             StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
             region.gpuCopy = true;
             gpuCopies.push_back(&region);
@@ -2497,15 +2545,22 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         recorder->FlushKeyStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
         recorder->FlushStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
     }
-    const auto commands = recorder->Commands();
-    const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
-    if (Recorder::BarrierValidate()) {
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
-        for (const auto* region : copies) reads.emplace_back(region->begin, region->end);
-        recorder->NoteAccess(Recorder::CommandClass::StagingIn, Recorder::Access{reads, {}, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
+    bool elided = false;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    if (Recorder::BarrierTracking()) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        for (const auto* region : copies) ranges.emplace_back(region->begin, region->end);
+        commands = recorder->Commands(Recorder::CommandClass::StagingIn, Recorder::Access{ranges, ranges, {}, VK_PIPELINE_STAGE_TRANSFER_BIT, false, false, capture}, elided);
+    } else {
+        commands = recorder->Commands();
     }
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-    Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+    const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
+    if (elided) {
+        Recorder::CountSkipped(Recorder::CommandClass::StagingIn);
+    } else {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+    }
     bool stagedAny = false;
     std::uint64_t copiedBytes = 0;
     for (auto* region : copies) {
@@ -2586,9 +2641,13 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     // The copied bytes are visible to the shaders bound to the buffers, which may also store into
     // them. Every stage: dispatches and draws share this path, and draws run mesh, task and
     // tessellation shaders too (the batch's own barriers around dispatches are as wide).
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
-    Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
-    recorder->MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    if (elided) {
+        Recorder::CountSkipped(Recorder::CommandClass::StagingIn);
+    } else {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+        recorder->MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
     recorder->EndGpuTiming(timing, copiedBytes);
 }
 
@@ -2601,26 +2660,45 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     VkCommandBuffer commands = VK_NULL_HANDLE;
     auto timing = Recorder::NoTiming;
     std::uint64_t copiedBytes = 0;
-    for (auto& region : regions) {
-        if (!region.gpuCopy || region.copiedBack) continue;
-        if (merged.empty() && !writes.empty()) {
-            auto sorted = writes;
-            std::sort(sorted.begin(), sorted.end());
-            for (const auto& range : sorted) {
-                if (!merged.empty() && range.first < merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
-                else merged.push_back(range);
+    const auto mergeWrites = [&] {
+        if (!merged.empty() || writes.empty()) return;
+        auto sorted = writes;
+        std::sort(sorted.begin(), sorted.end());
+        for (const auto& range : sorted) {
+            if (!merged.empty() && range.first < merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+            else merged.push_back(range);
+        }
+    };
+    bool elided = false;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> copied;
+    if (Recorder::BarrierTracking()) {
+        for (const auto& region : regions) {
+            if (!region.gpuCopy || region.copiedBack) continue;
+            mergeWrites();
+            for (const auto& [begin, end] : merged) {
+                const auto from = std::max(begin, region.begin);
+                const auto to = std::min(end, region.end);
+                if (from < to) copied.emplace_back(from, to);
             }
         }
+    }
+    for (auto& region : regions) {
+        if (!region.gpuCopy || region.copiedBack) continue;
+        mergeWrites();
         for (const auto& [begin, end] : merged) {
             const auto from = std::max(begin, region.begin);
             const auto to = std::min(end, region.end);
             if (from >= to) continue;
             if (!recording) {
-                commands = recorder.Commands();
+                commands = copied.empty() ? recorder.Commands() : recorder.Commands(Recorder::CommandClass::StagingOut, Recorder::Access{copied, copied, {}, VK_PIPELINE_STAGE_TRANSFER_BIT}, elided);
                 timing = recorder.BeginGpuTiming(StagingCopyBackKey);
                 // The shader's stores into the buffer (whichever stage made them) precede the copy.
-                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-                Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                if (elided) {
+                    Recorder::CountSkipped(Recorder::CommandClass::StagingOut);
+                } else {
+                    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                    Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+                }
                 recording = true;
             }
             // Exactly the sub-range the shader may write, in place in the import: what the shader
@@ -2640,14 +2718,17 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         region.copiedBack = true;
     }
     if (!recording) return;
-    if (Recorder::BarrierValidate()) recorder.NoteAccess(Recorder::CommandClass::StagingOut, Recorder::Access{{}, merged, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     // As a GPU label store or fill: visible to everything recorded after (shaders, transfers, an
     // indirect dispatch's arguments) and to the host once the batch completed; the caller's
     // pending-write note makes CPU readers wait for that.
     constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
-    Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
-    recorder.MarkCovered(copiedAccess);
+    if (elided) {
+        Recorder::CountSkipped(Recorder::CommandClass::StagingOut);
+    } else {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
+        Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
+        recorder.MarkCovered(copiedAccess);
+    }
     recorder.EndGpuTiming(timing, copiedBytes);
 }
 
@@ -2969,6 +3050,16 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceR
     return result;
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::TrackedReads() const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
+    if (!uploaded || committed) return result;
+    if (space != nullptr) {
+        for (const auto& region : space->base) result.emplace_back(region.begin, region.end);
+    }
+    for (const auto& region : regions) result.emplace_back(region.begin, region.end);
+    return result;
+}
+
 std::uint64_t GuestBufferMemory::AddressSpaceSerial() const {
     return uploaded && !committed && space != nullptr ? space->serial : 0;
 }
@@ -2994,6 +3085,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::OwnInPla
 
 void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     if (!uploaded || committed) return;
+    if (ForkLogged() != nullptr && std::any_of(regions.begin(), regions.end(), [](const Region& region) { return region.gpuCopy && region.deviceLocal; })) ForkRefuse("staging copies");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::vector<Region*> copies;
     for (auto& region : regions) {
@@ -3022,10 +3114,13 @@ std::uint64_t ImageMirrorSerial(const Context& context, std::uint64_t address, s
 std::uint64_t HostImportSerial(const Context& context, std::uint64_t address, std::size_t bytes, bool reconcile) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& state = Imports();
-    std::lock_guard lock(state.mutex);
+    const ForkGuard lock(state.mutex);
     // An import whose registered range changed must not be reused: reconcile first, as an upload
     // does (the walk only runs when the registry changed since the last one).
-    if (reconcile && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration) static_cast<void>(refreshImports(context, state, GuestAllocations::GuestAllocationsAcquire_nid_postfix()));
+    if (reconcile && GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration) {
+        ForkTrap("import reconcile");
+        static_cast<void>(refreshImports(context, state, GuestAllocations::GuestAllocationsAcquire_nid_postfix()));
+    }
     auto found = state.imports.upper_bound(address);
     if (found == state.imports.begin()) return 0;
     --found;
@@ -3034,20 +3129,23 @@ std::uint64_t HostImportSerial(const Context& context, std::uint64_t address, st
     // Serials are handed out on first use: a fresh import starts at 0, so one made after an earlier
     // import of the same range was dropped can never repeat that import's serial.
     static std::uint64_t serials = 0;
-    if (entry.serial == 0) entry.serial = ++serials;
+    if (entry.serial == 0) {
+        ForkTrap("import serial");
+        entry.serial = ++serials;
+    }
     return entry.serial;
 }
 
 bool HostImportsUnchanged(const Context& context, const HostImportsProof& proof) {
     if (proof.device == VK_NULL_HANDLE || proof.device != context.device) return false;
     auto& state = Imports();
-    std::lock_guard lock(state.mutex);
+    const ForkGuard lock(state.mutex);
     return state.device == proof.device && state.epoch == proof.epoch && state.refreshedGeneration == proof.refreshedGeneration && !importsStale(context, state);
 }
 
 HostImportsProof HostImportsIdentity(const Context& context) {
     auto& state = Imports();
-    std::lock_guard lock(state.mutex);
+    const ForkGuard lock(state.mutex);
     if (importsStale(context, state)) return {};
     return {state.device, state.epoch, state.refreshedGeneration};
 }

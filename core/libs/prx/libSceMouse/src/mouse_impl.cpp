@@ -77,6 +77,11 @@ int Read(std::int32_t handle, MouseData* data, std::int32_t num) {
     return available;
 }
 
+bool IsOpen() {
+    std::lock_guard lock(mouseMutex);
+    return opened;
+}
+
 void Publish(const MouseInputEvent& event) {
     std::lock_guard lock(mouseMutex);
     if (event.connectionChange) {

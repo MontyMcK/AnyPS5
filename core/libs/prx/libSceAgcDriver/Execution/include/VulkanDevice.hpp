@@ -18,6 +18,8 @@ namespace AgcDriver {
 
 namespace Graphics {
 class StorageTexture;
+struct DrawSpeculation;
+struct DrawPrebuild;
 }
 
 // Stage A of a dispatch's resource build (see VulkanDevice::PrepareDispatch); opaque to callers.
@@ -282,7 +284,11 @@ public:
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
     void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
+    std::shared_ptr<Graphics::DrawSpeculation> SpeculateDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots) const;
+    std::shared_ptr<Graphics::DrawPrebuild> PrebuildDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, bool keyed) const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
+    Graphics::Context DrawContext() const;
+    bool ApplyForkedDraw(const Graphics::Context& context, std::span<const Graphics::CompiledShader> shaders, Graphics::ForkedDraw& forked, const Graphics::ForkStamp& stamp, const std::function<void()>* quiesce = nullptr);
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
     // the packet's labels; Rebuild when the recipe's device is not this one or DrawWithRecipe
     // missed (nothing recorded: the caller runs Draw with the hit's stages and re-attaches).

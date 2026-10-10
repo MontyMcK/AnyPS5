@@ -149,6 +149,11 @@ bool BdaByteReadsForced() {
     return forced;
 }
 
+bool BdaHintFastPath() {
+    static const bool enabled = std::getenv("APS5_NO_BDA_HINT_FAST") == nullptr;
+    return enabled;
+}
+
 std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, bool subtract) {
     auto& state = ctx.state;
     const auto result = Binary(state, subtract ? spv::OpISub : spv::OpIAdd, TypeScalarU64(state), address, offset);

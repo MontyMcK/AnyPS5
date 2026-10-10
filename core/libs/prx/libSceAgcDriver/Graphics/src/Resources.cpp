@@ -257,6 +257,7 @@ VkImageView RenderTarget::View() const {
 }
 
 CommandBatch::CommandBatch(const Context& context) : context(context) {
+    ForkQuiesce("command batch");
     // Records into the device's one command pool and submits to its queue: device-lock work only.
     GuestMemory::AssertGpuLockHeld("CommandBatch");
     try {

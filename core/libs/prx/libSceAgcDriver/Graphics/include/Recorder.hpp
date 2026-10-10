@@ -15,6 +15,8 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <string>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <vector>
@@ -22,6 +24,95 @@
 namespace AgcDriver::Graphics {
 
 class Buffer;
+
+struct ForkRefusal {
+    const char* site;
+    bool backstop;
+};
+
+class ForkLog {
+public:
+    enum class Effect : std::uint8_t { Keep, Complete, Read, Reads, Snapshot, Touch, Erase, Sampled, Counter, Depth, Count };
+    struct Entry {
+        Effect kind;
+        std::uint64_t address;
+        std::uint64_t bytes;
+    };
+    explicit ForkLog(bool witness = false, std::size_t slot = 0) : witness(witness), slot(slot) {}
+    void Defer(Effect kind, std::uint64_t address, std::uint64_t bytes, std::function<void()> effect);
+    void Note(Effect kind, std::uint64_t address, std::uint64_t bytes);
+    void Expect(std::function<bool()> check);
+    bool Holds() const;
+    void Replay();
+    const std::vector<Entry>& Entries() const { return entries; }
+    std::size_t Effects() const { return effects.size(); }
+    const bool witness;
+    const std::size_t slot;
+
+private:
+    std::vector<Entry> entries;
+    std::vector<std::function<void()>> effects;
+    std::vector<std::function<bool()>> checks;
+};
+
+class ForkScope {
+public:
+    explicit ForkScope(ForkLog& log);
+    ~ForkScope();
+    ForkScope(const ForkScope&) = delete;
+    ForkScope& operator=(const ForkScope&) = delete;
+
+private:
+    ForkLog* previous;
+};
+
+ForkLog* ForkLogged();
+ForkLog* ForkWitnessed();
+class ForkQuiesceScope {
+public:
+    explicit ForkQuiesceScope(const std::function<void(const char*)>* hook);
+    ~ForkQuiesceScope();
+    ForkQuiesceScope(const ForkQuiesceScope&) = delete;
+    ForkQuiesceScope& operator=(const ForkQuiesceScope&) = delete;
+
+private:
+    const std::function<void(const char*)>* previous;
+};
+bool ForkQuiescing();
+void ForkQuiesce(const char* reason);
+void SetForkPausePending(bool pending);
+bool ForkPausePending();
+void CountForkRefusal(const char* site, bool backstop = false);
+[[noreturn]] void ForkRefuse(const char* site, bool backstop = false);
+inline void ForkTrap(const char* site) {
+    if (ForkLogged() != nullptr) ForkRefuse(site);
+}
+inline void ForkLock(std::mutex& mutex) {
+    if (ForkLogged() == nullptr) {
+        mutex.lock();
+        return;
+    }
+    for (std::uint32_t spin = 0; !mutex.try_lock(); ++spin) {
+        if (ForkPausePending()) ForkRefuse("paused");
+        if (spin > 64) std::this_thread::yield();
+    }
+}
+class ForkGuard {
+public:
+    explicit ForkGuard(std::mutex& mutex) : mutex(mutex) { ForkLock(mutex); }
+    ~ForkGuard() { mutex.unlock(); }
+    ForkGuard(const ForkGuard&) = delete;
+    ForkGuard& operator=(const ForkGuard&) = delete;
+
+private:
+    std::mutex& mutex;
+};
+struct ForkRefusalCounts {
+    std::vector<std::pair<std::string, std::uint64_t>> sites;
+    std::uint64_t total = 0;
+    std::uint64_t backstops = 0;
+};
+ForkRefusalCounts TakeForkRefusals();
 
 // Accumulates GPU work across guest commands so the CPU does not wait for each one. Dispatches and the
 // copies that feed them record into one open batch; Submit sends it to the queue without waiting and
@@ -54,6 +145,7 @@ public:
     // (the [barriers] line counts the merges). The call clears the mask (whatever the caller
     // records is assumed uncovered until it marks); a new batch starts uncovered.
     VkCommandBuffer Commands(VkAccessFlags* coveredAccess = nullptr);
+    VkCommandBuffer OpenBatch();
     // After a trailing barrier with ALL_COMMANDS as its destination stage: `access` is its
     // destination access mask.
     void MarkCovered(VkAccessFlags access);
@@ -83,6 +175,12 @@ public:
     void FlushKeyStores();
     void FlushKeyStoresOverlapping(std::uint64_t address, std::size_t bytes) { if (HasQueuedKeyStores() && QueuedKeyStoreOverlaps(address, bytes)) FlushKeyStores(); }
     bool Recording() const { return open != nullptr; }
+    bool PassContinuable() const { return open != nullptr && open->renderPass.open && open->renderPass.continuable; }
+    std::uint64_t WriteNotes() const { return writeNoteCount; }
+    std::uint64_t PassGeneration() const { return passGeneration; }
+    std::uint64_t FinishedBatches() const { return finishedBatches; }
+    std::size_t QueuedKeyStoreCount() const { return open != nullptr ? open->keyStores.size() : 0; }
+    std::size_t QueuedStoreCount() const { return open != nullptr ? open->run.queued.size() : 0; }
     bool Idle() const { return open == nullptr && inFlight.empty(); }
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
@@ -109,6 +207,7 @@ public:
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
     void NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     bool PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
+    bool PendingWriteOverlapsScreened(std::uint64_t address, std::size_t bytes) const;
     // Whether no unfinished batch writes the range any more: no open-batch overlap, and every
     // overlapping in-flight batch's fence has signaled (its in-place GPU stores are final in host
     // memory; its completion stores are the caller's business, see VulkanDevice::CopyBuffer).
@@ -371,6 +470,19 @@ public:
     // so a batch is submitted after a bounded amount of work (APS5_BATCH_CAP).
     static std::uint64_t RecordedWorkSinceSubmit();
     static void CountRecordedWork();
+    // APS5_EOP_COMPLETION_THREAD=1: a submitted batch holding completion labels or EOP interrupts
+    // is tracked, and a driver thread waits for it on the timeline WITHOUT the mutex
+    // (WaitCompletionWork), then finishes the batches up to it under the mutex
+    // (FinishCompletionWork), front to back like every other reap. APS5_PROFILE_DRAW tracks the
+    // same batches (without the thread option the thread only stamps when the timeline reached
+    // them) for the [eopcompletion] line. StopCompletionWork makes WaitCompletionWork return false.
+    static bool CompletionThreadEnabled();
+    static bool CompletionWorkTracked();
+    static bool WaitCompletionWork(std::uint64_t& recorder, std::uint64_t& serial);
+    static std::size_t FinishCompletionWork(std::uint64_t recorder, std::uint64_t serial);
+    static void StopCompletionWork();
+    // A queue worker's poll-loop reap attempt (try_lock on the mutex), for the [eopcompletion] line.
+    static void CountCompletionReapTry(bool failed);
 
     // The recorder of the current device, for code that only has guest addresses (the flush hook)
     // and for helpers that must not recycle resources the recorded work still uses.
@@ -465,9 +577,15 @@ public:
         std::span<const std::pair<VkImage, bool>> images;
         VkPipelineStageFlags stages;
         bool conservative = false;
+        bool ordered = false;
+        bool keepBarriers = false;
     };
     static bool BarrierValidate();
-    void NoteAccess(CommandClass which, const Access& access);
+    static bool BarrierTracking();
+    bool NoteAccess(CommandClass which, const Access& access);
+    VkCommandBuffer Commands(CommandClass which, const Access& access, bool& elided, VkAccessFlags* coveredAccess = nullptr);
+    bool SkipsBarriers(CommandClass which) const;
+    static void CountSkipped(CommandClass which, std::uint32_t count = 1);
     // A range timed outside the recorder's batches (the presenter's blit, stamped into its own
     // pool and read after its fence): enters the class totals like a recorded one.
     static void AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_t bytes);
@@ -549,6 +667,8 @@ private:
         std::uint32_t completionLabelCount = 0;
         // Write-back completions (OnComplete), likewise.
         std::uint32_t writeBackCompletionCount = 0;
+        // EOP interrupts appended by AfterRecordedWork.
+        std::uint32_t recordedWorkActions = 0;
         // The ranges of the completion labels also stored on the GPU, and whether each entered the
         // pending count (NoteWrittenBack counts one the first time a write-back overlaps it).
         struct CompletionLabel {
@@ -595,7 +715,12 @@ private:
                 VkPipelineStageFlags stages;
             };
             std::vector<Image> images;
+            bool unknown = true;
+            bool pending = false;
+            bool elided = false;
+            std::uint32_t classes = 0;
         } tracker;
+        std::uint32_t skipMask = 0;
         // The render pass a recorded draw left open (see ContinuesRenderPass).
         struct RenderPass {
             bool open = false;
@@ -681,6 +806,9 @@ private:
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
+    void prepareCommands();
+    void untrackedUse();
+    void recordFullBarrier();
     // Records the run's pending store (vkCmdUpdateBuffer), if any.
     void flushPendingStore();
     // Records the pending store and the run's trailing barrier; the next store starts a new run.
@@ -715,6 +843,8 @@ private:
     void noteLabelOn(Batch& batch, std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool behindCompletion = false);
     // Flags the recorded entries of `batch` over [begin, end) as stored by a completion action.
     void markBehindCompletion(const Batch& batch, std::uint64_t begin, std::uint64_t end);
+    // Enters a submitted batch with completion labels into the completion-work tracking.
+    void trackCompletionWork(const Batch& batch);
     // Flags the recorded entries of the dwords overlapping [address, end) as overwritten.
     void markOverwritten(std::uint64_t address, std::uint64_t end);
     // Whether a write-back noted after `sequence` overlapped [begin, end); true when the ring no
@@ -777,9 +907,18 @@ private:
         std::size_t bytes = 0;
     };
     std::map<DrawSnapshotKey, DrawSnapshot> drawSnapshots;
+    std::mutex snapshotMutex;
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     std::shared_ptr<Buffer> snapshotArena;
     std::size_t snapshotArenaCursor = 0;
+    struct ForkArena {
+        std::shared_ptr<Buffer> arena;
+        std::size_t cursor = 0;
+    };
+    std::array<ForkArena, 16> forkArenas;
+    std::uint64_t finishedBatches = 0;
+    std::uint64_t passGeneration = 0;
+    SnapshotSlice allocateSnapshot(std::shared_ptr<Buffer>& arena, std::size_t& cursor, std::size_t bytes);
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
 };
 

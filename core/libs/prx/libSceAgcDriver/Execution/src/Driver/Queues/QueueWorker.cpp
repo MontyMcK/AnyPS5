@@ -105,6 +105,7 @@ const std::atomic<std::uint64_t>*& Driver::workerQueued() {
 
 void Driver::reapCompletionLabels() {
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+    Graphics::Recorder::CountCompletionReapTry(!gpuLock.owns_lock());
     if (!gpuLock.owns_lock()) {
         ++triesFailed[TryIdle];
         return;
@@ -114,6 +115,24 @@ void Driver::reapCompletionLabels() {
 
     bumpEpoch(&EpochBumps::reaps);
     if (const auto localDevice = device.Load()) localDevice->ReapRecorded();
+}
+
+void Driver::runCompletionThread() noexcept {
+    PinWorkerThread("eop completion");
+    try {
+        std::uint64_t recorder = 0, serial = 0;
+        while (Graphics::Recorder::WaitCompletionWork(recorder, serial)) {
+            if (!Graphics::Recorder::CompletionThreadEnabled()) continue;
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Completion);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            bumpEpoch(&EpochBumps::reaps);
+            Graphics::Recorder::FinishCompletionWork(recorder, serial);
+        }
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[eop] completion thread stopped: %s\n", error.what());
+    } catch (...) {
+        std::fprintf(stderr, "[eop] completion thread stopped\n");
+    }
 }
 
 void Driver::run(std::uint32_t id) noexcept {

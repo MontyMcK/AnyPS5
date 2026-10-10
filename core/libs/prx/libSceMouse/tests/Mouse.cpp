@@ -89,6 +89,30 @@ int main() {
     input.HandleEvent(event, 7);
     Require(sceMouseRead(MOUSE_HANDLE, data, 1) == 1 && data[0].connected);
 
+    // A 3840x2160 image shown in a 1280x720 window: one window pixel is three source pixels.
+    // A window taller than the image fits it to the width, with bars above and below.
+    input.SetGeometry(3840, 2160, 1280, 720);
+    event = {};
+    event.type = SDL_MOUSEMOTION;
+    event.motion.windowID = 7;
+    event.motion.xrel = 2;
+    event.motion.yrel = -1;
+    input.HandleEvent(event, 7);
+    Require(sceMouseRead(MOUSE_HANDLE, data, 1) == 1 && data[0].x_axis == 6 && data[0].y_axis == -3);
+    input.SetGeometry(1920, 1080, 1280, 1080);
+    event.motion.xrel = 2;
+    event.motion.yrel = 0;
+    input.HandleEvent(event, 7);
+    Require(sceMouseRead(MOUSE_HANDLE, data, 1) == 1 && data[0].x_axis == 3);
+    event.motion.xrel = 1;
+    // A fractional scale carries the remainder instead of losing it.
+    input.SetGeometry(1920, 1080, 1280, 720);
+    input.HandleEvent(event, 7);
+    Require(sceMouseRead(MOUSE_HANDLE, data, 1) == 1 && data[0].x_axis == 1);
+    input.HandleEvent(event, 7);
+    Require(sceMouseRead(MOUSE_HANDLE, data, 1) == 1 && data[0].x_axis == 2);
+    Require(MouseIsOpen_nid_postfix());
+
     for (int i = 0; i < 70; ++i) {
         MouseInputEvent motion{};
         motion.x = i;
@@ -99,6 +123,7 @@ int main() {
     Require(sceMouseRead(MOUSE_HANDLE, data, 1) == 0);
     Require(sceMouseClose(MOUSE_HANDLE) == MOUSE_OK);
     Require(sceMouseRead(MOUSE_HANDLE, data, 1) == MOUSE_ERROR_INVALID_HANDLE);
+    Require(!MouseIsOpen_nid_postfix());
     Require(sceMouseClose(MOUSE_HANDLE) == MOUSE_ERROR_INVALID_HANDLE);
     MouseOpenParam merged{};
     merged.behaviorFlag = MOUSE_OPEN_PARAM_MERGED;

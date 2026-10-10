@@ -1,5 +1,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSpeculation.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
@@ -15,6 +18,609 @@ namespace AgcDriver::DriverDetail {
 
 std::vector<std::shared_ptr<DispatchVariant>>& RebasedProbes();
 bool verifyRebasedHits();
+
+struct DrawForkJob final : DrawPipeline::ForkJob {
+    std::shared_ptr<VulkanDevice> device;
+    const Graphics::State* state = nullptr;
+    const Pm4::DrawParameters* draw = nullptr;
+    std::span<const Graphics::CompiledShader> stages;
+    std::span<const Graphics::GuestMemorySnapshot> snapshots;
+    std::shared_ptr<Graphics::DrawPrebuild> prebuilt;
+    const std::vector<std::shared_ptr<DispatchVariant>>* recipeStages = nullptr;
+    std::uint64_t drawKey = 0;
+    std::uint32_t queue = 0;
+    std::uint32_t packet = 0;
+    std::uint64_t epoch = 0;
+    std::shared_ptr<Graphics::ForkedDraw> ahead;
+    std::shared_ptr<const Graphics::ForkStamp> aheadStamp;
+    std::shared_ptr<const Graphics::Context> aheadContext;
+    std::shared_ptr<const DrawRecipe> aheadRecipe;
+    std::weak_ptr<void> owner;
+    std::shared_ptr<Graphics::DrawSpeculation> speculation;
+    int streamState = 0;
+};
+
+namespace {
+
+struct CommitTimes {
+    std::atomic<std::uint64_t> commits{0};
+    std::atomic<std::uint64_t> lambdaNs{0};
+    std::atomic<std::uint64_t> lockNs{0};
+    std::atomic<std::uint64_t> labelsNs{0};
+    std::atomic<std::uint64_t> writersNs{0};
+    std::atomic<std::uint64_t> drawNs{0};
+    std::atomic<std::uint64_t> submitNs{0};
+    std::atomic<std::uint64_t> forked{0};
+    std::atomic<std::uint64_t> forkedNs{0};
+    std::atomic<std::uint64_t> runs{0};
+    std::atomic<std::uint64_t> runBuildNs{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+CommitTimes& Commits() {
+    static auto* times = new CommitTimes();
+    return *times;
+}
+
+struct AheadStatistics {
+    std::atomic<std::uint64_t> attempted{0};
+    std::atomic<std::uint64_t> ready{0};
+    std::atomic<std::uint64_t> refused{0};
+    std::atomic<std::uint64_t> buildNs{0};
+    std::atomic<std::uint64_t> used{0};
+    std::atomic<std::uint64_t> usedNs{0};
+    std::atomic<std::uint64_t> stale{0};
+    std::mutex mutex;
+    std::map<std::string, std::uint64_t> skipped;
+    std::map<std::string, std::uint64_t> staleReasons;
+};
+
+AheadStatistics& Ahead() {
+    static auto* stats = new AheadStatistics();
+    return *stats;
+}
+
+void countAhead(std::map<std::string, std::uint64_t> AheadStatistics::*table, const char* reason) {
+    auto& stats = Ahead();
+    std::lock_guard lock(stats.mutex);
+    ++(stats.*table)[reason];
+}
+
+struct PublishedSeed {
+    std::shared_ptr<const Graphics::ForkSeed> seed;
+    std::uint64_t token = 0;
+    std::uint64_t hint = 0;
+};
+
+PublishedSeed& Published() {
+    static auto* published = new PublishedSeed();
+    return *published;
+}
+
+void publishSeed(std::uint64_t token, std::uint64_t hint) {
+    auto& published = Published();
+    published.seed = Graphics::TakeForkSeed();
+    published.token = token;
+    published.hint = hint;
+}
+
+struct StreamStatistics {
+    std::atomic<std::uint64_t> windows{0};
+    std::atomic<std::uint64_t> scheduled{0};
+    std::atomic<std::uint64_t> started{0};
+    std::atomic<std::uint64_t> completed{0};
+    std::atomic<std::uint64_t> refused{0};
+    std::atomic<std::uint64_t> cancelled{0};
+    std::atomic<std::uint64_t> used{0};
+    std::atomic<std::uint64_t> usedNs{0};
+    std::atomic<std::uint64_t> normal{0};
+    std::atomic<std::uint64_t> normalNs{0};
+    std::atomic<std::uint64_t> stale{0};
+    std::atomic<std::uint64_t> discarded{0};
+    std::atomic<std::uint64_t> waitNs{0};
+    std::atomic<std::uint64_t> pauses{0};
+    std::atomic<std::uint64_t> pauseNs{0};
+    std::mutex mutex;
+    std::map<std::string, std::uint64_t> staleReasons;
+    std::map<std::string, std::uint64_t> pauseReasons;
+};
+
+StreamStatistics& Streams() {
+    static auto* stats = new StreamStatistics();
+    return *stats;
+}
+
+std::size_t StreamAhead() {
+    static const std::size_t ahead = [] {
+        const char* text = std::getenv("APS5_FORK_STREAM_AHEAD");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 12ull;
+        return static_cast<std::size_t>(std::clamp<unsigned long long>(value, 1, 64));
+    }();
+    return ahead;
+}
+
+std::int64_t StreamBudgetNs() {
+    static const std::int64_t budget = [] {
+        const char* text = std::getenv("APS5_FORK_STREAM_US");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 1000ull;
+        return static_cast<std::int64_t>(std::clamp<unsigned long long>(value, 50, 20000)) * 1000;
+    }();
+    return budget;
+}
+
+class DrawStream {
+public:
+    enum State : int { None = 0, Scheduled, Running, Done, Cancelled };
+    struct Entry {
+        std::shared_ptr<DrawForkJob> job;
+        std::shared_ptr<const Graphics::ForkSeed> seed;
+    };
+
+    static DrawStream& Get() {
+        static auto* stream = new DrawStream();
+        return *stream;
+    }
+
+    void Begin(std::shared_ptr<const Graphics::Context> windowContext) {
+        std::lock_guard lock(mutex);
+        while (threads.size() < DrawPipeline::ForkWorkers()) threads.emplace_back([this, slot = threads.size() + 1] { work(slot); });
+        context = std::move(windowContext);
+        entries.clear();
+        next = 0;
+        open = true;
+        wake.notify_all();
+    }
+
+    bool Schedule(const std::shared_ptr<DrawForkJob>& job, const std::shared_ptr<const Graphics::ForkSeed>& seed) {
+        std::lock_guard lock(mutex);
+        if (job->streamState != None || job->ahead != nullptr) return false;
+        job->streamState = Scheduled;
+        entries.push_back({job, seed});
+        wake.notify_all();
+        return true;
+    }
+
+    int Await(DrawForkJob& job, bool waitScheduled) {
+        std::unique_lock lock(mutex);
+        if (job.streamState == Scheduled && !waitScheduled) {
+            job.streamState = Cancelled;
+            return Cancelled;
+        }
+        waitWatched(lock, "await", [&] { return job.streamState != Scheduled && job.streamState != Running; });
+        return job.streamState;
+    }
+
+    std::shared_ptr<Graphics::ForkedDraw> Take(DrawForkJob& job) {
+        std::lock_guard lock(mutex);
+        return std::move(job.ahead);
+    }
+
+    bool Pause(const char* reason) {
+        std::unique_lock lock(mutex);
+        if (!open) return false;
+        open = false;
+        Graphics::SetForkPausePending(true);
+        waitWatched(lock, reason, [&] { return running == 0; });
+        Graphics::SetForkPausePending(false);
+        return true;
+    }
+
+    void Resume() {
+        std::lock_guard lock(mutex);
+        if (open) return;
+        open = true;
+        wake.notify_all();
+    }
+
+    void End() {
+        std::unique_lock lock(mutex);
+        open = false;
+        Graphics::SetForkPausePending(true);
+        waitWatched(lock, "window end", [&] { return running == 0; });
+        Graphics::SetForkPausePending(false);
+        for (auto index = next; index < entries.size(); ++index) {
+            if (entries[index].job->streamState == Scheduled || entries[index].job->streamState == Cancelled) entries[index].job->streamState = None;
+        }
+        for (const auto& entry : entries) {
+            if (entry.job->streamState == Done && entry.job->ahead != nullptr) Streams().discarded.fetch_add(1, std::memory_order_relaxed);
+        }
+        entries.clear();
+        next = 0;
+        context.reset();
+    }
+
+private:
+    template<typename Predicate>
+    void waitWatched(std::unique_lock<std::mutex>& lock, const char* reason, Predicate&& ready) {
+        const auto started = std::chrono::steady_clock::now();
+        while (!done.wait_for(lock, std::chrono::milliseconds(50), ready)) {
+            static std::atomic<std::uint64_t> reports{0};
+            const auto count = reports.fetch_add(1, std::memory_order_relaxed);
+            if (count >= 20 && count % 100 != 0) continue;
+            const auto now = std::chrono::steady_clock::now();
+            std::string slots;
+            for (std::size_t slot = 0; slot < slotStarted.size(); ++slot) {
+                const auto at = slotStarted[slot].load(std::memory_order_relaxed);
+                if (at == 0) continue;
+                slots += " slot " + std::to_string(slot) + " running " + std::to_string((now.time_since_epoch().count() - at) / 1000000) + " ms";
+            }
+            std::fprintf(stderr, "[fork] committer waiting %lld ms for stream workers (%s): running %zu, open %d, scheduled %zu, next %zu, pause pending %d;%s\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(now - started).count()), reason, running, open ? 1 : 0, entries.size(), next, Graphics::ForkPausePending() ? 1 : 0, slots.c_str());
+        }
+    }
+
+    void work(std::size_t slot) {
+        PinWorkerThread("fork stream");
+        for (;;) {
+            Entry entry;
+            std::shared_ptr<const Graphics::Context> windowContext;
+            {
+                std::unique_lock lock(mutex);
+                wake.wait(lock, [&] { return open && next < entries.size(); });
+                entry = entries[next++];
+                if (entry.job->streamState != Scheduled) continue;
+                entry.job->streamState = Running;
+                windowContext = context;
+                ++running;
+                if (slot < slotStarted.size()) slotStarted[slot].store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+            }
+            auto& stats = Streams();
+            stats.started.fetch_add(1, std::memory_order_relaxed);
+            std::shared_ptr<Graphics::ForkedDraw> forked;
+            std::shared_ptr<const Graphics::ForkStamp> stamp;
+            try {
+                if (const auto owner = entry.job->owner.lock(); owner != nullptr && windowContext != nullptr) {
+                    auto& job = *entry.job;
+                    DrawPipeline::FollowEpoch(job.epoch);
+                    GuestMemory::SetCurrentPacket(job.packet, job.queue);
+                    stamp = Graphics::TakeForkStamp(*windowContext);
+                    forked = Graphics::ForkDrawSpeculated(*windowContext, *job.state, *job.draw, job.stages, job.snapshots, job.prebuilt, job.recipeStages->empty() ? nullptr : &job.aheadRecipe, entry.seed.get(), true, slot, job.speculation);
+                }
+            } catch (...) {
+                forked.reset();
+            }
+            std::lock_guard lock(mutex);
+            if (forked != nullptr && Graphics::ForkedDrawRefusal(*forked) == nullptr) {
+                entry.job->ahead = std::move(forked);
+                entry.job->aheadStamp = std::move(stamp);
+                entry.job->aheadContext = windowContext;
+                stats.completed.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                stats.refused.fetch_add(1, std::memory_order_relaxed);
+            }
+            entry.job->streamState = Done;
+            --running;
+            if (slot < slotStarted.size()) slotStarted[slot].store(0, std::memory_order_relaxed);
+            done.notify_all();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    std::condition_variable done;
+    bool open = false;
+    std::size_t running = 0;
+    std::vector<Entry> entries;
+    std::size_t next = 0;
+    std::shared_ptr<const Graphics::Context> context;
+    std::vector<std::thread> threads;
+    std::array<std::atomic<std::int64_t>, 16> slotStarted{};
+};
+
+std::string takeStreamReport() {
+    auto& stats = Streams();
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto perCount = [](unsigned long long ns, unsigned long long count) { return count != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(count) : 0.0; };
+    const auto windows = take(stats.windows);
+    const auto scheduled = take(stats.scheduled);
+    const auto started = take(stats.started);
+    const auto completed = take(stats.completed);
+    const auto refused = take(stats.refused);
+    const auto cancelled = take(stats.cancelled);
+    const auto used = take(stats.used);
+    const auto usedNs = take(stats.usedNs);
+    const auto normal = take(stats.normal);
+    const auto normalNs = take(stats.normalNs);
+    const auto stale = take(stats.stale);
+    const auto discarded = take(stats.discarded);
+    const auto waitNs = take(stats.waitNs);
+    const auto pauses = take(stats.pauses);
+    const auto pauseNs = take(stats.pauseNs);
+    char head[512];
+    std::snprintf(head, sizeof(head), "stream: windows %llu, scheduled %llu, started %llu, completed %llu, refused %llu, cancelled %llu, used %llu at %.1f us/commit, normal %llu at %.1f us/commit, carried %llu, waits %.1f ms, pauses %llu (%.1f ms), stale %llu (", windows, scheduled, started, completed, refused, cancelled, used, perCount(usedNs, used), normal, perCount(normalNs, normal), discarded, static_cast<double>(waitNs) / 1e6, pauses, static_cast<double>(pauseNs) / 1e6, stale);
+    std::string line = head;
+    std::lock_guard lock(stats.mutex);
+    for (const auto& [reason, count] : stats.staleReasons) line += " " + reason + " " + std::to_string(count);
+    line += "), pauses by reason:";
+    for (const auto& [reason, count] : stats.pauseReasons) line += " " + reason + " " + std::to_string(count);
+    stats.staleReasons.clear();
+    stats.pauseReasons.clear();
+    return line;
+}
+
+std::string takeAheadReport() {
+    auto& stats = Ahead();
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto attempted = take(stats.attempted);
+    const auto ready = take(stats.ready);
+    const auto refused = take(stats.refused);
+    const auto buildNs = take(stats.buildNs);
+    const auto used = take(stats.used);
+    const auto usedNs = take(stats.usedNs);
+    const auto stale = take(stats.stale);
+    char head[256];
+    std::snprintf(head, sizeof(head), "build-ahead: attempted %llu, built %llu at %.1f us, refused %llu, used %llu at %.1f us/commit, stale %llu (", attempted, ready + refused, ready + refused != 0 ? static_cast<double>(buildNs) / 1000.0 / static_cast<double>(ready + refused) : 0.0, refused, used, used != 0 ? static_cast<double>(usedNs) / 1000.0 / static_cast<double>(used) : 0.0, stale);
+    std::string line = head;
+    std::lock_guard lock(stats.mutex);
+    for (const auto& [reason, count] : stats.staleReasons) line += " " + reason + " " + std::to_string(count);
+    line += "), not built:";
+    for (const auto& [reason, count] : stats.skipped) line += " " + reason + " " + std::to_string(count);
+    stats.staleReasons.clear();
+    stats.skipped.clear();
+    return line;
+}
+
+bool forkTimed() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile && Graphics::ForkStatsEnabled();
+}
+
+std::uint64_t nanosSince(std::chrono::steady_clock::time_point since) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
+}
+
+void reportForks() {
+    if (!forkTimed()) return;
+    auto& times = Commits();
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto last = times.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        times.lastReport.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 10'000'000'000ll || !times.lastReport.compare_exchange_strong(last, now)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
+    const auto commits = take(times.commits);
+    const auto lambdaNs = take(times.lambdaNs);
+    const auto lockNs = take(times.lockNs);
+    const auto labelsNs = take(times.labelsNs);
+    const auto writersNs = take(times.writersNs);
+    const auto drawNs = take(times.drawNs);
+    const auto submitNs = take(times.submitNs);
+    const auto forked = take(times.forked);
+    const auto forkedNs = take(times.forkedNs);
+    const auto runs = take(times.runs);
+    const auto runBuildNs = take(times.runBuildNs);
+    const auto perCommit = [&](std::uint64_t ns) { return commits != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(commits) : 0.0; };
+    const auto rest = lambdaNs > lockNs + labelsNs + writersNs + drawNs + submitNs ? lambdaNs - lockNs - labelsNs - writersNs - drawNs - submitNs : 0;
+    const auto pipelineRuns = DrawPipeline::Queue0().TakeForkRuns();
+    const auto graphics = Graphics::TakeForkReport();
+    const auto ahead = takeAheadReport() + "; " + takeStreamReport();
+    std::fprintf(stderr, "[fork] (10 s) %s; %s; parallel builds %llu runs at %.1f us each; %llu forked commits at %.1f us each; %s; normal commits %llu at %.1f us, us per commit outside Graphics::Draw: lock %.2f, labels %.2f, writers %.2f, submit check %.2f, rest %.2f (Graphics::Draw %.1f)\n", pipelineRuns.c_str(), ahead.c_str(), static_cast<unsigned long long>(runs), runs != 0 ? static_cast<double>(runBuildNs) / 1000.0 / static_cast<double>(runs) : 0.0, static_cast<unsigned long long>(forked), forked != 0 ? static_cast<double>(forkedNs) / 1000.0 / static_cast<double>(forked) : 0.0, graphics.c_str(), static_cast<unsigned long long>(commits), perCommit(lambdaNs), perCommit(lockNs), perCommit(labelsNs), perCommit(writersNs), perCommit(submitNs), perCommit(rest), perCommit(drawNs));
+}
+
+std::uint64_t forkPassHint(const Graphics::State& graphics) {
+    std::uint64_t hash = 14695981039346656037ull;
+    const auto mix = [&](std::uint64_t value) {
+        hash ^= value;
+        hash *= 1099511628211ull;
+    };
+    for (const auto& color : graphics.colors) {
+        mix(color.address);
+        mix(static_cast<std::uint64_t>(color.format));
+        mix(color.extent.width);
+        mix(color.extent.height);
+        mix(color.mip);
+        mix(color.depthSlice);
+        mix(color.layers);
+        mix(color.exportIndex);
+    }
+    if (graphics.depth) {
+        mix(graphics.depth->address);
+        mix(static_cast<std::uint64_t>(graphics.depth->format));
+        mix(graphics.depth->extent.width);
+        mix(graphics.depth->extent.height);
+        mix(graphics.depth->arraySlice);
+        mix(graphics.depth->layers);
+    }
+    mix(graphics.blends.size());
+    mix(graphics.renderExtent.width);
+    mix(graphics.renderExtent.height);
+    return hash;
+}
+
+}
+
+class DrawForkRunner final : public DrawPipeline::ForkRunner {
+public:
+    explicit DrawForkRunner(Driver& driver) : driver(driver) {}
+
+    std::size_t Run(std::span<DrawPipeline::ForkJob* const> jobs, const std::function<bool(std::size_t, const DrawPipeline::Commit*)>& commit) override {
+        std::vector<DrawForkJob*> draws;
+        draws.reserve(jobs.size());
+        for (auto* job : jobs) {
+            auto* draw = static_cast<DrawForkJob*>(job);
+            if ((!draws.empty() && draw->epoch != draws.front()->epoch) || draw->ahead != nullptr) break;
+            draws.push_back(draw);
+        }
+        if (draws.size() < 2) {
+            Graphics::CountForkCut("epoch boundary");
+            return 0;
+        }
+        const auto hint = draws.front()->passHint;
+        if (const auto found = backoff.find(hint); found != backoff.end() && found->second != 0) {
+            --found->second;
+            Graphics::CountForkCut("refusal backoff");
+            return 0;
+        }
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+        std::unique_lock gpuLock(GuestMemory::GpuMutex());
+        const auto localDevice = driver.device.Load();
+        auto* recorder = Graphics::Recorder::Active();
+        if (localDevice == nullptr || recorder == nullptr || !recorder->PassContinuable()) {
+            Graphics::CountForkCut("no open pass");
+            return 0;
+        }
+        if (std::any_of(draws.begin(), draws.end(), [&](const DrawForkJob* job) { return job->device != localDevice; })) {
+            Graphics::CountForkCut("device replaced");
+            return 0;
+        }
+        const auto runEpoch = draws.front()->epoch;
+        const bool timed = forkTimed();
+        std::vector<std::shared_ptr<Graphics::ForkedDraw>> forked(draws.size());
+        std::vector<std::shared_ptr<const DrawRecipe>> built(draws.size());
+        std::optional<Graphics::Context> context;
+        std::shared_ptr<const Graphics::ForkStamp> stamp;
+        try {
+            DrawPipeline::FollowEpoch(runEpoch);
+            const auto seed = Graphics::TakeForkSeed();
+            context.emplace(localDevice->DrawContext());
+            const auto buildStart = std::chrono::steady_clock::now();
+            std::atomic<std::size_t> firstRefused{draws.size()};
+            DrawPipeline::RunForkJobs(draws.size(), [&](std::size_t index, std::size_t slot) {
+                if (index > firstRefused.load(std::memory_order_relaxed)) return;
+                const auto& job = *draws[index];
+                DrawPipeline::FollowEpoch(job.epoch);
+                GuestMemory::SetCurrentPacket(job.packet, job.queue);
+                forked[index] = Graphics::ForkDrawSpeculated(*context, *job.state, *job.draw, job.stages, job.snapshots, job.prebuilt, job.recipeStages->empty() ? nullptr : &built[index], seed.get(), job.epoch == runEpoch, slot, job.speculation);
+                if (Graphics::ForkedDrawRefusal(*forked[index]) == nullptr) return;
+                auto current = firstRefused.load(std::memory_order_relaxed);
+                while (index < current && !firstRefused.compare_exchange_weak(current, index, std::memory_order_relaxed)) {
+                }
+            });
+            if (firstRefused.load(std::memory_order_relaxed) == 0) {
+                if (backoff.size() > 256) backoff.clear();
+                backoff[hint] = 16;
+            }
+            if (timed) {
+                Commits().runs.fetch_add(1, std::memory_order_relaxed);
+                Commits().runBuildNs.fetch_add(nanosSince(buildStart), std::memory_order_relaxed);
+            }
+            stamp = Graphics::TakeForkStamp(*context);
+        } catch (...) {
+            Graphics::CountForkCut("runner setup");
+            return 0;
+        }
+        std::size_t handled = 0;
+        for (std::size_t index = 0; index < draws.size(); ++index) {
+            auto* job = draws[index];
+            bool cut = false;
+            const auto commitStart = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const DrawPipeline::Commit body = [&] { driver.commitForked(*job, *context, forked[index].get(), *stamp, built[index], cut); };
+            const bool committed = commit(index, &body);
+            forked[index].reset();
+            built[index].reset();
+            ++handled;
+            if (timed && committed && !cut) {
+                Commits().forked.fetch_add(1, std::memory_order_relaxed);
+                Commits().forkedNs.fetch_add(nanosSince(commitStart), std::memory_order_relaxed);
+            }
+            if (!committed || cut) break;
+        }
+        reportForks();
+        return handled;
+    }
+
+    std::size_t Stream(const std::function<std::vector<std::shared_ptr<DrawPipeline::ForkJob>>(std::size_t)>& peek, const std::function<bool(const DrawPipeline::Commit*)>& commit) override {
+        auto queued = peek(1);
+        if (queued.empty() || !queued.front()->eligible) return 0;
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+        std::unique_lock gpuLock(GuestMemory::GpuMutex());
+        const auto localDevice = driver.device.Load();
+        if (localDevice == nullptr || Graphics::Recorder::Active() == nullptr) return 0;
+        std::shared_ptr<const Graphics::Context> context;
+        try {
+            context = std::make_shared<const Graphics::Context>(localDevice->DrawContext());
+        } catch (...) {
+            return 0;
+        }
+        auto& stream = DrawStream::Get();
+        auto& stats = Streams();
+        const bool timed = forkTimed();
+        stats.windows.fetch_add(1, std::memory_order_relaxed);
+        stream.Begin(context);
+        const auto windowStart = std::chrono::steady_clock::now();
+        const auto ahead = StreamAhead();
+        const bool waitScheduled = Graphics::ForkStreamWaitEnabled();
+        const std::function<void(const char*)> hook = [&](const char* reason) {
+            const auto pauseStart = std::chrono::steady_clock::now();
+            if (!stream.Pause(reason)) return;
+            stats.pauses.fetch_add(1, std::memory_order_relaxed);
+            stats.pauseNs.fetch_add(nanosSince(pauseStart), std::memory_order_relaxed);
+            std::lock_guard lock(stats.mutex);
+            ++stats.pauseReasons[reason];
+        };
+        const Graphics::ForkQuiesceScope quiesceScope(&hook);
+        const bool lazy = Graphics::ForkStreamLazyEnabled();
+        std::shared_ptr<const Graphics::ForkSeed> seed;
+        std::uint64_t seedHint = 0;
+        std::uint64_t seedEpoch = 0;
+        bool committedOne = false;
+        std::uint64_t lastHint = 0;
+        std::uint64_t lastEpoch = 0;
+        std::size_t handled = 0;
+        for (;;) {
+            queued = peek(ahead + 1);
+            if (queued.empty()) break;
+            auto job = std::static_pointer_cast<DrawForkJob>(queued.front());
+            if (!job->eligible || job->device != localDevice) break;
+            if (handled != 0 && static_cast<std::int64_t>(nanosSince(windowStart)) > StreamBudgetNs()) break;
+            auto* recorder = Graphics::Recorder::Active();
+            if (committedOne && recorder != nullptr && recorder->PassContinuable()) {
+                if (seed == nullptr || seedHint != lastHint || seedEpoch != lastEpoch) {
+                    seed = Graphics::TakeForkSeed();
+                    seedHint = lastHint;
+                    seedEpoch = lastEpoch;
+                }
+                for (const auto& candidate : queued) {
+                    auto draw = std::static_pointer_cast<DrawForkJob>(candidate);
+                    if (!draw->eligible || draw->passHint != lastHint || draw->epoch != lastEpoch) break;
+                    if (stream.Schedule(draw, seed)) stats.scheduled.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            const auto waitStart = std::chrono::steady_clock::now();
+            const auto state = stream.Await(*job, waitScheduled);
+            stats.waitNs.fetch_add(nanosSince(waitStart), std::memory_order_relaxed);
+            if (state == DrawStream::Cancelled) stats.cancelled.fetch_add(1, std::memory_order_relaxed);
+            auto forked = stream.Take(*job);
+            const auto commitStart = std::chrono::steady_clock::now();
+            bool committed = false;
+            if (forked != nullptr) {
+                bool cut = false;
+                auto stamp = job->aheadStamp;
+                auto forkContext = job->aheadContext != nullptr ? job->aheadContext : context;
+                const DrawPipeline::Commit body = [&] { driver.commitForked(*job, *forkContext, forked.get(), *stamp, job->aheadRecipe, cut); };
+                committed = commit(&body);
+                if (cut) {
+                    stats.stale.fetch_add(1, std::memory_order_relaxed);
+                    const char* why = Graphics::ForkedDrawCut(*forked);
+                    std::lock_guard lock(stats.mutex);
+                    ++stats.staleReasons[why != nullptr ? why : "device"];
+                } else {
+                    stats.used.fetch_add(1, std::memory_order_relaxed);
+                    stats.usedNs.fetch_add(nanosSince(commitStart), std::memory_order_relaxed);
+                }
+            } else {
+                if (!lazy) hook("normal commit");
+                committed = commit(nullptr);
+                stats.normal.fetch_add(1, std::memory_order_relaxed);
+                stats.normalNs.fetch_add(nanosSince(commitStart), std::memory_order_relaxed);
+            }
+            stream.Resume();
+            static_cast<void>(committed);
+            ++handled;
+            committedOne = true;
+            lastHint = job->passHint;
+            lastEpoch = job->epoch;
+        }
+        stream.End();
+        if (timed) reportForks();
+        return handled;
+    }
+
+private:
+    Driver& driver;
+    std::unordered_map<std::uint64_t, std::uint32_t> backoff;
+};
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     const DrawPipeline::TraceScope pipeTrace(DrawPipeline::Trace::QueueDraw, DrawPipeline::Trace::QueueDrawEnd);
@@ -720,8 +1326,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
     }
     if (pipelined && !drawParameters.indirect && deferredLabels().labels.empty()) {
+        static const bool windowRegistered = [] {
+            Graphics::SetAppliedWindow({[] { return DrawPipeline::Queue0().AppliedFrontier(); }, [](std::uint64_t fromExclusive, std::span<const std::pair<std::uint64_t, std::uint64_t>> reads) {
+                return static_cast<Graphics::WindowVerdict>(DrawPipeline::Queue0().CheckWindow(fromExclusive, DrawPipeline::CommittingSequence(), reads));
+            }});
+            GuestMemory::SetCollectHistoryFlag(&Graphics::TargetTokensEnabled);
+            return true;
+        }();
+        static_cast<void>(windowRegistered);
         phaseTiming.Phase(DrawRowVectors);
         auto writes = drawWriteRanges(graphics, stages);
+        const bool unknownWrites = std::any_of(stages.begin(), stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program == nullptr || stage.program->bdaWrites; });
         const auto commitQueue = submission.queue;
         const auto commitPacket = (packet[0] >> 8u) & 0xffu;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
@@ -757,13 +1372,79 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             if (graphics.hasColorTarget) prefetchTarget(graphics.color);
             for (const auto& color : graphics.colors) prefetchTarget(color);
         }
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), compiledStages = std::move(compiledStages), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry)] {
+        std::shared_ptr<Graphics::DrawSpeculation> speculation;
+        if (recipe == nullptr && Graphics::DrawSpeculationEnabled() && DrawPipeline::Queue0().OnPrepThread()) {
+            try {
+                speculation = localDevice->SpeculateDraw(graphics, drawParameters, stages, snapshots);
+            } catch (...) {
+                speculation = nullptr;
+            }
+        }
+        std::shared_ptr<Graphics::DrawPrebuild> prebuilt;
+        if (recipe == nullptr && Graphics::ParallelDrawBuild() && Graphics::DrawPlansEnabled() && DrawPipeline::Queue0().OnPrepThread()) prebuilt = localDevice->PrebuildDraw(graphics, drawParameters, stages, speculation == nullptr);
+        static const bool runnerRegistered = [this] {
+            DrawPipeline::SetForkRunner(new DrawForkRunner(*this));
+            return true;
+        }();
+        static_cast<void>(runnerRegistered);
+        std::shared_ptr<DrawForkJob> forkJob;
+        if (Graphics::ForkBuildEnabled() || Graphics::ForkStatsEnabled() || Graphics::ForkAheadEnabled()) forkJob = std::make_shared<DrawForkJob>();
+        auto commit = [this, forkJob, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, speculation = std::move(speculation), prebuilt = std::move(prebuilt), programs = std::move(programs), results = std::move(results), compiledStages = std::move(compiledStages), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry)](DrawForkJob* fork) {
+            if (fork != nullptr) {
+                fork->device = localDevice;
+                fork->state = &decode->state;
+                fork->draw = &drawParameters;
+                fork->stages = stages;
+                fork->snapshots = snapshots;
+                fork->prebuilt = prebuilt;
+                fork->recipeStages = &recipeStages;
+                fork->drawKey = drawKey;
+                fork->queue = commitQueue;
+                fork->packet = commitPacket;
+                fork->epoch = epoch;
+                fork->speculation = speculation;
+                fork->eligible = recipe == nullptr && prebuilt != nullptr && !drawParameters.indirect;
+                fork->passHint = forkPassHint(decode->state);
+                return;
+            }
+            const bool timed = forkTimed();
+            const auto lambdaStart = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (forkJob != nullptr && forkJob->ahead != nullptr) {
+                auto forked = std::move(forkJob->ahead);
+                bool cut = false;
+                commitForked(*forkJob, *forkJob->aheadContext, forked.get(), *forkJob->aheadStamp, forkJob->aheadRecipe, cut);
+                auto& ahead = Ahead();
+                if (cut) {
+                    ahead.stale.fetch_add(1, std::memory_order_relaxed);
+                    const char* why = Graphics::ForkedDrawCut(*forked);
+                    countAhead(&AheadStatistics::staleReasons, why != nullptr ? why : "device");
+                } else {
+                    ahead.used.fetch_add(1, std::memory_order_relaxed);
+                    if (timed) ahead.usedNs.fetch_add(nanosSince(lambdaStart), std::memory_order_relaxed);
+                }
+                reportForks();
+                return;
+            }
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
+            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, std::move(speculation), std::move(prebuilt));
+            if (forkJob != nullptr && Graphics::ForkAheadEnabled()) {
+                GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+                std::lock_guard publishLock(GuestMemory::GpuMutex());
+                publishSeed(epoch, forkJob->passHint);
+            }
+            if (!timed) return;
+            Commits().commits.fetch_add(1, std::memory_order_relaxed);
+            Commits().lambdaNs.fetch_add(nanosSince(lambdaStart), std::memory_order_relaxed);
+            reportForks();
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
-        DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
+        if (forkJob != nullptr) {
+            (*held)(forkJob.get());
+            forkJob->owner = std::shared_ptr<void>(held);
+            if (Graphics::ForkAheadEnabled() && DrawPipeline::Queue0().OnPrepThread()) buildAhead(*forkJob);
+        }
+        DrawPipeline::Queue0().Enqueue([held] { (*held)(nullptr); }, std::move(writes), 0, {}, unknownWrites, std::move(forkJob));
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");
         return drawn();
@@ -793,26 +1474,135 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     return drawn();
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, std::shared_ptr<Graphics::DrawSpeculation> speculation, std::shared_ptr<Graphics::DrawPrebuild> prebuilt) {
+    const bool timed = forkTimed();
+    auto lap = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto mark = [&](std::atomic<std::uint64_t>& into) {
+        if (!timed) return;
+        const auto now = std::chrono::steady_clock::now();
+        into.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - lap).count()), std::memory_order_relaxed);
+        lap = now;
+    };
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
+    mark(Commits().lockNs);
+    struct SubmitDue {
+        Driver& driver;
+        const std::shared_ptr<VulkanDevice>& device;
+        bool timed;
+        ~SubmitDue() noexcept(false) {
+            if (std::uncaught_exceptions() != 0) return;
+            const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            driver.submitDueAfterCommit(device.get());
+            if (timed) Commits().submitNs.fetch_add(nanosSince(start), std::memory_order_relaxed);
+        }
+    } submitDue{*this, localDevice, timed};
+    recordLabelsForPacket(localDevice.get(), queue);
+    mark(Commits().labelsNs);
+    noteDrawWriters(stages, queue);
+    mark(Commits().writersNs);
+    if (recipe != nullptr) {
+        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) {
+            mark(Commits().drawNs);
+            return;
+        }
+        VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
+    }
+    std::shared_ptr<const DrawRecipe> built;
+    {
+        const Graphics::SpeculationScope speculationScope(std::move(speculation));
+        const Graphics::DrawPrebuildScope prebuildScope(std::move(prebuilt));
+        localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
+    }
+    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
+    mark(Commits().drawNs);
+}
+
+void Driver::commitForked(const DrawForkJob& job, const Graphics::Context& context, Graphics::ForkedDraw* forked, const Graphics::ForkStamp& stamp, std::shared_ptr<const DrawRecipe>& built, bool& cut, const std::function<void()>* quiesce) {
+    DrawPipeline::FollowEpoch(job.epoch);
+    GuestMemory::SetCurrentPacket(job.packet, job.queue);
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    auto localDevice = job.device;
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
     struct SubmitDue {
         Driver& driver;
         const std::shared_ptr<VulkanDevice>& device;
+        const std::function<void()>* quiesce;
         ~SubmitDue() noexcept(false) {
-            if (std::uncaught_exceptions() == 0) driver.submitDueAfterCommit(device.get());
+            if (std::uncaught_exceptions() != 0) return;
+            if ((quiesce != nullptr || Graphics::ForkQuiescing()) && driver.submitPending(device.get())) {
+                if (quiesce != nullptr) (*quiesce)();
+                else Graphics::ForkQuiesce("submit due");
+            }
+            driver.submitDueAfterCommit(device.get());
         }
-    } submitDue{*this, localDevice};
-    recordLabelsForPacket(localDevice.get(), queue);
-    noteDrawWriters(stages, queue);
-    if (recipe != nullptr) {
-        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) return;
-        VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
+    } submitDue{*this, localDevice, quiesce};
+    if ((quiesce != nullptr || Graphics::ForkQuiescing()) && labelsPending(localDevice.get())) {
+        if (quiesce != nullptr) (*quiesce)();
+        else Graphics::ForkQuiesce("labels");
     }
-    std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
-    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
+    recordLabelsForPacket(localDevice.get(), job.queue);
+    noteDrawWriters(job.stages, job.queue);
+    const bool sameDevice = localDevice == job.device;
+    if (!sameDevice) Graphics::CountForkCut("device replaced");
+    else if (forked == nullptr) Graphics::CountForkCut("build failed");
+    if (!sameDevice || forked == nullptr || !localDevice->ApplyForkedDraw(context, job.stages, *forked, stamp, quiesce)) {
+        cut = true;
+        if (quiesce != nullptr) (*quiesce)();
+        else Graphics::ForkQuiesce("cut fallback");
+        built.reset();
+        const Graphics::DrawPrebuildScope prebuildScope(job.prebuilt);
+        localDevice->Draw(*job.state, *job.draw, job.stages, job.snapshots, job.recipeStages->empty() ? nullptr : &built);
+    }
+    if (built != nullptr) attachDrawRecipe(job.drawKey, *job.recipeStages, std::move(built));
+    if (Graphics::ForkAheadEnabled()) publishSeed(job.epoch, job.passHint);
+}
+
+void Driver::buildAhead(DrawForkJob& job) {
+    auto& stats = Ahead();
+    stats.attempted.fetch_add(1, std::memory_order_relaxed);
+    if (!job.eligible) {
+        countAhead(&AheadStatistics::skipped, "ineligible");
+        return;
+    }
+    if (!DrawPipeline::Queue0().CommitterIdle()) {
+        countAhead(&AheadStatistics::skipped, "committer busy");
+        return;
+    }
+    std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+    if (!gpuLock.owns_lock()) {
+        countAhead(&AheadStatistics::skipped, "lock busy");
+        return;
+    }
+    auto* recorder = Graphics::Recorder::Active();
+    const auto& published = Published();
+    if (device.Load() != job.device) {
+        countAhead(&AheadStatistics::skipped, "device");
+        return;
+    }
+    if (recorder == nullptr || !recorder->PassContinuable()) {
+        countAhead(&AheadStatistics::skipped, "no open pass");
+        return;
+    }
+    if (published.seed == nullptr || published.hint != job.passHint) {
+        countAhead(&AheadStatistics::skipped, "other pass");
+        return;
+    }
+    const auto started = std::chrono::steady_clock::now();
+    DrawPipeline::FollowEpoch(job.epoch);
+    auto context = std::make_shared<const Graphics::Context>(job.device->DrawContext());
+    auto forked = Graphics::ForkDrawSpeculated(*context, *job.state, *job.draw, job.stages, job.snapshots, job.prebuilt, job.recipeStages->empty() ? nullptr : &job.aheadRecipe, published.seed.get(), job.epoch == published.token, DrawPipeline::AheadSlot, job.speculation);
+    stats.buildNs.fetch_add(nanosSince(started), std::memory_order_relaxed);
+    if (Graphics::ForkedDrawRefusal(*forked) != nullptr) {
+        stats.refused.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    job.aheadStamp = Graphics::TakeForkStamp(*context);
+    job.aheadContext = std::move(context);
+    job.ahead = std::move(forked);
+    stats.ready.fetch_add(1, std::memory_order_relaxed);
 }
 
 }
