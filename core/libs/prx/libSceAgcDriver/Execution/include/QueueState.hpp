@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <utility>
 #include <map>
+#include <memory>
 #include <array>
 #include <optional>
 #include <string>
@@ -176,12 +177,48 @@ struct Predication {
     bool executeWhenSet = false;
 };
 
+// The constant engine's RAM, allocated by its first write (most queues never use it, and a draw's
+// snapshot of the queue does not carry it).
+class ConstantRam {
+public:
+    static constexpr std::size_t Words = 0x3000;
+    ConstantRam() = default;
+    ConstantRam(const ConstantRam& other) : words(other.words != nullptr ? std::make_unique<std::array<std::uint32_t, Words>>(*other.words) : nullptr) {}
+    ConstantRam& operator=(const ConstantRam& other) {
+        if (this != &other) words = other.words != nullptr ? std::make_unique<std::array<std::uint32_t, Words>>(*other.words) : nullptr;
+        return *this;
+    }
+    ConstantRam(ConstantRam&&) noexcept = default;
+    ConstantRam& operator=(ConstantRam&&) noexcept = default;
+    std::size_t size() const { return Words; }
+    std::uint32_t* data() {
+        if (words == nullptr) words = std::make_unique<std::array<std::uint32_t, Words>>();
+        return words->data();
+    }
+    const std::uint32_t* data() const { return words != nullptr ? words->data() : Zero().data(); }
+    std::uint32_t* begin() { return data(); }
+    std::uint32_t* end() { return data() + Words; }
+    const std::uint32_t* begin() const { return data(); }
+    const std::uint32_t* end() const { return data() + Words; }
+
+private:
+    static const std::array<std::uint32_t, Words>& Zero() {
+        static const std::array<std::uint32_t, Words> zero{};
+        return zero;
+    }
+    std::unique_ptr<std::array<std::uint32_t, Words>> words;
+};
+
 struct QueueState {
+    struct DrawSnapshot {};
+    QueueState() = default;
+    // Everything a draw reads of the queue, without the constant RAM.
+    QueueState(const QueueState& other, DrawSnapshot) : shader(other.shader), context(other.context), userConfig(other.userConfig), savedContext(other.savedContext), indexBase(other.indexBase), drawIndirectBase(other.drawIndirectBase), dispatchIndirectBase(other.dispatchIndirectBase), indexBufferSize(other.indexBufferSize), indexType(other.indexType), instanceCount(other.instanceCount), predication(other.predication) {}
     Registers shader;
     Registers context = InitialContextRegisters();
     Registers userConfig{{0x24a, 0}, {0x24b, 0}};
     std::optional<Registers> savedContext;
-    std::array<std::uint32_t, 0x3000> constantRam{};
+    ConstantRam constantRam;
     std::uint64_t indexBase = 0;
     std::uint64_t drawIndirectBase = 0;
     std::uint64_t dispatchIndirectBase = 0;

@@ -38,6 +38,23 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     };
     auto drawParameters = Pm4::ResolveDraw(packet, queue);
     const bool pipelined = DrawPipeline::Active();
+    // APS5_SPLIT_DRAW_FRONT=1: the whole draw runs on a preparation worker from a snapshot of the
+    // queue's registers; the queue thread only takes the snapshot.
+    static const bool frontSplit = std::getenv("APS5_SPLIT_DRAW_FRONT") != nullptr;
+    if (frontSplit && pipelined && submission.queue == 0 && DrawPipeline::SplitDraws() && !DrawPipeline::Queue0().OnPrepThread() && !drawParameters.indirect && deferredLabels().labels.empty()) {
+        auto snapshot = std::make_shared<QueueState>(queue, QueueState::DrawSnapshot{});
+        auto stable = std::make_shared<Submission>();
+        stable->serial = submission.serial;
+        stable->queue = submission.queue;
+        stable->shaders = submission.shaders;
+        stable->received = submission.received;
+        auto words = std::make_shared<const std::vector<std::uint32_t>>(packet.begin(), packet.end());
+        DrawPipeline::Queue0().Prepare([this, snapshot, stable, words] {
+            std::string frontRejected;
+            static_cast<void>(draw(*snapshot, std::span<const std::uint32_t>(*words), *stable, frontRejected));
+        });
+        return drawn();
+    }
     if (pipelined && drawParameters.indirect) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
     bool traceIndirect = false;
     if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return *verdict;
@@ -316,8 +333,18 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     auto splitRejected = std::make_shared<std::string>();
     std::string* rejectedOut = splitDraw ? splitRejected.get() : &rejected;
     const auto splitEpoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-    auto tail = [this, &queue, &submission, clipControl, packet, rejectedOut, splitRejected, splitDraw, splitEpoch, phaseMsIn = phaseMs, phaseLapIn = phaseLap, capturesIn = captures, drawParameters, pipelined, traceIndirect, gpuLock = std::move(gpuLock), localDevice, useDrawEntries, registerKey, drawKey, entry = std::move(entry), decode = std::move(decode), dataEntry = std::move(dataEntry), shapeKey, programs = std::move(programs), memory = std::move(memory), linked = std::move(linked), vertexInfos = std::move(vertexInfos), decodeReads = std::move(decodeReads), results = std::move(results), compiledStages = std::move(compiledStages), stages = std::move(stages), pushCursorBytes, programResults = std::move(programResults), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), recompiled = std::move(recompiled), dataCandidates = std::move(dataCandidates), reused = std::move(reused), dataStagesReused, dataStagesCompiled, dataVerified, drawHit, verifyHit]() mutable -> DrawVerdict {
+    // A split tail outlives the submission it came from (the queue thread moves on): it keeps what it
+    // reads of it.
+    auto stableSubmission = std::make_shared<Submission>();
+    stableSubmission->serial = submission.serial;
+    stableSubmission->queue = submission.queue;
+    stableSubmission->shaders = submission.shaders;
+    stableSubmission->received = submission.received;
+    auto packetWords = std::make_shared<const std::vector<std::uint32_t>>(packet.begin(), packet.end());
+    auto tail = [this, &queue, stableSubmission, packetWords, clipControl, rejectedOut, splitRejected, splitDraw, splitEpoch, phaseMsIn = phaseMs, phaseLapIn = phaseLap, capturesIn = captures, drawParameters, pipelined, traceIndirect, gpuLock = std::move(gpuLock), localDevice, useDrawEntries, registerKey, drawKey, entry = std::move(entry), decode = std::move(decode), dataEntry = std::move(dataEntry), shapeKey, programs = std::move(programs), memory = std::move(memory), linked = std::move(linked), vertexInfos = std::move(vertexInfos), decodeReads = std::move(decodeReads), results = std::move(results), compiledStages = std::move(compiledStages), stages = std::move(stages), pushCursorBytes, programResults = std::move(programResults), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), recompiled = std::move(recompiled), dataCandidates = std::move(dataCandidates), reused = std::move(reused), dataStagesReused, dataStagesCompiled, dataVerified, drawHit, verifyHit]() mutable -> DrawVerdict {
     if (splitDraw) DrawPipeline::FollowEpoch(splitEpoch);
+    const Submission& submission = *stableSubmission;
+    const std::span<const std::uint32_t> packet(*packetWords);
     using Stage = ShaderRecompiler::ShaderStage;
     using Role = ShaderRecompiler::ProgramRole;
     auto phaseMs = phaseMsIn;
@@ -760,7 +787,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("draw_and_resource_release");
     return drawn();
     };
-    if (!splitDraw) return tail();
+    if (!splitDraw || DrawPipeline::Queue0().OnPrepThread()) return tail();
     auto held = std::make_shared<decltype(tail)>(std::move(tail));
     DrawPipeline::Queue0().Prepare([held] { static_cast<void>((*held)()); });
     return drawn();
