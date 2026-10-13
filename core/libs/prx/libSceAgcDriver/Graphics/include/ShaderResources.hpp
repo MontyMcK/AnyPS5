@@ -141,6 +141,16 @@ public:
         std::vector<std::uint32_t> words;
     };
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
+    // A dispatch inside a dispatch run (Recorder::DispatchRunsEnabled) cannot rewrite the template's
+    // data buffers in place: a dispatch of the run before it may still read them. Its differing
+    // ShaderData/FlattenedSrt words go to snapshot-ring slices instead, bound through a copy of the
+    // template's descriptor set (returned; bind it instead of the template's own). `usable` is false
+    // when the words cannot be served this way (the caller then ends the run and refreshes); a null
+    // result with `usable` means the template's buffers already hold the words. `keyChecked`: the
+    // caller already matched the shader to the template's refresh key.
+    std::shared_ptr<DrawBindings> DataBindings(Recorder& recorder, const CompiledShader& shader, bool keyChecked, bool& usable) const;
+    // Binds the given per-use set (DrawBindings) in place of the template's own.
+    void BindSet(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, VkDescriptorSet set) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
@@ -198,6 +208,45 @@ public:
     void PrecollectSurfaces() const;
     bool Reusable() const { return reusable; }
     bool AddressReusable() const { return addressReusable; }
+    // Stream templates (APS5_STREAM_RING=1, live flag stream_ring; off by default): a draw build
+    // whose only regions not bound in place are small read-only CPU copies
+    // (GuestBufferMemory::StreamableRegions) is kept as a template anyway. Its guest buffers inside
+    // those regions are tagged `streamed`: the template's own copy of them is stale by design, so
+    // every hit rebinds them like moved read-only buffers (movedBuffers reports them moved even at
+    // an unchanged address, through the same refusals), and PrepareDrawBindings copies their
+    // current bytes into a fresh snapshot ring slice in the hit's stream position, as the build it
+    // replaces copied them. StreamLimit is APS5_STREAM_RING_MAX_KIB (default 16, 1..256) in bytes:
+    // the largest copied region a template takes and the largest streamed view a hit copies.
+    static bool StreamRing();
+    static std::size_t StreamLimit();
+    bool Streamed() const { return streamed; }
+    // APS5_PROFILE_DRAW: what noteReusable decided for each draw build, by the first rule met
+    // (cumulative; Draw.cpp's [reuse] line prints 10 s deltas): kept with every region in place,
+    // kept as a stream template, streamable but the switch is off (the baseline's share of builds a
+    // stream template would serve), or refused for completion work or a lease, a texture refreshed
+    // per use, a data buffer over the refresh limit, a copied region StreamableRegions refuses (by
+    // kind; None: the upload was not complete), a guest buffer straddling a copied region, or a
+    // region without an import or mirror serial. `copied*` are the copied regions of the stream
+    // templates made or, with the switch off, that would have been; `streamed*` the ranges hits
+    // copied, and `verified` those APS5_VERIFY_STREAM_RING compared with a hooked read.
+    struct ReuseStats {
+        std::uint64_t builds = 0;
+        std::uint64_t inPlace = 0;
+        std::uint64_t streamMade = 0;
+        std::uint64_t streamableOff = 0;
+        std::uint64_t completion = 0;
+        std::uint64_t perUseTexture = 0;
+        std::uint64_t largeData = 0;
+        std::array<std::uint64_t, static_cast<std::size_t>(GuestBufferMemory::StreamRefusal::Count)> copyRefused{};
+        std::uint64_t straddled = 0;
+        std::uint64_t noSerial = 0;
+        std::uint64_t copiedRanges = 0;
+        std::uint64_t copiedBytes = 0;
+        std::uint64_t streamedRanges = 0;
+        std::uint64_t streamedBytes = 0;
+        std::uint64_t verified = 0;
+    };
+    static ReuseStats ReuseCounters();
     static bool AddressTemplates();
     enum class AddressMiss : std::size_t { None, Replaced, Imports, Proof, Moved, Outside, MovedOutside, Count };
     static std::shared_ptr<ShaderResources> AddressUse(const std::shared_ptr<ShaderResources>& source, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, AddressMiss& miss);
@@ -354,6 +403,9 @@ private:
         ShaderRecompiler::DescriptorRole role = ShaderRecompiler::DescriptorRole::ShaderData;
         // Guest buffers: whether the shader may store to the range (see addGuestBuffer).
         bool written = true;
+        // Guest buffers of a stream template (see StreamRing): the template's copy is stale by
+        // design; every hit rebinds them as moved (movedBuffers) with a fresh copy of their bytes.
+        bool streamed = false;
         // Data buffers: the words the buffer holds once the recorded work ran (see RefreshData).
         std::vector<std::uint32_t> dataWords;
         std::uint32_t adjustment = 0;
@@ -557,6 +609,13 @@ private:
     std::vector<std::shared_ptr<Sampler>> samplers;
     std::shared_ptr<Sampler> paddingSampler;
     bool reusable = false;
+    // A reusable draw build some of whose guest buffers are streamed (Allocation::streamed).
+    bool streamed = false;
+    // Drops every stream tag (noteReusable, before it decides again and on a late refusal).
+    void clearStreamed();
+    // Tags the guest buffers inside `copied` (StreamableRegions); false, with nothing tagged, when
+    // one is written or straddles a copied region's bounds.
+    bool tagStreamed(std::span<const std::pair<std::uint64_t, std::uint64_t>> copied);
     std::vector<DirectRegion> directRegions;
     std::vector<ValidatedSurface> validatedTextures;
     mutable std::mutex proofMutex;

@@ -5,6 +5,12 @@
 // distinct stacks are written with their counts to APS5_SAMPLE_OUT (default agc-stacks.txt):
 //   <tid>\t<thread name>\t<count>\t<module>+<offset> <module>+<offset> ...   (leaf first)
 // Nothing is allocated while a thread is suspended.
+//
+// APS5_SAMPLE_THREADS=<text>: sample only threads whose name contains it (sampling every thread
+// costs ~40k suspends per second and stretches the tick). APS5_SAMPLE_RAW=1 also writes
+// <out>.raw with one row per sample whose leaf is in the main image (guest code): tick, tid, name,
+// leaf offset, RAX, RCX and the 8 bytes at RAX when readable. The guest's label spins
+// (`mov rdx,[rax]; cmp rdx,rcx; jne`) then name the address and value they wait for.
 #include <windows.h>
 #include <tlhelp32.h>
 #include <algorithm>
@@ -25,6 +31,9 @@ struct Sample {
     DWORD tid;
     std::uint32_t frames;
     std::uint64_t pc[MaxFrames];
+    std::uint64_t tick = 0;
+    std::uint64_t rax = 0, rcx = 0, current = 0;
+    bool readable = false;
 };
 
 struct Tracked {
@@ -53,10 +62,14 @@ PRUNTIME_FUNCTION LookupFunction(DWORD64 pc, DWORD64* imageBase) {
     return const_cast<PRUNTIME_FUNCTION>(&moduleFunctions[low]);
 }
 
-std::uint32_t Walk(HANDLE thread, std::uint64_t* pc) {
+std::uint32_t Walk(HANDLE thread, std::uint64_t* pc, Sample* registers = nullptr) {
     CONTEXT context{};
     context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
     if (!GetThreadContext(thread, &context)) return 0;
+    if (registers != nullptr) {
+        registers->rax = context.Rax;
+        registers->rcx = context.Rcx;
+    }
     std::uint32_t count = 0;
     pc[count++] = context.Rip;
     while (count < MaxFrames) {
@@ -135,6 +148,14 @@ DWORD WINAPI SamplerMain(void*) {
         }
     }
     Sleep(static_cast<DWORD>(delay * 1000));
+    const char* threadFilter = std::getenv("APS5_SAMPLE_THREADS");
+    const bool raw = std::getenv("APS5_SAMPLE_RAW") != nullptr;
+    const auto mainBase = reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
+    std::uint64_t mainEnd = mainBase;
+    {
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(mainBase + reinterpret_cast<const IMAGE_DOS_HEADER*>(mainBase)->e_lfanew);
+        mainEnd = mainBase + nt->OptionalHeader.SizeOfImage;
+    }
 
     const DWORD self = GetCurrentThreadId();
     const DWORD process = GetCurrentProcessId();
@@ -158,6 +179,12 @@ DWORD WINAPI SamplerMain(void*) {
                 if (tracked.handle == nullptr) {
                     tracked.handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
                     if (tracked.handle != nullptr) names[entry.th32ThreadID] = ThreadName(tracked.handle);
+                    // A filtered-out thread keeps a null handle (never sampled); its name may still be
+                    // unset, so the filter is retried at each scan.
+                    if (tracked.handle != nullptr && threadFilter != nullptr && names[entry.th32ThreadID].find(threadFilter) == std::string::npos) {
+                        CloseHandle(tracked.handle);
+                        tracked.handle = nullptr;
+                    }
                 }
             }
             CloseHandle(snapshot);
@@ -178,8 +205,13 @@ DWORD WINAPI SamplerMain(void*) {
             tracked.cycles = cycles;
             Sample sample;
             sample.tid = tid;
+            sample.tick = ticks;
             if (SuspendThread(tracked.handle) == static_cast<DWORD>(-1)) continue;
-            sample.frames = Walk(tracked.handle, sample.pc);
+            sample.frames = Walk(tracked.handle, sample.pc, &sample);
+            if (raw && sample.frames != 0 && sample.pc[0] >= mainBase && sample.pc[0] < mainEnd) {
+                SIZE_T read = 0;
+                sample.readable = ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(sample.rax), &sample.current, sizeof(sample.current), &read) && read == sizeof(sample.current);
+            }
             ResumeThread(tracked.handle);
             ++suspended;
             if (sample.frames != 0) samples.push_back(sample);
@@ -201,6 +233,17 @@ DWORD WINAPI SamplerMain(void*) {
             std::fputc('\n', file);
         }
         std::fclose(file);
+    }
+    if (raw) {
+        if (auto* file = std::fopen((outPath + ".raw").c_str(), "w")) {
+            std::fprintf(file, "# tick\ttid\tname\tleaf\trax\trcx\t[rax]\n");
+            for (const auto& sample : samples) {
+                if (sample.frames == 0 || sample.pc[0] < mainBase || sample.pc[0] >= mainEnd) continue;
+                if (sample.readable) std::fprintf(file, "%llu\t%lu\t%s\tapp+%llx\t%llx\t%llx\t%llx\n", static_cast<unsigned long long>(sample.tick), sample.tid, names[sample.tid].c_str(), static_cast<unsigned long long>(sample.pc[0] - mainBase), static_cast<unsigned long long>(sample.rax), static_cast<unsigned long long>(sample.rcx), static_cast<unsigned long long>(sample.current));
+                else std::fprintf(file, "%llu\t%lu\t%s\tapp+%llx\t%llx\t%llx\t-\n", static_cast<unsigned long long>(sample.tick), sample.tid, names[sample.tid].c_str(), static_cast<unsigned long long>(sample.pc[0] - mainBase), static_cast<unsigned long long>(sample.rax), static_cast<unsigned long long>(sample.rcx));
+            }
+            std::fclose(file);
+        }
     }
     std::fprintf(stderr, "[sampler] %llu ticks, %llu thread samples, %zu stacks written to %s\n", static_cast<unsigned long long>(ticks), static_cast<unsigned long long>(suspended), stacks.size(), outPath.c_str());
     for (auto& [tid, tracked] : threads) {

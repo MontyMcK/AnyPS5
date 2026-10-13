@@ -163,6 +163,37 @@ void RunBdaExecutionTests(const Context& context) {
             read(guest + 1, 4, coherent, stops, 0x55443322, true);
         }
     }
+    {
+        // An index whose window covers only the middle range, as BdaResources' dense window leaves
+        // the exe image and the image mirrors outside it: lookups below and above the window must
+        // resolve through the full search, which is what keeps any window exact. A lookup clamped
+        // into the window's last bucket would select the middle range and fault Unmapped above it.
+        const std::array<Abi::Range, 3> windowed{{ranges[0], ranges[1], {guest + 0x2000, guest + 0x2003, first.DeviceAddress(), Abi::Read, 0}}};
+        const Abi::BucketHeader index{guest + 3, 4, 0};
+        const std::array<std::uint32_t, 2> bounds{1, 2};
+        Buffer indexed(context, sizeof(Abi::Header) + sizeof(windowed) + sizeof(index) + sizeof(bounds), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        const Abi::Header header{Abi::Version, static_cast<std::uint32_t>(windowed.size()), sizeof(Abi::Range), static_cast<std::uint32_t>(bounds.size() / 2u)};
+        auto* bytes = indexed.Bytes().data();
+        std::memcpy(bytes, &header, sizeof(header));
+        std::memcpy(bytes + sizeof(header), windowed.data(), sizeof(windowed));
+        std::memcpy(bytes + sizeof(header) + sizeof(windowed), &index, sizeof(index));
+        std::memcpy(bytes + sizeof(header) + sizeof(windowed) + sizeof(index), bounds.data(), sizeof(bounds));
+        const auto lookup = [&](std::uint64_t address, std::uint32_t expected) {
+            std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+            const std::uint32_t sentinel = 0xdeadbeef;
+            std::memcpy(output.Bytes().data(), &sentinel, sizeof(sentinel));
+            Pipeline pipeline(context, MakeBdaTestShader(address, 8), {&indexed, &fault, &output});
+            pipeline.Run(1);
+            Abi::Fault report{};
+            std::uint32_t result = 0;
+            std::memcpy(&report, fault.Bytes().data(), sizeof(report));
+            std::memcpy(&result, output.Bytes().data(), sizeof(result));
+            Require(report.state == Abi::FaultState::Empty && result == expected, "a BDA lookup outside the bucket window did not resolve through the full search");
+        };
+        lookup(guest + 1, 0x22);
+        lookup(guest + 4, 0x55);
+        lookup(guest + 0x2002, 0x33);
+    }
     ranges[0].permissions = 0;
     run(guest, 8, 0, Abi::FaultReason::Permission);
 }

@@ -337,9 +337,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             const auto commitPacket = (packet[0] >> 8u) & 0xffu;
             const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
             const std::array<std::uint32_t, 5> packetWords{packet[0], packet[1], packet[2], packet[3], packet[4]};
-            auto commit = [this, localDevice, compiledResult, keepVariant, attachVariant, shaderMemory, captured, registeredShader, groups, address, dataHit, cached, commitQueue, commitPacket, epoch, packetWords, codeOffset, userData, compute]() mutable {
+            const auto runToken = Graphics::Recorder::DispatchRunToken();
+            auto commit = [this, localDevice, compiledResult, keepVariant, attachVariant, shaderMemory, captured, registeredShader, groups, address, dataHit, cached, commitQueue, commitPacket, epoch, packetWords, codeOffset, userData, compute, runToken]() mutable {
                 DrawPipeline::FollowEpoch(epoch);
                 GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
+                // The dispatch run token of the packet, for the committer's recordDispatch.
+                struct RunToken {
+                    explicit RunToken(std::uint64_t token) { Graphics::Recorder::SetDispatchRunToken(token); }
+                    ~RunToken() { Graphics::Recorder::SetDispatchRunToken(0); }
+                } runTokenScope{runToken};
                 const auto& compiled = *compiledResult;
                 std::vector<Graphics::GuestMemorySnapshot> snapshots;
                 snapshots.reserve(captured.size());

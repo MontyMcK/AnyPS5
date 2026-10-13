@@ -702,6 +702,24 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags) {
     return 0;
 }
 
+// Whether every page of the range is committed (Windows; elsewhere the protect path never commits).
+static bool AllCommitted(const void* pointer, std::size_t bytes) {
+#ifdef _WIN32
+    auto cursor = reinterpret_cast<std::uintptr_t>(pointer);
+    const auto end = cursor + bytes;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(reinterpret_cast<void*>(cursor), &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_COMMIT) return false;
+        cursor = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+    }
+    return true;
+#else
+    static_cast<void>(pointer);
+    static_cast<void>(bytes);
+    return true;
+#endif
+}
+
 int DoMprotect(const void* addr, size_t len, int prot) {
     Trace("protect %p+0x%zx prot=0x%x", addr, len, prot);
     const auto address = reinterpret_cast<std::uintptr_t>(addr);
@@ -724,9 +742,22 @@ int DoMprotect(const void* addr, size_t len, int prot) {
 #else
     mutation.RegisterMainImage();
 #endif
-    mutation.Protect(pointer, bytes, (prot & 3) != 0, (prot & 2) != 0, [&] {
+    const auto apply = [&] {
         if (mprotect(const_cast<void*>(pointer), bytes, nativeProtection) != 0) throw std::system_error(errno, std::generic_category(), "mprotect failed");
-    });
+    };
+    // APS5_KEEP_SAME_PROTECT=1: a protection whose readable/writable pair the registry already
+    // holds for the whole range, over pages that are all committed (the host mprotect would
+    // otherwise commit some, which changes their contents), changes nothing the registry
+    // describes: only the host protection is applied. The entries are not split (which would
+    // retire host imports of them), GPU work holding the range is not waited for, and the
+    // mutation moves no generation, so address spaces built on these entries stay valid.
+    const bool readableFlag = (prot & 3) != 0;
+    const bool writableFlag = (prot & 2) != 0;
+    if (mutation.Carries(pointer, bytes, readableFlag, writableFlag) && AllCommitted(pointer, bytes)) {
+        apply();
+    } else {
+        mutation.Protect(pointer, bytes, readableFlag, writableFlag, apply);
+    }
     RecordProtection(pointer, bytes, prot);
     return 0;
 }

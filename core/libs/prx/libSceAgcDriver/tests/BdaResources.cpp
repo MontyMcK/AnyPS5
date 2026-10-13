@@ -1,4 +1,5 @@
 #include "BdaTests.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -351,6 +352,101 @@ void addressTemplateTests(const Context& context, const BdaTestAccess& access) {
     Require(counts.hits >= 3 && counts.detached >= 1 && counts.movedBuffers >= 1 && counts.misses[static_cast<std::size_t>(ShaderResources::AddressMiss::Replaced)] >= 1 && counts.misses[static_cast<std::size_t>(ShaderResources::AddressMiss::MovedOutside)] >= 1, "address template counters missed the uses");
 }
 
+// The lookup index over a low cluster (the exe image), a heap cluster and an image mirror, as the
+// race's tables are laid out: the dense window covers the heap alone, the whole-span shape is the
+// one every table had before, and a table built here carries the shape its builder chose with
+// every range inside the [low, high) of each bucket it intersects, which is what the lookup's
+// narrowing relies on (a lookup outside the window searches every range; BdaExecution pins that).
+void bucketShapeTests(const Context& context, const BdaTestAccess& access) {
+    using Range = ShaderRecompiler::BdaAbi::Range;
+    constexpr std::uint64_t heap = 0x10'0000'0000ull;
+    constexpr std::uint64_t mirror = 0x7ff6'b000'0000ull;
+    const auto make = [](std::size_t low, std::size_t heaped, std::size_t mirrors) {
+        std::vector<Range> ranges;
+        const auto add = [&](std::uint64_t begin, std::uint64_t bytes) { ranges.push_back({begin, begin + bytes, 0x100000000000ull + ranges.size() * 0x10000u, ShaderRecompiler::BdaAbi::Read, 0}); };
+        for (std::size_t i = 0; i < low; ++i) add(0x400000u + i * 0x20000u, 0x10000);
+        for (std::size_t i = 0; i < heaped; ++i) add(heap + i * 0x100000u, 0x8000);
+        for (std::size_t i = 0; i < mirrors; ++i) add(mirror + i * 0x1000000u, 0x400000);
+        return ranges;
+    };
+    // Written out apart from the builder: the smallest shift from 12 whose buckets over
+    // [first & ~mask, last) number at most `limit`.
+    const auto fitted = [](std::uint64_t first, std::uint64_t last, std::size_t limit) {
+        for (std::uint32_t shift = 12; shift <= 48; ++shift) {
+            const auto mask = (std::uint64_t{1} << shift) - 1u;
+            const auto count = (last - (first & ~mask) + mask) >> shift;
+            if (count <= limit) return BdaBucketWindow{first & ~mask, shift, static_cast<std::size_t>(count), false};
+        }
+        return BdaBucketWindow{};
+    };
+    const auto same = [](const BdaBucketWindow& left, const BdaBucketWindow& right) { return left.base == right.base && left.shift == right.shift && left.count == right.count && left.windowed == right.windowed; };
+    const auto ranges = make(6, 20, 1);
+    const auto whole = BdaBucketShape(ranges, 4096, false);
+    Require(same(whole, fitted(ranges.front().begin, ranges.back().end, 4096)) && whole.shift == 35, "the whole-span bucket shape changed");
+    const auto dense = BdaBucketShape(ranges, 4096, true);
+    const auto heapEnd = ranges[25].end;
+    Require(dense.windowed && same(dense, BdaBucketWindow{heap, 13, (heapEnd - heap + 0x1fffu) >> 13u, true}), "the dense window does not fit the heap cluster");
+    Require(dense.base <= ranges[6].begin && dense.base + (static_cast<std::uint64_t>(dense.count) << dense.shift) >= heapEnd && dense.base >= ranges[5].end, "the dense window does not cover exactly the heap cluster");
+    Require(same(BdaBucketShape(ranges, 1024, true), BdaBucketWindow{heap, 15, (heapEnd - heap + 0x7fffu) >> 15u, true}), "the dense window ignores the bucket limit");
+    // The mirrors never take the window, even when they hold the most entries.
+    const auto mirrored = make(0, 17, 20);
+    const auto skipped = BdaBucketShape(mirrored, 4096, true);
+    Require(skipped.windowed && skipped.base == heap && skipped.base + (static_cast<std::uint64_t>(skipped.count) << skipped.shift) < mirror, "the dense window covered the image mirrors");
+    // Equal entries: the smaller span, here the later cluster (16 low ranges over ~15 MiB, 16 heap
+    // ranges over ~1 MiB).
+    std::vector<Range> tie;
+    for (std::uint64_t i = 0; i < 16; ++i) tie.push_back({0x400000u + i * 0x100000u, 0x400000u + i * 0x100000u + 0x1000u, 0x100000000000ull, ShaderRecompiler::BdaAbi::Read, 0});
+    for (std::uint64_t i = 0; i < 16; ++i) tie.push_back({heap + i * 0x10000u, heap + i * 0x10000u + 0x1000u, 0x100000000000ull, ShaderRecompiler::BdaAbi::Read, 0});
+    const auto tied = BdaBucketShape(tie, 4096, true);
+    Require(tied.windowed && tied.base == heap && tied.shift == 12 && tied.count == 0xf1u, "a tie between clusters did not take the smaller span");
+    // No cluster of 16: the whole-span shape, not a window over a handful of entries.
+    const auto scattered = make(8, 8, 1);
+    Require(same(BdaBucketShape(scattered, 4096, true), BdaBucketShape(scattered, 4096, false)) && !BdaBucketShape(scattered, 4096, true).windowed, "a table with no 16-entry cluster got a dense window");
+    Require(BdaBucketShape(make(4, 11, 0), 4096, true).count == 0 && BdaBucketShape(make(4, 11, 0), 4096, false).count == 0 && BdaBucketShape(ranges, 0, true).count == 0, "a small table or APS5_BDA_BUCKETS=0 got an index");
+
+    // A table built from snapshots at those addresses (snapshots map apart on the device, so no
+    // two join) carries the shape for the flag as the builder read it.
+    const std::array<std::byte, 8> bytes{};
+    std::vector<GuestMemorySnapshot> snapshots;
+    for (const auto& range : ranges) snapshots.push_back({range.begin, bytes});
+    ShaderRecompiler::RecompileResult shader;
+    shader.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    shader.bindings = {binding(Role::BdaPagetable, 4), binding(Role::FaultBuffer, 5)};
+    const CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &shader, 0};
+    const bool denseOn = BdaDenseBuckets();
+    {
+        ShaderResources resources(context, compiled, snapshots);
+        const auto table = access.bytes(access.descriptor(4).buffer);
+        ShaderRecompiler::BdaAbi::Header header{};
+        std::memcpy(&header, table.data(), sizeof(header));
+        Require(header.version == ShaderRecompiler::BdaAbi::Version && header.count >= ranges.size(), "the snapshot table lost or joined ranges");
+        std::vector<Range> built(header.count);
+        std::memcpy(built.data(), table.data() + sizeof(header), built.size() * sizeof(Range));
+        for (const auto& range : ranges) Require(std::any_of(built.begin(), built.end(), [&](const Range& entry) { return entry.begin == range.begin && entry.end == range.begin + bytes.size(); }), "a snapshot range is missing from the table");
+        const auto expected = BdaBucketShape(built, BdaBucketLimit(), denseOn);
+        Require(header.buckets == expected.count && expected.count != 0 && expected.windowed == denseOn, "the table's index does not have the builder's shape");
+        ShaderRecompiler::BdaAbi::BucketHeader index{};
+        const auto at = sizeof(header) + built.size() * sizeof(Range);
+        Require(table.size() >= at + sizeof(index) + header.buckets * 2u * sizeof(std::uint32_t), "the table is shorter than its index");
+        std::memcpy(&index, table.data() + at, sizeof(index));
+        Require(index.base == expected.base && index.shift == expected.shift && index.reserved == 0, "the table's index window differs from its shape");
+        std::vector<std::uint32_t> bounds(header.buckets * 2u);
+        std::memcpy(bounds.data(), table.data() + at + sizeof(index), bounds.size() * sizeof(std::uint32_t));
+        for (std::uint32_t bucket = 0; bucket < header.buckets; ++bucket) {
+            const auto start = index.base + (static_cast<std::uint64_t>(bucket) << index.shift);
+            const auto stop = start + (std::uint64_t{1} << index.shift);
+            const auto low = bounds[bucket * 2u], high = bounds[bucket * 2u + 1u];
+            Require(low <= high && high <= header.count, "a bucket's bounds are out of order");
+            for (std::uint32_t entry = 0; entry < header.count; ++entry) {
+                const bool intersects = built[entry].end > start && built[entry].begin < stop;
+                Require(!intersects || (low <= entry && entry < high), "a range is missing from a bucket it intersects");
+            }
+        }
+        resources.WriteBack();
+    }
+    std::cout << "BDA bucket index tested with bda_dense_buckets " << (denseOn ? "on" : "off") << '\n';
+}
+
 }
 
 void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
@@ -427,6 +523,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
         std::memset(fault.data(), 0, fault.size());
         resources.WriteBack();
     }
+    bucketShapeTests(context, access);
     {
         auto writable = binding(Role::GuestBuffers, 6);
         writable.guestDescriptor = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32) & 0xffffu, sizeof(guest), 0x31000000u};

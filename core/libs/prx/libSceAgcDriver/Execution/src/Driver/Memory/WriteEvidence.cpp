@@ -2,7 +2,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -151,6 +156,19 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
         reason = &ValidateCounters::syncedShadow;
         return Policy::Sync;
     }
+    // Live `label_known` (env APS5_LABEL_KNOWN): a dword whose pending writer is a recorded label
+    // store (the title builds V#s and BVH headers with WRITE_DATA right before the dispatches that
+    // read them) takes the store's value instead of a GPU round trip (Recorder::CurrentLabelDword).
+    // Live `label_known_verify` waits anyway and counts mismatches ([capture] known-value words).
+    static const bool labelKnownDefault = std::getenv("APS5_LABEL_KNOWN") != nullptr;
+    if (bytes == sizeof(std::uint32_t) && known.size() == bytes && Graphics::LiveFlag("label_known", labelKnownDefault)) {
+        std::uint32_t value = 0;
+        if (Graphics::Recorder::CurrentLabelDword(address, value)) {
+            std::memcpy(known.data(), &value, sizeof(value));
+            knownValueReads.fetch_add(1, std::memory_order_relaxed);
+            return Graphics::LiveFlag("label_known_verify", false) ? Policy::VerifyKnownValue : Policy::KnownValue;
+        }
+    }
     reason = &ValidateCounters::syncedOff;
     if (!writeEvidenceEnabled()) return Policy::Sync;
     const auto writer = newestWriter(address, address + bytes);
@@ -226,7 +244,42 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
     std::uint64_t ValidateCounters::*reason = nullptr;
     PendingView pending;
     pending.Load();
-    return Get().classifyPendingWrite(address, bytes, reason, pending, known);
+    const auto policy = Get().classifyPendingWrite(address, bytes, reason, pending, known);
+    countCaptureQuery(policy, reason, bytes);
+    return policy;
+}
+
+void Driver::countCaptureQuery(ShaderMemory::PendingWrite policy, std::uint64_t ValidateCounters::*reason, std::size_t bytes) {
+    // APS5_PROFILE_DRAW: why capture reads over pending GPU writes waited ([capsync], 10 s): by the
+    // first classifyPendingWrite rule that refused a skip, next to the reads it answered without a
+    // wait (known values, raw on evidence). Word-sized reads and larger ones are counted apart.
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile || policy == ShaderMemory::PendingWrite::None) return;
+    enum Slot : std::size_t { Shadow, Off, NoWriter, Foreign, LargeRange, Label, Evidence, WriterChanged, Sample, Image, Other, Known, Raw, Count };
+    static std::array<std::atomic<std::uint64_t>, Count * 2> counts{};
+    static std::atomic<std::int64_t> last{0};
+    std::size_t slot = Other;
+    using Policy = ShaderMemory::PendingWrite;
+    if (policy == Policy::KnownValue || policy == Policy::VerifyKnownValue) slot = Known;
+    else if (policy == Policy::Raw || policy == Policy::VerifyRaw) slot = Raw;
+    else if (reason == &ValidateCounters::syncedShadow) slot = Shadow;
+    else if (reason == &ValidateCounters::syncedOff) slot = Off;
+    else if (reason == &ValidateCounters::syncedNoWriter) slot = NoWriter;
+    else if (reason == &ValidateCounters::syncedForeign) slot = Foreign;
+    else if (reason == &ValidateCounters::syncedLargeRange) slot = LargeRange;
+    else if (reason == &ValidateCounters::syncedLabel) slot = Label;
+    else if (reason == &ValidateCounters::syncedEvidence) slot = Evidence;
+    else if (reason == &ValidateCounters::syncedWriterChanged) slot = WriterChanged;
+    else if (reason == &ValidateCounters::syncedSample) slot = Sample;
+    else if (reason == &ValidateCounters::syncedImage) slot = Image;
+    counts[slot + (bytes <= sizeof(std::uint32_t) ? 0 : Count)].fetch_add(1, std::memory_order_relaxed);
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto previous = last.load(std::memory_order_relaxed);
+    if (now - previous < 10 || !last.compare_exchange_strong(previous, now, std::memory_order_relaxed)) return;
+    std::array<unsigned long long, Count * 2> taken{};
+    for (std::size_t i = 0; i < taken.size(); ++i) taken[i] = counts[i].exchange(0, std::memory_order_relaxed);
+    std::fprintf(stderr, "[capsync] capture reads over pending GPU writes (10 s; dword/larger): sync by reason: shadow %llu/%llu, label_known off %llu/%llu, no writer %llu/%llu, foreign writer %llu/%llu, large range %llu/%llu, label %llu/%llu, evidence short %llu/%llu, writer changed %llu/%llu, sampled %llu/%llu, image %llu/%llu, other %llu/%llu; no wait: known value %llu/%llu, raw %llu/%llu\n",
+                 taken[Shadow], taken[Count + Shadow], taken[Off], taken[Count + Off], taken[NoWriter], taken[Count + NoWriter], taken[Foreign], taken[Count + Foreign], taken[LargeRange], taken[Count + LargeRange], taken[Label], taken[Count + Label], taken[Evidence], taken[Count + Evidence], taken[WriterChanged], taken[Count + WriterChanged], taken[Sample], taken[Count + Sample], taken[Image], taken[Count + Image], taken[Other], taken[Count + Other], taken[Known], taken[Count + Known], taken[Raw], taken[Count + Raw]);
 }
 
 }

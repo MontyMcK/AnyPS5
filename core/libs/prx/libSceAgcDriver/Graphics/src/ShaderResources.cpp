@@ -1412,7 +1412,10 @@ void ShaderResources::buildComplete() {
         timing.uploadMs += phase(BuildPhase::Upload);
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
-        if (bda) bda->SetMayWrite(storesThroughAddresses);
+        if (bda) {
+            bda->SetMayWrite(storesThroughAddresses);
+            bda->SetCompute(!drawBuild);
+        }
         phase(BuildPhase::Bda);
         if (_set != VK_NULL_HANDLE) {
             // One update call for the whole set: the info arrays are sized up front so every write's
@@ -1552,6 +1555,116 @@ void mixDataWords(std::uint64_t& hash, std::span<const std::uint32_t> words) {
 std::atomic<std::uint64_t> resourceCacheFinds{0};
 std::atomic<std::uint64_t> resourceCacheTouches{0};
 
+// APS5_PROFILE_DRAW: noteReusable's verdicts on draw builds and the stream hits' copies
+// (ShaderResources::ReuseCounters). Relaxed atomics: one add per build or streamed range.
+constexpr std::size_t StreamRefusalCount = static_cast<std::size_t>(GuestBufferMemory::StreamRefusal::Count);
+struct ReuseCounts {
+    std::atomic<std::uint64_t> builds{0};
+    std::atomic<std::uint64_t> inPlace{0};
+    std::atomic<std::uint64_t> streamMade{0};
+    std::atomic<std::uint64_t> streamableOff{0};
+    std::atomic<std::uint64_t> completion{0};
+    std::atomic<std::uint64_t> perUseTexture{0};
+    std::atomic<std::uint64_t> largeData{0};
+    std::array<std::atomic<std::uint64_t>, StreamRefusalCount> copyRefused{};
+    std::atomic<std::uint64_t> straddled{0};
+    std::atomic<std::uint64_t> noSerial{0};
+    std::atomic<std::uint64_t> copiedRanges{0};
+    std::atomic<std::uint64_t> copiedBytes{0};
+    std::atomic<std::uint64_t> streamedRanges{0};
+    std::atomic<std::uint64_t> streamedBytes{0};
+    std::atomic<std::uint64_t> verified{0};
+};
+
+ReuseCounts& Reuses() {
+    static ReuseCounts counts;
+    return counts;
+}
+
+void countCopied(std::span<const std::pair<std::uint64_t, std::uint64_t>> copied) {
+    std::uint64_t bytes = 0;
+    for (const auto& [begin, end] : copied) bytes += end - begin;
+    Reuses().copiedRanges.fetch_add(copied.size(), std::memory_order_relaxed);
+    Reuses().copiedBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+}
+
+bool ShaderResources::StreamRing() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_STREAM_RING");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return LiveFlag("stream_ring", enabled);
+}
+
+std::size_t ShaderResources::StreamLimit() {
+    // The snapshot ring hands out slices of at most 256 KiB (Recorder::AllocateDrawSnapshot); the
+    // default keeps a hit's copies to the small constant ranges the design targets.
+    static const std::size_t limit = [] {
+        const char* value = std::getenv("APS5_STREAM_RING_MAX_KIB");
+        const long kib = value != nullptr ? std::strtol(value, nullptr, 10) : 16;
+        return static_cast<std::size_t>(std::clamp<long>(kib, 1, 256)) * 1024u;
+    }();
+    return limit;
+}
+
+ShaderResources::ReuseStats ShaderResources::ReuseCounters() {
+    auto& counts = Reuses();
+    const auto load = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+    ReuseStats stats;
+    stats.builds = load(counts.builds);
+    stats.inPlace = load(counts.inPlace);
+    stats.streamMade = load(counts.streamMade);
+    stats.streamableOff = load(counts.streamableOff);
+    stats.completion = load(counts.completion);
+    stats.perUseTexture = load(counts.perUseTexture);
+    stats.largeData = load(counts.largeData);
+    for (std::size_t index = 0; index < StreamRefusalCount; ++index) stats.copyRefused[index] = load(counts.copyRefused[index]);
+    stats.straddled = load(counts.straddled);
+    stats.noSerial = load(counts.noSerial);
+    stats.copiedRanges = load(counts.copiedRanges);
+    stats.copiedBytes = load(counts.copiedBytes);
+    stats.streamedRanges = load(counts.streamedRanges);
+    stats.streamedBytes = load(counts.streamedBytes);
+    stats.verified = load(counts.verified);
+    return stats;
+}
+
+void ShaderResources::clearStreamed() {
+    if (!streamed) return;
+    streamed = false;
+    for (auto& allocation : allocations) allocation.streamed = false;
+}
+
+bool ShaderResources::tagStreamed(std::span<const std::pair<std::uint64_t, std::uint64_t>> copied) {
+    // Every guest buffer lies inside the one merged region its descriptor range made
+    // (addDescriptorRegion widens it to DWORDs; UploadPrepare merges overlaps), so one that only
+    // overlaps a copied region cannot happen; it is refused rather than half rebound.
+    bool any = false;
+    for (auto& allocation : allocations) {
+        if (!allocation.guest || allocation.size == 0) continue;
+        const auto begin = allocation.address;
+        const auto end = allocation.address + allocation.size;
+        const auto inside = std::find_if(copied.begin(), copied.end(), [&](const auto& range) { return begin >= range.first && end <= range.second; });
+        if (inside == copied.end()) {
+            if (std::any_of(copied.begin(), copied.end(), [&](const auto& range) { return begin < range.second && range.first < end; })) {
+                clearStreamed();
+                return false;
+            }
+            continue;
+        }
+        // StreamableRegions refused every region a written element lies in (WritesOverlap).
+        if (allocation.written) {
+            clearStreamed();
+            return false;
+        }
+        allocation.streamed = true;
+        streamed = true;
+        any = true;
+    }
+    if (!any) clearStreamed();
+    return any;
 }
 
 void ShaderResources::noteReusable() {
@@ -1560,14 +1673,54 @@ void ShaderResources::noteReusable() {
     reusable = false;
     addressReusable = false;
     directRegions.clear();
+    clearStreamed();
+    // The [reuse] verdict of a draw build (dispatches are not counted).
+    const bool counted = drawBuild && BuildProfiled();
+    auto& counts = Reuses();
+    const auto count = [&](std::atomic<std::uint64_t>& verdict) {
+        if (!counted) return;
+        counts.builds.fetch_add(1, std::memory_order_relaxed);
+        verdict.fetch_add(1, std::memory_order_relaxed);
+    };
     if (NeedsCompletion() || HoldsLease()) {
+        count(counts.completion);
         noteAddressReusable();
         return;
     }
-    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
-    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) return;
-    const auto regions = guestMemory.DirectRegions();
-    if (!regions.has_value()) return;
+    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) {
+        count(counts.perUseTexture);
+        return;
+    }
+    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) {
+        count(counts.largeData);
+        return;
+    }
+    auto regions = guestMemory.DirectRegions();
+    std::optional<GuestBufferMemory::StreamRegions> stream;
+    if (!regions.has_value()) {
+        // A region was copied through the CPU. A draw build may still become a stream template
+        // (see StreamRing); with the switch off the same predicate runs for the [reuse] count only,
+        // so a baseline run measures the share of builds a stream template would serve.
+        if (!drawBuild) return;
+        const bool enabled = StreamRing();
+        if (!enabled && !counted) return;
+        auto why = GuestBufferMemory::StreamRefusal::None;
+        stream = guestMemory.StreamableRegions(StreamLimit(), &why);
+        if (!stream.has_value()) {
+            count(counts.copyRefused[static_cast<std::size_t>(why)]);
+            return;
+        }
+        if (!enabled) {
+            count(counts.streamableOff);
+            if (counted) countCopied(stream->copied);
+            return;
+        }
+        if (!tagStreamed(stream->copied)) {
+            count(counts.straddled);
+            return;
+        }
+        regions = std::move(stream->direct);
+    }
     for (const auto& [begin, end] : *regions) {
         // No reconcile here: the upload just took these imports, and the set is about to be recorded
         // against them.
@@ -1575,10 +1728,17 @@ void ShaderResources::noteReusable() {
         // Read-only image mirrors (exe ranges) are as stable as imports; their serials have the top
         // bit set, so the two spaces never collide.
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
-        if (serial == 0) return;
+        if (serial == 0) {
+            // Not reusable after all: no stream tag may outlive the refusal.
+            clearStreamed();
+            count(counts.noSerial);
+            return;
+        }
         directRegions.push_back({begin, end, serial});
     }
     reusable = true;
+    count(streamed ? counts.streamMade : counts.inPlace);
+    if (counted && streamed) countCopied(stream->copied);
 }
 
 namespace {
@@ -3185,7 +3345,28 @@ ShaderResources::SpeculationMiss ShaderResources::ProveSpeculated(const ProofSpe
     return failure == ProofFailure::None ? Miss::None : Miss::Tail;
 }
 
+namespace {
+
+// Whether a DCC key store or label store queued in the open batch, a label this thread deferred but
+// has not recorded yet (the flush hook would record it before a hooked read), or a recorded label
+// still pending in the batch overlaps a streamed element's range (movedBuffers, MovedStillFree):
+// the stream copy is a raw memcpy, so it must refuse every case the hooked read would act on.
+bool StreamStoreQueued(const Recorder& recorder, std::uint64_t begin, std::size_t bytes) {
+    return (recorder.HasQueuedKeyStores() && recorder.QueuedKeyStoreOverlaps(begin, bytes)) || (recorder.HasQueuedStores() && recorder.QueuedStoreOverlaps(begin, bytes)) || Recorder::QueuedLabelsOverlap(begin, bytes) || recorder.PendingLabelIn(begin, bytes);
+}
+
+}
+
 bool ShaderResources::MovedStillFree(std::span<const MovedBuffer> moved, Recorder* recorder, const MovedProof* proof) const {
+    // Streamed elements refuse queued stores at commit whatever the token proof says (movedBuffers
+    // ran on the prep thread without a recorder).
+    if (streamed && recorder != nullptr) {
+        for (const auto& entry : moved) {
+            if (!entry.words.empty() || entry.allocation >= allocations.size() || !allocations[entry.allocation].streamed) continue;
+            const auto& item = allocations[entry.allocation];
+            if (StreamStoreQueued(*recorder, entry.address - item.adjustment, static_cast<std::size_t>(GuestBufferMemory::ViewBytes(entry.size, item.adjustment)))) return false;
+        }
+    }
     const bool tokens = DrawTokensEnabled();
     const auto full = [&] {
         for (const auto& entry : moved) {
@@ -4393,14 +4574,25 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::movedB
                     if (empty) continue;
                     return std::nullopt;
                 }
-                if (item.address == address && item.size == size) continue;
+                // A streamed element (stream template, see StreamRing) stays in the moved list at its
+                // own address: the template's copy of it is stale by design, so the hit copies the
+                // current bytes through the same refusals as any moved read-only buffer. A dataOnly
+                // use (which rebinds nothing) refuses it below.
+                if (item.address == address && item.size == size && !item.streamed) continue;
                 if (dataOnly) return std::nullopt;
                 const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
                 if (written || empty || item.written || size > context.limits.maxStorageBufferRange) return std::nullopt;
                 const auto begin = address - item.adjustment;
                 const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
+                // Bounds a hit's per-draw copy when a later V# under the same key is large: the draw
+                // builds as before instead.
+                if (item.streamed && bytes > StreamLimit()) return std::nullopt;
                 if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) return std::nullopt;
                 if (guestMemory.WritesOverlap(begin, bytes) || (recorder != nullptr && recorder->PendingWriteOverlaps(begin, bytes)) || PendingStorageOverlaps(begin, bytes, nullptr) || AnyShadowedOverlaps(begin, bytes)) return std::nullopt;
+                // The build a stream hit replaces may copy the range on the GPU (a misaligned region
+                // inside an import), after the queued DCC key and label stores over it land
+                // (recordGpuCopies); the hit's CPU copy cannot wait for those, so it refuses them.
+                if (item.streamed && recorder != nullptr && StreamStoreQueued(*recorder, begin, bytes)) return std::nullopt;
                 moved.push_back({index, address, static_cast<std::size_t>(size)});
             }
         }
@@ -4409,6 +4601,29 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::movedB
 }
 
 constexpr std::size_t FreshCopyLimit = 4096;
+
+namespace {
+
+// Debug aid: APS5_VERIFY_STREAM_RING=1 compares every stream hit's copy with a read of the same
+// range through the flush hook (what the build the hit replaces would have read) and aborts on a
+// difference: a case the moved checks let through that the hook would have acted on.
+bool VerifyStreamRing() {
+    static const bool enabled = std::getenv("APS5_VERIFY_STREAM_RING") != nullptr;
+    return enabled;
+}
+
+void VerifyStreamedCopy(std::uint64_t begin, std::span<const std::byte> copy) {
+    std::vector<std::byte> hooked(copy.size());
+    GuestMemory::Read(begin, hooked);
+    if (std::memcmp(hooked.data(), copy.data(), copy.size()) != 0) {
+        std::fprintf(stderr, "[reuse] APS5_VERIFY_STREAM_RING: a stream hit's copy of 0x%llx+0x%zx differs from the hooked read\n", static_cast<unsigned long long>(begin), copy.size());
+        std::fflush(stderr);
+        std::abort();
+    }
+    Reuses().verified.fetch_add(1, std::memory_order_relaxed);
+}
+
+}
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if (_set == VK_NULL_HANDLE || usesBda) return {};
@@ -4447,6 +4662,35 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
+        if (item.streamed && override != moved.end()) {
+            // A stream hit: always a fresh copy, with no write tracking or snapshot reuse (the
+            // range is usually outside the watched arena, where CollectWrites has no generation to
+            // offer), taken here under the commit's device lock in stream order, where the build it
+            // replaces copied the same range. movedBuffers refused every case the flush hook would
+            // have acted on; the slice lives until the batch completed (recorder.Keep below).
+            VkDeviceSize offset = 0;
+            std::shared_ptr<Buffer> buffer;
+            if (Recorder::SnapshotRingEnabled()) {
+                auto slice = recorder.AllocateDrawSnapshot(bytes);
+                buffer = std::move(slice.buffer);
+                offset = slice.offset;
+            }
+            if (buffer == nullptr) {
+                buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+                offset = 0;
+            }
+            const auto copy = buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes);
+            std::memcpy(copy.data(), reinterpret_cast<const void*>(begin), bytes);
+            if (VerifyStreamRing()) VerifyStreamedCopy(begin, copy);
+            if (BuildProfiled()) {
+                Reuses().streamedRanges.fetch_add(1, std::memory_order_relaxed);
+                Reuses().streamedBytes.fetch_add(bytes, std::memory_order_relaxed);
+            }
+            selected.push_back(index);
+            result->snapshots.push_back({begin, std::move(buffer), offset, bytes});
+            CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
+            continue;
+        }
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto generation = GuestMemory::CollectWrites(begin, bytes);
         VkDeviceSize offset = 0;
@@ -4527,6 +4771,99 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
     if (_set == VK_NULL_HANDLE) return;
     context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
+}
+
+void ShaderResources::BindSet(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, VkDescriptorSet set) const {
+    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &set, 0, nullptr);
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::DataBindings(Recorder& recorder, const CompiledShader& shader, bool keyChecked, bool& usable) const {
+    usable = false;
+    if (_set == VK_NULL_HANDLE || shader.program == nullptr || context.descriptorCache == nullptr || !Recorder::SnapshotRingEnabled()) return {};
+    const auto& program = *shader.program;
+    if (program.bindings.size() != bindings.size()) return {};
+    if (!keyChecked && (refreshResourceKey.empty() || !MatchesContentKey(shader, refreshResourceKey))) return {};
+    auto result = std::make_shared<DrawBindings>();
+    thread_local std::vector<std::size_t>* selectedSlot = nullptr;
+    auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
+    selected.clear();
+    for (std::size_t index = 0; index < program.bindings.size(); ++index) {
+        const auto& binding = program.bindings[index];
+        if (!DataRole(binding.role)) continue;
+        if (bindings[index].allocations.size() != 1) return {};
+        const auto allocationIndex = bindings[index].allocations.front();
+        const auto& allocation = allocations[allocationIndex];
+        const auto size = binding.guestDescriptor.size() * sizeof(std::uint32_t);
+        if (allocation.buffer == nullptr || allocation.guest || allocation.size != size || size > MaxRefreshBytes) return {};
+        if (allocation.dataWords.size() == binding.guestDescriptor.size() && std::equal(allocation.dataWords.begin(), allocation.dataWords.end(), binding.guestDescriptor.begin())) continue;
+        if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData) ValidateRuntimeResources(shader, binding.guestDescriptor);
+        auto slice = recorder.AllocateDrawSnapshot(size);
+        if (slice.buffer == nullptr) return {};
+        auto* bytes = slice.buffer->Bytes().data() + slice.offset;
+        std::memcpy(bytes, binding.guestDescriptor.data(), size);
+        for (const auto& patch : dataPatches) {
+            if (patch.allocation == allocationIndex && patch.byte < size) bytes[patch.byte] = static_cast<std::byte>(patch.adjustment);
+        }
+        selected.push_back(allocationIndex);
+        result->snapshots.push_back({0, std::move(slice.buffer), slice.offset, size});
+    }
+    usable = true;
+    if (selected.empty()) return {};
+    thread_local std::vector<VkDescriptorPoolSize>* sizesSlot = nullptr;
+    auto& sizes = ShaderRecompiler::ThreadOwned(sizesSlot);
+    sizes.clear();
+    for (const auto& binding : bindings) {
+        const auto type = binding.layout.descriptorType;
+        const auto found = std::find_if(sizes.begin(), sizes.end(), [type](const VkDescriptorPoolSize& size) { return size.type == type; });
+        if (found != sizes.end()) found->descriptorCount += binding.layout.descriptorCount;
+        else sizes.push_back({type, binding.layout.descriptorCount});
+    }
+    result->cache = context.descriptorCache;
+    result->allocation = result->cache->AllocateRewritten(_layout, sizes);
+    result->layout = _layout;
+    if (result->allocation.set == VK_NULL_HANDLE) {
+        usable = false;
+        return {};
+    }
+    thread_local std::vector<VkCopyDescriptorSet>* copiesSlot = nullptr;
+    auto& copies = ShaderRecompiler::ThreadOwned(copiesSlot);
+    copies.clear();
+    for (const auto& binding : bindings) {
+        VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
+        copy.srcSet = _set;
+        copy.srcBinding = binding.layout.binding;
+        copy.dstSet = result->allocation.set;
+        copy.dstBinding = binding.layout.binding;
+        copy.descriptorCount = binding.layout.descriptorCount;
+        copies.push_back(copy);
+    }
+    const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
+    update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
+    thread_local std::vector<VkDescriptorBufferInfo>* infosSlot = nullptr;
+    auto& infos = ShaderRecompiler::ThreadOwned(infosSlot);
+    infos.clear();
+    infos.reserve(selected.size());
+    for (const auto& snapshot : result->snapshots) infos.push_back({snapshot.buffer->Handle(), snapshot.offset, snapshot.bytes});
+    thread_local std::vector<VkWriteDescriptorSet>* writesSlot = nullptr;
+    auto& writes = ShaderRecompiler::ThreadOwned(writesSlot);
+    writes.clear();
+    for (const auto& binding : bindings) {
+        for (std::size_t element = 0; element < binding.allocations.size(); ++element) {
+            const auto found = std::find(selected.begin(), selected.end(), binding.allocations[element]);
+            if (found == selected.end()) continue;
+            VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+            write.dstSet = result->allocation.set;
+            write.dstBinding = binding.layout.binding;
+            write.dstArrayElement = static_cast<std::uint32_t>(element);
+            write.descriptorCount = 1;
+            write.descriptorType = binding.layout.descriptorType;
+            write.pBufferInfo = &infos[static_cast<std::size_t>(found - selected.begin())];
+            writes.push_back(write);
+        }
+    }
+    update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    recorder.Keep(result);
+    return result;
 }
 
 namespace {

@@ -15,10 +15,12 @@ if ($InPlaceDrawInputs -ge 0) {
 }
 $sources = Get-ChildItem -LiteralPath "$repoRoot\core\shader\recompiler" -File -Recurse | Sort-Object FullName | Get-FileHash -Algorithm SHA256 | Select-Object Path,Hash
 $sources | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $output 'source-hashes.json')
-$binaries = Get-ChildItem -LiteralPath "$repoRoot\build\core\libs\libs" -Filter '*.prx' -File | Sort-Object Name | Get-FileHash -Algorithm SHA256 | Select-Object Path,Hash
+# APS5_RUN_LIBS names a frozen copy of build\core\libs\libs to deploy instead (A/B batches while building).
+$libsSource = if ($env:APS5_RUN_LIBS) { $env:APS5_RUN_LIBS } else { "$repoRoot\build\core\libs\libs" }
+$binaries = Get-ChildItem -LiteralPath $libsSource -Filter '*.prx' -File | Sort-Object Name | Get-FileHash -Algorithm SHA256 | Select-Object Path,Hash
 $binaries | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $output 'binary-hashes.json')
 Get-ChildItem Env: | Where-Object Name -like 'APS5_*' | Select-Object Name,Value | Sort-Object Name | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $output 'environment.json')
-Copy-Item "$repoRoot\build\core\libs\libs\*.prx" "$gameRoot\libs\" -Force
+Copy-Item "$libsSource\*.prx" "$gameRoot\libs\" -Force
 $game = Start-Process -FilePath "$gameRoot\app.exe" -WorkingDirectory $gameRoot -WindowStyle Normal -RedirectStandardOutput "$gameRoot\run-out.log" -RedirectStandardError "$gameRoot\run-err.log" -PassThru
 $gamePath = $null; for ($try = 0; $try -lt 50 -and -not $gamePath; $try++) { $gamePath = (Get-Process -Id $game.Id -ErrorAction SilentlyContinue).Path; if (-not $gamePath) { Start-Sleep -Milliseconds 100 } }
 $identity = [pscustomobject]@{ pid=$game.Id; path=$gamePath; started=$game.StartTime.ToUniversalTime().ToString('o') }

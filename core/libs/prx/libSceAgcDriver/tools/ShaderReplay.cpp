@@ -180,7 +180,7 @@ bool Replay(const char* path) {
     if (g_assembly) {
         const auto program = ShaderRecompiler::DecodeShaderProgram(request.request.shader);
         // Raw first words carry what the text omits (branch offsets, waitcnt fields).
-        for (const auto& instruction : program.instructions) std::printf("raw=%08x %s\n", instruction.rawWords[0], ShaderRecompiler::RdnaInstructionToString(instruction).c_str());
+        for (const auto& instruction : program.instructions) std::printf("raw=%08x op=%u %s\n", instruction.rawWords[0], static_cast<unsigned>(instruction.op), ShaderRecompiler::RdnaInstructionToString(instruction).c_str());
     }
     if (g_graph) {
         const auto program = ShaderRecompiler::DecodeShaderProgram(request.request.shader);

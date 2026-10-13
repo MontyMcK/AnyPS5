@@ -1241,6 +1241,132 @@ void drawSnapshotReuseTests(const Device& device, Recorder& recorder) {
     recorder.Activate();
 }
 
+// Stream templates (ShaderResources::StreamRing): a draw build whose only CPU-copied region is a
+// small read-only one outside every registered range (no import, as the race's 0xf0000000 constants)
+// is kept as a template only with the switch on. Its hits report the element moved at an unchanged
+// address, copy its current bytes into a fresh slice each time, follow a moved V#, refuse a pending
+// write over it and a later V# over the limit; a written or large element never makes one. Run once
+// with APS5_STREAM_RING=1 (and APS5_VERIFY_STREAM_RING=1 for the hooked compare) and once without.
+void streamTemplateTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the stream template block");
+    auto* guest = static_cast<std::uint8_t*>(block);
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    const bool enabled = ShaderResources::StreamRing();
+    constexpr std::uint32_t elementOffset = 256;
+    constexpr std::uint32_t movedOffset = 1024;
+    constexpr std::size_t elementBytes = 48;
+    const auto program = [](std::uint64_t at, std::size_t size, bool written) {
+        ShaderRecompiler::RecompileResult result;
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.descriptorSet = 0;
+        binding.binding = 0;
+        binding.count = 1;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at >> 32u) & 0xffffu, static_cast<std::uint32_t>(size), 0x31000000u};
+        binding.bufferWritten = {written};
+        result.bindings.push_back(binding);
+        result.pushConstants.resize(16);
+        result.memoryOffsetDword = 0;
+        return result;
+    };
+    const auto holds = [](std::span<const std::byte> contents, std::size_t size, std::uint8_t value) {
+        return contents.size() >= size && std::all_of(contents.begin(), contents.begin() + static_cast<std::ptrdiff_t>(size), [&](std::byte byte) { return byte == std::byte{value}; });
+    };
+    {
+        auto streamContext = context;
+        DescriptorCache cache(streamContext);
+        streamContext.descriptorCache = &cache;
+        Recorder streamRecorder(streamContext);
+        streamRecorder.Activate();
+        {
+            auto vertexProgram = program(address + elementOffset, elementBytes, false);
+            const CompiledShader vertex{ShaderRecompiler::ShaderStage::Vertex, &vertexProgram, 0};
+            const std::span<const CompiledShader> shaders(&vertex, 1);
+            ShaderResources resources(streamContext, shaders, ColorTarget{}, 0, 0);
+            Require(resources.Streamed() == enabled, enabled ? "a small read-only copied region did not make a stream template" : "a stream template was made with the switch off");
+            Require(resources.Reusable() == enabled, enabled ? "a stream template is not reusable" : "a draw build with a CPU-copied region became reusable with the switch off");
+            if (enabled) {
+                const auto take = [&](std::span<const CompiledShader> stages) {
+                    const auto moved = resources.MovedReadOnlyBuffers(stages, streamRecorder);
+                    Require(moved.has_value() && moved->size() == 1 && moved->front().words.empty(), "a stream hit did not rebind its streamed element");
+                    auto bindings = resources.PrepareDrawBindings(streamRecorder, *moved);
+                    Require(bindings != nullptr && bindings->snapshots.size() == 1, "a stream hit made no per-draw copy");
+                    return std::pair{moved->front(), bindings};
+                };
+                const auto [firstMoved, first] = take(shaders);
+                Require(firstMoved.address == address + elementOffset && firstMoved.size == elementBytes, "a streamed element at an unchanged address was not reported at its own address");
+                Require(holds(first->snapshots[0].Bytes(), elementBytes, 0x11), "a stream hit's copy does not hold the guest bytes");
+                std::memset(guest + elementOffset, 0x22, elementBytes);
+                const auto [secondMoved, second] = take(shaders);
+                Require(holds(second->snapshots[0].Bytes(), elementBytes, 0x22), "a stream hit reused an earlier copy of changed guest bytes");
+                Require(first->allocation.set != second->allocation.set, "in-flight stream hits share a descriptor set");
+                Require(first->snapshots[0].buffer != second->snapshots[0].buffer || first->snapshots[0].offset != second->snapshots[0].offset, "in-flight stream hits share a ring slice");
+                // A moved V# under the same key copies from its new address.
+                std::memset(guest + movedOffset, 0x44, elementBytes);
+                auto movedProgram = program(address + movedOffset, elementBytes, false);
+                const CompiledShader movedVertex{ShaderRecompiler::ShaderStage::Vertex, &movedProgram, 0};
+                const auto [thirdMoved, third] = take(std::span<const CompiledShader>(&movedVertex, 1));
+                Require(thirdMoved.address == address + movedOffset && holds(third->snapshots[0].Bytes(), elementBytes, 0x44), "a stream hit with a moved V# did not copy from the new address");
+                // A later V# over the limit builds instead of copying a large range per hit.
+                if (ShaderResources::StreamLimit() < 32768) {
+                    auto largeProgram = program(address + 8192, 32768, false);
+                    const CompiledShader largeVertex{ShaderRecompiler::ShaderStage::Vertex, &largeProgram, 0};
+                    Require(!resources.MovedReadOnlyBuffers(std::span<const CompiledShader>(&largeVertex, 1), streamRecorder).has_value(), "a stream hit accepted a V# over the copy limit");
+                }
+                // The GPU reads the slices as they were when each hit copied them.
+                std::memset(guest + elementOffset, 0x33, elementBytes);
+                auto downloaded = std::make_shared<Buffer>(streamContext, elementBytes * 2, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                const auto commands = streamRecorder.Commands();
+                RecordMemoryBarrier(streamContext, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                const auto copy = streamContext.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+                VkBufferCopy region{first->snapshots[0].offset, 0, elementBytes};
+                copy(commands, first->snapshots[0].buffer->Handle(), downloaded->Handle(), 1, &region);
+                region.srcOffset = second->snapshots[0].offset;
+                region.dstOffset = elementBytes;
+                copy(commands, second->snapshots[0].buffer->Handle(), downloaded->Handle(), 1, &region);
+                RecordMemoryBarrier(streamContext, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+                streamRecorder.Sync();
+                const auto contents = downloaded->Bytes();
+                Require(holds(contents, elementBytes, 0x11) && holds(contents.subspan(elementBytes), elementBytes, 0x22), "the GPU did not read the stream hits' copies");
+                // Recorded GPU work writing the range: the hit is refused (the draw builds, and the
+                // build's read waits for that work through the flush hook).
+                streamRecorder.NotePendingWrite(address + elementOffset, elementBytes);
+                Require(!resources.MovedReadOnlyBuffers(shaders, streamRecorder).has_value(), "a stream hit copied a range recorded GPU work writes");
+                streamRecorder.Sync();
+            }
+        }
+        {
+            // A written element needs its write-back: never a template.
+            auto writtenProgram = program(address + elementOffset, elementBytes, true);
+            const CompiledShader vertex{ShaderRecompiler::ShaderStage::Vertex, &writtenProgram, 0};
+            ShaderResources resources(streamContext, std::span<const CompiledShader>(&vertex, 1), ColorTarget{}, 0, 0);
+            Require(!resources.Streamed() && !resources.Reusable(), "a written CPU-copied element made a template");
+        }
+        if (ShaderResources::StreamLimit() < 32768) {
+            auto largeProgram = program(address + 8192, 32768, false);
+            const CompiledShader vertex{ShaderRecompiler::ShaderStage::Vertex, &largeProgram, 0};
+            ShaderResources resources(streamContext, std::span<const CompiledShader>(&vertex, 1), ColorTarget{}, 0, 0);
+            Require(!resources.Streamed() && !resources.Reusable(), "a copied region over the stream limit made a template");
+        }
+        streamRecorder.Sync();
+    }
+    recorder.Activate();
+#ifdef _WIN32
+    VirtualFree(block, 0, MEM_RELEASE);
+#else
+    std::free(block);
+#endif
+}
+
 void snapshotRingTests(const Device& device) {
     if (!Recorder::SnapshotRingEnabled()) return;
     const auto& context = device.GetContext();
@@ -3570,6 +3696,11 @@ int main(int argc, char** argv) {
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--stream-template-only") {
+            streamTemplateTests(device, recorder);
+            std::cout << "Stream template tests passed (switch " << (ShaderResources::StreamRing() ? "on" : "off") << ")\n";
+            return 0;
+        }
         readTrackingTests(device, recorder);
         writeSettledTests(device, recorder);
         completionCountTests(device, recorder);
@@ -3584,6 +3715,7 @@ int main(int argc, char** argv) {
         resourceReadTests(device, recorder);
         misalignedSnapshotTests(device, recorder);
         drawSnapshotReuseTests(device, recorder);
+        streamTemplateTests(device, recorder);
         snapshotRingTests(device);
         targetProofTests(device);
         drawSnapshotEvictionTests(device);

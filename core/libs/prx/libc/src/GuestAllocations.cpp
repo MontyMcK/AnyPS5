@@ -34,6 +34,9 @@ struct Registry {
     std::mutex mutex;
     std::map<std::uint64_t, std::shared_ptr<const Range>> ranges;
     bool mainImageRegistered = false;
+    // The readable ranges as a lease snapshot (see Lease), built by the first Acquire after a change
+    // and dropped when a mutation begins, before it checks pins.
+    std::shared_ptr<const Lease::Items> snapshot;
 };
 
 Registry& registry() {
@@ -42,8 +45,78 @@ Registry& registry() {
 }
 
 std::atomic<std::uint64_t> generation{1};
+
+// [guest-allocations] (APS5_PROFILE_COLLECT or APS5_PROFILE_DRAW): registry mutations per 10 s by
+// kind, to tell which ones move the generation (every End and Invalidate does) during a scene.
+struct MutationProfile {
+    std::atomic<std::uint64_t> ends{0}, emptyEnds{0}, addReadable{0}, addHidden{0}, removeReadable{0}, removeHidden{0}, protectReadable{0}, protectHidden{0}, unmapReadable{0}, unmapHidden{0}, invalidates{0}, invalidateBytes{0};
+    // Protects whose every registered piece already had the requested readable/writable flags.
+    std::atomic<std::uint64_t> protectSameFlags{0}, protectSameFlagsPinned{0};
+    std::atomic<std::int64_t> reported{0};
+};
+
+bool mutationProfiled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_COLLECT") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return enabled;
+}
+
+MutationProfile& mutationProfile() {
+    static MutationProfile profile;
+    return profile;
+}
+
+void countMutation(std::atomic<std::uint64_t> MutationProfile::*counter) {
+    if (mutationProfiled()) (mutationProfile().*counter).fetch_add(1, std::memory_order_relaxed);
+}
+
+void reportMutations() {
+    if (!mutationProfiled()) return;
+    auto& profile = mutationProfile();
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto last = profile.reported.load(std::memory_order_relaxed);
+    if (last == 0) {
+        profile.reported.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 10'000'000'000ll || !profile.reported.compare_exchange_strong(last, now)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto ends = take(profile.ends);
+    const auto empty = take(profile.emptyEnds);
+    const auto addR = take(profile.addReadable);
+    const auto addH = take(profile.addHidden);
+    const auto remR = take(profile.removeReadable);
+    const auto remH = take(profile.removeHidden);
+    const auto proR = take(profile.protectReadable);
+    const auto proH = take(profile.protectHidden);
+    const auto unR = take(profile.unmapReadable);
+    const auto unH = take(profile.unmapHidden);
+    const auto inv = take(profile.invalidates);
+    const auto invBytes = take(profile.invalidateBytes);
+    const auto same = take(profile.protectSameFlags);
+    const auto samePinned = take(profile.protectSameFlagsPinned);
+    std::fprintf(stderr, "[guest-allocations] (10 s) mutations %llu (%llu changed nothing); add readable %llu / not %llu, remove readable %llu / not %llu, protect to readable %llu / not %llu, unmap readable %llu / not %llu; invalidates %llu (%.1f MiB); protects that keep every flag %llu (%llu of them over a range GPU work held)\n", ends, empty, addR, addH, remR, remH, proR, proH, unR, unH, inv, static_cast<double>(invBytes) / 1048576.0, same, samePinned);
+}
 std::atomic<void (*)(std::uintptr_t, std::size_t)> invalidator{nullptr};
 std::atomic<bool (*)()> pinWaiter{nullptr};
+// Whether same-flag protections keep the registry as it is (APS5_KEEP_SAME_PROTECT, or the driver's
+// live flag through GuestAllocationsSetKeepSameQuery).
+std::atomic<bool (*)()> keepSameQuery{nullptr};
+
+// Whether leases share the registry's snapshot (see Lease); on unless the driver's live flag
+// (GuestAllocationsSetSnapshotQuery) or APS5_NO_LEASE_SNAPSHOT turns it off, for A/B runs.
+std::atomic<bool (*)()> snapshotQuery{nullptr};
+
+bool leaseSnapshots() {
+    static const bool environment = std::getenv("APS5_NO_LEASE_SNAPSHOT") == nullptr;
+    if (const auto query = snapshotQuery.load(std::memory_order_acquire)) return query();
+    return environment;
+}
+
+bool keepSameProtect() {
+    static const bool environment = std::getenv("APS5_KEEP_SAME_PROTECT") != nullptr;
+    if (const auto query = keepSameQuery.load(std::memory_order_acquire)) return query();
+    return environment;
+}
 
 std::chrono::milliseconds pinWait() {
     static const std::chrono::milliseconds value{[] {
@@ -63,10 +136,16 @@ void require(bool condition, const char* reason) {
 struct MutationState {
     std::unique_lock<std::mutex> lock;
     std::vector<std::pair<std::uintptr_t, std::size_t>> changed;
+    // The registry was modified (an entry added, erased or split). A mutation that only applied
+    // protections the registry already records (APS5_KEEP_SAME_PROTECT) leaves it false, and its
+    // End moves no generation: nothing a lease, an address space or an import was built from changed.
+    bool modified = false;
 };
 
 void recordChange(void* mutation, const void* pointer, std::size_t bytes) {
-    if (mutation != nullptr && bytes != 0) static_cast<MutationState*>(mutation)->changed.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    if (mutation == nullptr) return;
+    static_cast<MutationState*>(mutation)->modified = true;
+    if (bytes != 0) static_cast<MutationState*>(mutation)->changed.emplace_back(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 }
 
 #ifndef _WIN32
@@ -104,11 +183,21 @@ bool backWritableImageAnonymously() {
 }
 
 void* GuestAllocationsBegin_nid_postfix() {
-    return new MutationState{std::unique_lock<std::mutex>(registry().mutex), {}};
+    auto* state = new MutationState{std::unique_lock<std::mutex>(registry().mutex), {}};
+    // The registry's own snapshot reference would pin every range it holds.
+    registry().snapshot.reset();
+    return state;
 }
 
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
     auto* state = static_cast<MutationState*>(mutation);
+    countMutation(&MutationProfile::ends);
+    if (state->changed.empty()) countMutation(&MutationProfile::emptyEnds);
+    reportMutations();
+    if (!state->modified && keepSameProtect()) {
+        delete state;
+        return;
+    }
     generation.fetch_add(1, std::memory_order_release);
     if (const auto callback = invalidator.load(std::memory_order_acquire)) {
         for (const auto& [address, bytes] : state->changed) callback(address, bytes);
@@ -125,6 +214,8 @@ void GuestAllocationsSetInvalidator_nid_postfix(void (*callback)(std::uintptr_t,
 }
 
 void GuestAllocationsInvalidate_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    countMutation(&MutationProfile::invalidates);
+    if (mutationProfiled()) mutationProfile().invalidateBytes.fetch_add(bytes, std::memory_order_relaxed);
     generation.fetch_add(1, std::memory_order_release);
     if (const auto callback = invalidator.load(std::memory_order_acquire)) callback(address, bytes);
 }
@@ -134,7 +225,7 @@ void GuestAllocationsSetPinWaiter_nid_postfix(bool (*callback)()) {
 }
 
 #ifdef _WIN32
-void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
+void GuestAllocationsRegisterMainImage_nid_postfix(void* mutation) {
     auto& state = registry();
     if (state.mainImageRegistered) return;
     const auto image = GetModuleHandleW(nullptr);
@@ -168,9 +259,10 @@ void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
     require(registered, "main guest image has no committed pages");
     state.ranges.swap(replacement);
     state.mainImageRegistered = true;
+    if (mutation != nullptr) static_cast<MutationState*>(mutation)->modified = true;
 }
 #else
-void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
+void GuestAllocationsRegisterMainImage_nid_postfix(void* mutation) {
     auto& state = registry();
     if (state.mainImageRegistered) return;
     struct Page {
@@ -213,10 +305,12 @@ void GuestAllocationsRegisterMainImage_nid_postfix(void*) {
     }
     state.ranges.swap(replacement);
     state.mainImageRegistered = true;
+    if (mutation != nullptr) static_cast<MutationState*>(mutation)->modified = true;
 }
 #endif
 
 void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable) {
+    countMutation(readable ? &MutationProfile::addReadable : &MutationProfile::addHidden);
     recordChange(mutation, pointer, bytes);
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     require(address != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid guest allocation range");
@@ -252,6 +346,9 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     const auto deadline = std::chrono::steady_clock::now() + pinWait();
     int syncedRounds = 0;
     for (;;) {
+        // A lease taken while the lock was released below rebuilt the registry's snapshot, whose own
+        // reference is no pin.
+        registry().snapshot.reset();
         bool pinned = false;
         auto it = ranges.upper_bound(address);
         if (it != ranges.begin()) --it;
@@ -342,6 +439,7 @@ Range GuestAllocationsFind_nid_postfix(void*, const void* pointer) {
 
 void GuestAllocationsRemove_nid_postfix(void* mutation, const void* pointer) {
     const auto range = GuestAllocationsFind_nid_postfix(mutation, pointer);
+    countMutation(range.readable ? &MutationProfile::removeReadable : &MutationProfile::removeHidden);
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, range.bytes);
     recordChange(mutation, pointer, range.bytes);
     auto& ranges = registry().ranges;
@@ -383,7 +481,66 @@ std::map<std::uint64_t, std::shared_ptr<const Range>> replaceRange(const void* p
 
 }
 
+namespace {
+
+// Whether registered entries cover all of [pointer, pointer + bytes) without a hole and every one
+// of them already has these flags.
+bool rangesCarry(const void* pointer, std::size_t bytes, bool readable, bool writable) {
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    const auto end = address + bytes;
+    auto& ranges = registry().ranges;
+    auto it = ranges.upper_bound(address);
+    if (it != ranges.begin()) --it;
+    auto cursor = address;
+    for (; it != ranges.end() && it->first < end; ++it) {
+        const auto& range = *it->second;
+        if (range.address + range.bytes <= cursor) continue;
+        if (range.address > cursor || range.readable != readable || range.writable != writable) return false;
+        cursor = range.address + range.bytes;
+        if (cursor >= end) return true;
+    }
+    return false;
+}
+
+}
+
+bool GuestAllocationsCarries_nid_postfix(void*, const void* pointer, std::size_t bytes, bool readable, bool writable) {
+    return keepSameProtect() && rangesCarry(pointer, bytes, readable, writable);
+}
+
+void GuestAllocationsSetKeepSameQuery_nid_postfix(bool (*query)()) {
+    keepSameQuery.store(query, std::memory_order_release);
+}
+
+void GuestAllocationsSetSnapshotQuery_nid_postfix(bool (*query)()) {
+    snapshotQuery.store(query, std::memory_order_release);
+}
+
 void GuestAllocationsProtect_nid_postfix(void* mutation, const void* pointer, std::size_t bytes, bool readable, bool writable, const std::function<void()>& apply) {
+    countMutation(readable ? &MutationProfile::protectReadable : &MutationProfile::protectHidden);
+    if (mutationProfiled()) {
+        const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+        const auto end = address + bytes;
+        bool same = bytes != 0;
+        bool pinned = false;
+        auto cursor = address;
+        auto& ranges = registry().ranges;
+        auto it = ranges.upper_bound(address);
+        if (it != ranges.begin()) --it;
+        for (; it != ranges.end() && it->first < end; ++it) {
+            const auto& range = *it->second;
+            if (range.address + range.bytes <= address) continue;
+            if (range.address > cursor || range.readable != readable || range.writable != writable) same = false;
+            if (it->second.use_count() != 1) pinned = true;
+            cursor = std::max<std::uintptr_t>(cursor, range.address + range.bytes);
+        }
+        if (cursor < end) same = false;
+        if (same) {
+            countMutation(&MutationProfile::protectSameFlags);
+            if (pinned) countMutation(&MutationProfile::protectSameFlagsPinned);
+        }
+    }
     GuestAllocationsRequireUnpinned_nid_postfix(mutation, pointer, bytes);
     recordChange(mutation, pointer, bytes);
     auto replacement = replaceRange(pointer, bytes, false, readable, writable);
@@ -410,6 +567,7 @@ void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std:
             continue;
         }
         const auto range = *containing;
+        countMutation(range.readable ? &MutationProfile::unmapReadable : &MutationProfile::unmapHidden);
         require(range.releasable, "guest image memory cannot be unmapped");
         const auto pieceEnd = std::min<std::uint64_t>(end, range.allocationAddress + range.allocationBytes);
         auto replacement = replaceRange(reinterpret_cast<const void*>(cursor), pieceEnd - cursor, true, false, false);
@@ -426,12 +584,25 @@ void GuestAllocationsUnmap_nid_postfix(void* mutation, const void* pointer, std:
 }
 
 Lease GuestAllocationsAcquire_nid_postfix() {
-    std::lock_guard lock(registry().mutex);
-    Lease result;
-    for (const auto& [address, range] : registry().ranges) {
-        if (range->readable && range->bytes != 0) result.push_back(range);
+    auto& state = registry();
+    std::lock_guard lock(state.mutex);
+    if (!leaseSnapshots()) {
+        // A private copy per lease, as before snapshots.
+        state.snapshot.reset();
+        auto items = std::make_shared<Lease::Items>();
+        for (const auto& [address, range] : state.ranges) {
+            if (range->readable && range->bytes != 0) items->push_back(range);
+        }
+        return Lease(std::move(items));
     }
-    return result;
+    if (state.snapshot == nullptr) {
+        auto items = std::make_shared<Lease::Items>();
+        for (const auto& [address, range] : state.ranges) {
+            if (range->readable && range->bytes != 0) items->push_back(range);
+        }
+        state.snapshot = std::move(items);
+    }
+    return Lease(state.snapshot);
 }
 
 }

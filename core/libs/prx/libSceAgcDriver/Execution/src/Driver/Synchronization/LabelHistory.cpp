@@ -3,6 +3,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string_view>
+#include <algorithm>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -37,9 +39,26 @@ bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t ad
 }
 
 void Driver::traceLabel(std::span<const std::uint32_t> packet, std::uint32_t queue) {
-    static const std::uint64_t watched = [] {
+    // APS5_TRACE_LABEL=<hex address>|<hex begin>-<hex end>[,...] (up to 8): packets that write within
+    // 0x100 bytes of an address, or into a range.
+    static const std::vector<std::pair<std::uint64_t, std::uint64_t>> watchedList = [] {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> list;
         const char* value = std::getenv("APS5_TRACE_LABEL");
-        return value ? std::strtoull(value, nullptr, 16) : 0ull;
+        while (value != nullptr && *value != '\0' && list.size() < 8) {
+            char* end = nullptr;
+            const auto address = std::strtoull(value, &end, 16);
+            if (end == value) break;
+            if (*end == '-') {
+                const char* next = end + 1;
+                const auto last = std::strtoull(next, &end, 16);
+                if (end == next) break;
+                list.emplace_back(address, last);
+            } else {
+                list.emplace_back(address > 0x100 ? address - 0x100 : 0, address + 0x100);
+            }
+            value = *end == ',' ? end + 1 : end;
+        }
+        return list;
     }();
     const auto opcode = (packet[0] >> 8u) & 0xffu;
     std::uint64_t target = 0;
@@ -61,7 +80,7 @@ void Driver::traceLabel(std::span<const std::uint32_t> packet, std::uint32_t que
         auto& entry = writeHistory()[writeCursor()++ % writeHistory().size()];
         entry = {target, length, queue, opcode};
     }
-    if (watched == 0 || target + length + 0x100 < watched || target > watched + 0x100) return;
+    if (std::none_of(watchedList.begin(), watchedList.end(), [&](const auto& watched) { return target + length > watched.first && target < watched.second; })) return;
     std::fprintf(stderr, "[label] %lld ms queue 0x%x %s 0x%llx:", static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()), queue, kind, static_cast<unsigned long long>(target));
     for (std::size_t i = 1; i < packet.size() && i < 9; ++i) std::fprintf(stderr, " %08x", packet[i]);
     std::fprintf(stderr, "\n");

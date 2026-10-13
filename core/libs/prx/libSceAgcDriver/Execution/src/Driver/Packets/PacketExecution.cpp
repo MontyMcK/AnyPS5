@@ -14,6 +14,8 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include <array>
+#include <atomic>
 #include <cstdlib>
 #include <functional>
 #include <shared_mutex>
@@ -127,10 +129,13 @@ void Driver::execute(const Submission& submission) {
     if (traceGpu) AgcDriver::ProfilePrint_nid_no_patch("[gpu] %.1f execute serial=%llu queue=0x%x dwords=%zu\n", TraceMs(), static_cast<unsigned long long>(submission.serial), submission.queue, submission.commands.size());
 
     static const long dumpQueue = [] { const char* text = std::getenv("APS5_DUMP_QUEUE"); return text ? std::strtol(text, nullptr, 16) : -1L; }();
-    if (static_cast<long>(submission.queue) == dumpQueue) {
+    // APS5_DUMP_QUEUE_LIVE=1: dump only while the live flag `dump_queue` is set, at most 3 submissions
+    // (to look at a scene the boot never reaches).
+    static const bool dumpLive = std::getenv("APS5_DUMP_QUEUE_LIVE") != nullptr;
+    if (static_cast<long>(submission.queue) == dumpQueue && (!dumpLive || Graphics::LiveFlag("dump_queue", false))) {
 
         static int dumped = 0;
-        if (dumped++ < 40) {
+        if (dumped++ < (dumpLive ? 3 : 40)) {
             std::string text = "[queue] submission " + std::to_string(submission.serial) + ":\n";
             for (std::size_t cursor = 0; cursor < submission.commands.size();) {
                 const auto header = submission.commands[cursor];
@@ -167,6 +172,16 @@ void Driver::execute(const Submission& submission) {
         if (!epochEach) noteReleasedTails(submission);
         bumpEpoch(&EpochBumps::submissions);
     }
+    // Dispatch runs (Graphics::Recorder::DispatchRunsEnabled): a queue's run lasts while only
+    // dispatches and SET_SH_REG writes follow each other in its stream. Any other packet (a wait, a
+    // flush or cache action, a release, a data write, a NOP-wrapped custom packet) or a new
+    // submission starts the next one.
+    static std::array<std::atomic<std::uint32_t>, 256> dispatchRunEpochs{};
+    auto& dispatchRunEpoch = dispatchRunEpochs[submission.queue & 0xffu];
+    // Debug aid: APS5_DISPATCH_RUN_QUEUE=<hex queue> gives runs to that one queue only.
+    static const long dispatchRunQueue = [] { const char* text = std::getenv("APS5_DISPATCH_RUN_QUEUE"); return text != nullptr ? std::strtol(text, nullptr, 16) : -1L; }();
+    const bool dispatchRunsHere = dispatchRunQueue < 0 || static_cast<long>(submission.queue) == dispatchRunQueue;
+    dispatchRunEpoch.fetch_add(1, std::memory_order_relaxed);
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
@@ -178,6 +193,16 @@ void Driver::execute(const Submission& submission) {
         if (submission.queue == 0) DrawPipeline::PipeTrace(DrawPipeline::Trace::QueuePacket, header == FlipPacketHeader ? 0x1ffu : opcode);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+        if (opcode == 0x37 && !predicated && dispatchRunsHere && Graphics::Recorder::DispatchRunStoresEnabled()) {
+            // A WRITE_DATA keeps the run (Recorder::DispatchRunStoresEnabled): its store goes in
+            // place inside it.
+            Graphics::Recorder::SetDispatchRunToken(((static_cast<std::uint64_t>(submission.queue) + 1u) << 32u) | dispatchRunEpoch.load(std::memory_order_relaxed));
+        } else if (opcode != 0x15 || predicated) {
+            if (opcode != 0x76 || predicated) dispatchRunEpoch.fetch_add(1, std::memory_order_relaxed);
+            Graphics::Recorder::SetDispatchRunToken(0);
+        } else {
+            Graphics::Recorder::SetDispatchRunToken(dispatchRunsHere ? ((static_cast<std::uint64_t>(submission.queue) + 1u) << 32u) | dispatchRunEpoch.load(std::memory_order_relaxed) : 0);
+        }
         const ReplayProbe::Scope probeScope(probing ? ReplayProbe::Observe(queue, packet, Pm4::IndirectRegisterOpcode(opcode) && submission.registerLists.contains(cursor) ? std::span<const std::uint32_t>(submission.registerLists.at(cursor)) : std::span<const std::uint32_t>{}, replayCut(packet, header, opcode, predicated), probeDevice, submission.shaders.get()) : nullptr);
         if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue))) {
             traceLabel(packet, submission.queue);

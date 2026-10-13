@@ -38,7 +38,7 @@ void RunGuestLeaseWaitTests() {
         mutation.Add(memory.data() + 64, 64, true, true);
     }
     auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    std::erase_if(lease, [&](const auto& range) { return range->address != address; });
+    lease.RetainIf([&](const auto& range) { return range->address == address; });
     std::atomic<bool> mutationEntered = false;
     std::atomic<bool> lookupFinished = false;
     std::exception_ptr failure;
@@ -56,7 +56,7 @@ void RunGuestLeaseWaitTests() {
     });
     mutationEntered.wait(false);
     auto other = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
-    std::erase_if(other, [&](const auto& range) { return range->address != address + 64; });
+    other.RetainIf([&](const auto& range) { return range->address == address + 64; });
     const bool found = other.size() == 1 && other.front()->address == address + 64;
     lookupFinished.store(true);
     lease.clear();

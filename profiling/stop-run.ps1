@@ -10,4 +10,7 @@ if ($null -eq $process) { Write-Output "PID $processId already exited"; return }
 if ($process.Path -ne $path -or $process.StartTime.ToUniversalTime().ToString('o') -ne $started) { throw "PID $processId does not match the recorded identity for $Tag" }
 Stop-Process -Id $processId -Force
 $process.WaitForExit()
+# Keep the run's log: the next launch overwrites run-err.log in the game directory.
+$log = 'D:\ps5\gt7\run-err.log'
+if (Test-Path $log) { Copy-Item $log "D:\ps5\gt7\diagnostics-rapid\$Tag\run-err.log" -Force }
 Write-Output "Stopped PID $processId ($Tag)"

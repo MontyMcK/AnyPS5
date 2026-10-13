@@ -62,7 +62,8 @@ std::chrono::microseconds Driver::labelFlushDeadline() {
         const char* text = std::getenv("APS5_LABEL_FLUSH_US");
         return std::chrono::microseconds(text ? std::atoi(text) : (LabelBatchSubmit() ? 1000 : 250));
     }();
-    return value;
+    // Live `label_deadline_long`: 8 times the deadline (fewer batch submits for pending labels).
+    return Graphics::LiveFlag("label_deadline_long", false) ? value * 8 : value;
 }
 
 bool Driver::labelFlushDue() {
@@ -86,7 +87,8 @@ std::uint64_t Driver::batchCap() {
         const char* text = std::getenv("APS5_BATCH_CAP");
         return text ? std::strtoull(text, nullptr, 10) : 64ull;
     }();
-    return value;
+    // Live `batch_cap_big`: 8 times the cap (fewer, larger batches).
+    return Graphics::LiveFlag("batch_cap_big", false) ? value * 8 : value;
 }
 
 void Driver::recordDeferredLabels(VulkanDevice* localDevice, std::uint32_t queue) {

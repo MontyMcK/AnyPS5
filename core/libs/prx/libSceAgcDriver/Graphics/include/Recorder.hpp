@@ -129,6 +129,9 @@ ForkRefusalCounts TakeForkRefusals();
 // up to serial S" WITHOUT the mutex (WaitSerial), because the monotonic value cannot be reset or
 // recycled the way the pooled batch fences are, and afterwards run the completions under the mutex
 // (FinishUpTo). Without timeline semaphores callers use the locked Sync as before.
+// The calling thread's GPU-sync waits in the flush hook so far (ms, count; profiling only).
+std::pair<double, std::uint64_t> ThreadHookSyncs();
+
 class Recorder {
 public:
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).
@@ -403,6 +406,20 @@ public:
     static std::optional<LabelHit> LookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal = nullptr);
     // The value alone, for callers asking whether any label is pending in a dword (afterStamp 0).
     static std::optional<std::uint64_t> LookupLabelValue(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp);
+    // The value a recorded label store (WRITE_DATA, RELEASE_MEM data) leaves in a dword, when nothing
+    // recorded after it is known to write the dword: the entry is recorded (not queued), no later
+    // noted GPU write overlaps it, its value does not wait for completion actions, and no wide
+    // label covers it. Work recorded after the store reads this value, so a capture for such work
+    // can take it instead of waiting for the GPU (live `label_known`).
+    static bool CurrentLabelDword(std::uint64_t address, std::uint32_t& value);
+    // APS5_TRACE_DCC_SYNC: the code address that noted a pending write (the caller of
+    // NotePendingWrite/NotePendingFill/NotePendingWrites), from a ring of the last 8192 notes;
+    // null when the note is older or was noted another way.
+    static const void* NoteSite(std::uint64_t note);
+    // The guest program whose recorded work notes writes next on this thread (a dispatch's compute
+    // program, 1 for a draw; 0 clears), kept with the note sites for the same trace.
+    static void SetNoteProgram(std::uint64_t program);
+    static std::uint64_t NoteProgram(std::uint64_t note);
     static bool WideLabelIn(std::uint64_t address, std::size_t bytes);
     // A label a queue worker decoded but has not recorded yet (Driver.cpp DeferredLabels): it
     // enters the table with no batch, and only a lookup made on the noting thread (a WAIT_REG_MEM
@@ -568,6 +585,29 @@ public:
     // (or APS5_NO_BARRIER_ELISION=1) records every leading barrier, as before.
     static bool MergeBarriers();
     static bool MergeDrawBarriers();
+    // Dispatch runs (live `dispatch_runs`, env APS5_DISPATCH_RUNS): on the console, consecutive
+    // dispatches of one queue overlap unless the title asks for a wait between them (a
+    // CS_PARTIAL_FLUSH, an ACQUIRE_MEM, a release). The driver gives each dispatch a token that
+    // stays the same while only register writes separate the dispatches of a queue
+    // (SetDispatchRunToken, thread-local; 0 = none). A dispatch whose token matches the run left
+    // open by the previous command skips its leading barrier, and every dispatch of a run leaves
+    // its trailing barrier owed: any other command (or a dispatch outside the run, or Submit)
+    // records it first.
+    static bool DispatchRunsEnabled();
+    // Live `dispatch_run_stores` (env APS5_DISPATCH_RUN_STORES), with dispatch runs: a WRITE_DATA
+    // between the dispatches of a run does not end it (the console's ME writes it without waiting
+    // for the dispatches before it). Its store is recorded in place inside the run (RecordStore),
+    // with only a transfer-to-compute barrier, so the dispatches after it read it.
+    static bool DispatchRunStoresEnabled();
+    // Live `dispatch_run_data` (env APS5_DISPATCH_RUN_DATA), with dispatch runs: a dispatch whose
+    // template data words differ continues the run with its words in snapshot-ring slices
+    // (ShaderResources::DataBindings) instead of ending it to refresh the template's buffers.
+    static bool DispatchRunDataEnabled();
+    static void SetDispatchRunToken(std::uint64_t token);
+    static std::uint64_t DispatchRunToken();
+    bool ContinuesDispatchRun(std::uint64_t token) const;
+    VkCommandBuffer CommandsInDispatchRun();
+    void LeaveDispatchRunOpen(std::uint64_t token);
     static constexpr VkAccessFlags DrawBarrierAccess = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     static void CountMerged(CommandClass which);
     static std::uint64_t MergedBarriers(CommandClass which);
@@ -712,6 +752,9 @@ private:
         } run;
         // See Commands(): the accesses the last recorded command's trailing barrier covers.
         VkAccessFlags coveredAccess = 0;
+        // The token of the dispatch run the last command left open (its trailing barrier owed;
+        // see DispatchRunsEnabled), 0 when none.
+        std::uint64_t dispatchRun = 0;
         // The hazard tracker's accesses since its last simulated barrier (see NoteAccess).
         struct Tracker {
             struct Range {
@@ -831,6 +874,12 @@ private:
     bool closeStoreRun(bool atSubmit = false);
     // Ends the render pass a draw left open (vkCmdEndRenderPass, the pass's trailing barrier).
     void endOpenRenderPass();
+    // Records the trailing barrier an open dispatch run owes (see DispatchRunsEnabled).
+    void closeDispatchRun();
+    // Whether the last RecordStore went in place inside a dispatch run: its NoteLabel then does
+    // not arm the prompt submit at the next packet (the run would end at every WRITE_DATA); the
+    // store is still in the label table and under a pending-write note.
+    bool lastStoreInRun = false;
     // Records the queued key stores as one run (`forWriter`: before a command writing, reading or
     // labelling over one, not at Submit).
     void recordKeyStores(bool forWriter);

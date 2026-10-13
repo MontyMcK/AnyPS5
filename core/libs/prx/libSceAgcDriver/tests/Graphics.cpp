@@ -2897,6 +2897,31 @@ void vertexCopyTests() {
     }
 }
 
+// The BDA resource tests on a fresh mock device, in the full run and alone (--bda-only: the
+// address-table and guest-buffer work only needs these, and the full run stops at the first
+// broken group before it reaches them).
+void bdaResourceTests() {
+    mock = MockVulkan{};
+    auto bdaContext = mockContext();
+    bdaContext.bufferDeviceAddress = true;
+    bdaContext.limits.maxStorageBufferRange = 1u << 27;
+    RunBdaResourceTests(bdaContext, {
+        [](VkBuffer buffer) -> std::span<std::byte> { return mock.memories.at(mock.bufferMemory.at(buffer)); },
+        [](std::uint32_t binding) {
+            for (auto it = mock.writes.rbegin(); it != mock.writes.rend(); ++it) {
+                if (it->binding == binding) return it->buffers.at(0);
+            }
+            throw std::runtime_error("missing BDA test descriptor");
+        },
+        [](VkDeviceAddress address) {
+            const auto offset = address - 0x100000000000ULL;
+            const auto buffer = reinterpret_cast<VkBuffer>(offset / 0x10000);
+            return std::span<std::byte>(mock.memories.at(mock.bufferMemory.at(buffer))).subspan(offset % 0x10000);
+        }
+    });
+    Require(mock.live == 0, "BDA resources leaked Vulkan objects");
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     _putenv_s("APS5_PIN_WAIT_MS", "200");
@@ -2931,6 +2956,13 @@ int main(int argc, char** argv) {
             std::cout << "packed float target state tests passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--guest-allocations-only") {
+            RunGuestLeaseWaitTests();
+            RunGuestAllocationTests();
+            RunUnmappedGapTests();
+            std::cout << "Guest allocation registry and lease tests passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--sampler-only") {
             RunGuestSamplerResourceTests();
             std::cout << "Guest sampler decoding and Vulkan state tests passed\n";
@@ -2944,6 +2976,11 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--vertex-copy-only") {
             vertexCopyTests();
             std::cout << "Vertex copy range and alignment tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--bda-only") {
+            bdaResourceTests();
+            std::cout << "BDA resource tests passed\n";
             return 0;
         }
         {
@@ -3009,25 +3046,7 @@ int main(int argc, char** argv) {
         vertexCopyTests();
         pixelParameterSlotTests();
         rectListTests();
-        mock = MockVulkan{};
-        auto bdaContext = mockContext();
-        bdaContext.bufferDeviceAddress = true;
-        bdaContext.limits.maxStorageBufferRange = 1u << 27;
-        RunBdaResourceTests(bdaContext, {
-            [](VkBuffer buffer) -> std::span<std::byte> { return mock.memories.at(mock.bufferMemory.at(buffer)); },
-            [](std::uint32_t binding) {
-                for (auto it = mock.writes.rbegin(); it != mock.writes.rend(); ++it) {
-                    if (it->binding == binding) return it->buffers.at(0);
-                }
-                throw std::runtime_error("missing BDA test descriptor");
-            },
-            [](VkDeviceAddress address) {
-                const auto offset = address - 0x100000000000ULL;
-                const auto buffer = reinterpret_cast<VkBuffer>(offset / 0x10000);
-                return std::span<std::byte>(mock.memories.at(mock.bufferMemory.at(buffer))).subspan(offset % 0x10000);
-            }
-        });
-        Require(mock.live == 0, "BDA resources leaked Vulkan objects");
+        bdaResourceTests();
         RunGuestAllocationTests();
         RunUnmappedGapTests();
         RunColorTargetLayoutTests();

@@ -212,6 +212,14 @@ bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* pro
     return WindowsMappings::Get().Protection(address, protection);
 }
 
+void GuestArenaSetUnlockedWatchQuery_nid_postfix(bool (*query)()) {
+#ifdef _WIN32
+    WindowsMappings::unlockedWatchQuery().store(query, std::memory_order_release);
+#else
+    static_cast<void>(query);
+#endif
+}
+
 bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
     return WindowsMappings::Get().Collect(address, bytes, pages, count, clear);
 }

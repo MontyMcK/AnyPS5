@@ -12,6 +12,12 @@
 // by the runtime's internal callers), go to the original functions. Freed blocks go to a per-thread
 // cache, which trades batches with a per-class global pool, so a block freed on another thread is
 // reused there. Thread caches are returned to the pools when a thread exits.
+//
+// Large blocks (live `fast_heap_large`, env APS5_FAST_HEAP_LARGE=0 turns them off): requests over
+// 32 KiB up to 4 MiB take a power-of-two run of whole spans from the same arena and go back to a
+// per-size free list when freed. Through the runtime they walked the process heap's fragmented free
+// lists (about 3,000 per race frame, mostly the BDA address-range vectors), about 35 us per
+// allocation and free pair on the committer and the async-compute queue thread.
 #include <windows.h>
 #include <intrin.h>
 #include <atomic>
@@ -20,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 
 namespace {
 
@@ -45,6 +52,10 @@ constexpr std::size_t SpanBytes = std::size_t{1} << SpanShift;
 constexpr std::size_t CommitStep = 4u << 20;
 constexpr std::size_t MaxSmall = 32u << 10;
 constexpr std::size_t MaxClasses = 64;
+constexpr std::size_t MaxLarge = 4u << 20;
+// spanClass of a large block's first span: LargeTag + log2(size / SpanBytes).
+constexpr std::uint8_t LargeTag = 0x80;
+constexpr std::uint32_t LargeClasses = 7;
 
 std::uint8_t* arenaBase;
 std::uint8_t* arenaEnd;
@@ -63,6 +74,9 @@ struct Pool {
     void* batches = nullptr;
 };
 Pool pools[MaxClasses];
+// Freed large blocks by size, linked through their first word.
+Pool largePools[LargeClasses];
+std::atomic<bool> largeEnabled{true};
 
 // head is the list blocks are taken from and freed to; when it reaches a batch it becomes the spare
 // (one full batch held back), and an older spare goes to the pool. Nothing walks a list.
@@ -73,7 +87,7 @@ struct Cache {
 };
 
 // Slow-path counters for the 10 s report.
-std::atomic<std::uint64_t> carves{0}, refills{0}, returns{0}, large{0}, foreignFrees{0};
+std::atomic<std::uint64_t> carves{0}, refills{0}, returns{0}, large{0}, foreignFrees{0}, largeServed{0}, largeCarved{0};
 
 DWORD cacheSlot = TLS_OUT_OF_INDEXES;
 DWORD exitSlot = FLS_OUT_OF_INDEXES;
@@ -147,24 +161,29 @@ Cache* MakeCache() {
     return cache;
 }
 
+// Commits the arena up to offset + bytes; false when the arena or the commit is exhausted.
+bool CommitThrough(std::size_t offset, std::size_t bytes) {
+    if (offset + bytes > ArenaBytes) return false;
+    if (offset + bytes <= arenaCommitted) return true;
+    AcquireSRWLockExclusive(&commitLock);
+    while (offset + bytes > arenaCommitted) {
+        const DWORD error = GetLastError();
+        if (VirtualAlloc(arenaBase + arenaCommitted, CommitStep, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+            SetLastError(error);
+            ReleaseSRWLockExclusive(&commitLock);
+            return false;
+        }
+        SetLastError(error);
+        arenaCommitted += CommitStep;
+    }
+    ReleaseSRWLockExclusive(&commitLock);
+    return true;
+}
+
 bool CarveSpan(std::uint32_t sizeClass, Cache* cache) {
     carves.fetch_add(1, std::memory_order_relaxed);
     const auto offset = arenaUsed.fetch_add(SpanBytes, std::memory_order_relaxed);
-    if (offset + SpanBytes > ArenaBytes) return false;
-    if (offset + SpanBytes > arenaCommitted) {
-        AcquireSRWLockExclusive(&commitLock);
-        while (offset + SpanBytes > arenaCommitted) {
-            const DWORD error = GetLastError();
-            if (VirtualAlloc(arenaBase + arenaCommitted, CommitStep, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
-                SetLastError(error);
-                ReleaseSRWLockExclusive(&commitLock);
-                return false;
-            }
-            SetLastError(error);
-            arenaCommitted += CommitStep;
-        }
-        ReleaseSRWLockExclusive(&commitLock);
-    }
+    if (!CommitThrough(offset, SpanBytes)) return false;
     spanClass[offset >> SpanShift] = static_cast<std::uint8_t>(sizeClass);
     // Link the span into batches; the first refills this thread (whose head is empty), the rest pool.
     auto* span = arenaBase + offset;
@@ -208,8 +227,32 @@ bool Refill(std::uint32_t sizeClass, Cache* cache) {
     return true;
 }
 
+inline std::uint32_t LargeClassOf(std::size_t bytes) {
+    std::uint32_t index = 0;
+    while ((SpanBytes << index) < bytes) ++index;
+    return index;
+}
+
+void* LargeMalloc(std::size_t bytes) {
+    const auto index = LargeClassOf(bytes);
+    auto& pool = largePools[index];
+    AcquireSRWLockExclusive(&pool.lock);
+    void* block = pool.batches;
+    if (block != nullptr) pool.batches = Next(block);
+    ReleaseSRWLockExclusive(&pool.lock);
+    largeServed.fetch_add(1, std::memory_order_relaxed);
+    if (block != nullptr) return block;
+    largeCarved.fetch_add(1, std::memory_order_relaxed);
+    const auto size = SpanBytes << index;
+    const auto offset = arenaUsed.fetch_add(size, std::memory_order_relaxed);
+    if (!CommitThrough(offset, size)) return realMalloc(bytes);
+    spanClass[offset >> SpanShift] = static_cast<std::uint8_t>(LargeTag + index);
+    return arenaBase + offset;
+}
+
 void* FastMalloc(std::size_t bytes) {
     if (bytes > MaxSmall) {
+        if (bytes <= MaxLarge && largeEnabled.load(std::memory_order_relaxed)) return LargeMalloc(bytes);
         large.fetch_add(1, std::memory_order_relaxed);
         return realMalloc(bytes);
     }
@@ -234,6 +277,14 @@ void FastFree(void* block) {
         return;
     }
     const std::uint32_t sizeClass = spanClass[(static_cast<std::uint8_t*>(block) - arenaBase) >> SpanShift];
+    if (sizeClass >= LargeTag) {
+        auto& pool = largePools[sizeClass - LargeTag];
+        AcquireSRWLockExclusive(&pool.lock);
+        Next(block) = pool.batches;
+        pool.batches = block;
+        ReleaseSRWLockExclusive(&pool.lock);
+        return;
+    }
     Cache* cache = ThreadCache();
     if (cache == nullptr && (cache = MakeCache()) == nullptr) {
         Next(block) = nullptr;
@@ -251,7 +302,9 @@ void FastFree(void* block) {
 }
 
 inline std::size_t OwnedSize(void* block) {
-    return classSize[spanClass[(static_cast<std::uint8_t*>(block) - arenaBase) >> SpanShift]];
+    const auto sizeClass = spanClass[(static_cast<std::uint8_t*>(block) - arenaBase) >> SpanShift];
+    if (sizeClass >= LargeTag) return SpanBytes << (sizeClass - LargeTag);
+    return classSize[sizeClass];
 }
 
 void* FastRealloc(void* block, std::size_t bytes) {
@@ -273,7 +326,7 @@ void* FastRealloc(void* block, std::size_t bytes) {
 void* FastCalloc(std::size_t count, std::size_t size) {
     if (size != 0 && count > SIZE_MAX / size) return realCalloc(count, size);
     const auto bytes = count * size;
-    if (bytes > MaxSmall) return realCalloc(count, size);
+    if (bytes > MaxSmall && (bytes > MaxLarge || !largeEnabled.load(std::memory_order_relaxed))) return realCalloc(count, size);
     void* block = FastMalloc(bytes);
     if (block != nullptr) std::memset(block, 0, bytes);
     return block;
@@ -365,10 +418,21 @@ bool Redirect(std::uint8_t* function, void* target, std::uint8_t*& trampolines) 
     return true;
 }
 
+// Follows live `fast_heap_large` (the env setting is the default) twice a second; a block's size is
+// in its span tag, so frees stay right whichever path made it.
+bool largeDefault = true;
+
+DWORD WINAPI FollowMain(void*) {
+    for (;;) {
+        Sleep(500);
+        largeEnabled.store(AgcDriver::Graphics::LiveFlag("fast_heap_large", largeDefault), std::memory_order_relaxed);
+    }
+}
+
 DWORD WINAPI ReportMain(void*) {
     for (;;) {
         Sleep(10000);
-        std::fprintf(stderr, "[fast-heap] arena %.1f MiB, 10 s: span carves %llu, pool refills %llu, batches returned %llu, large (real) allocations %llu, foreign frees %llu\n", arenaUsed.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(carves.exchange(0)), static_cast<unsigned long long>(refills.exchange(0)), static_cast<unsigned long long>(returns.exchange(0)), static_cast<unsigned long long>(large.exchange(0)), static_cast<unsigned long long>(foreignFrees.exchange(0)));
+        std::fprintf(stderr, "[fast-heap] arena %.1f MiB, 10 s: span carves %llu, pool refills %llu, batches returned %llu, large (real) allocations %llu, foreign frees %llu; arena large blocks %llu (%llu carved, %s)\n", arenaUsed.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(carves.exchange(0)), static_cast<unsigned long long>(refills.exchange(0)), static_cast<unsigned long long>(returns.exchange(0)), static_cast<unsigned long long>(large.exchange(0)), static_cast<unsigned long long>(foreignFrees.exchange(0)), static_cast<unsigned long long>(largeServed.exchange(0)), static_cast<unsigned long long>(largeCarved.exchange(0)), largeEnabled.load(std::memory_order_relaxed) ? "on" : "off");
     }
 }
 
@@ -417,6 +481,7 @@ bool Install() {
                     Redirect(malloc_, reinterpret_cast<void*>(&FastMalloc), trampolines);
     if (ok) {
         if (HANDLE thread = CreateThread(nullptr, 0, ReportMain, nullptr, 0, nullptr)) CloseHandle(thread);
+        if (HANDLE thread = CreateThread(nullptr, 0, FollowMain, nullptr, 0, nullptr)) CloseHandle(thread);
     }
     std::fprintf(stderr, "[fast-heap] %s: %u size classes up to %zu bytes, arena %p\n", ok ? "malloc family redirected" : "redirect FAILED part way", classCount, MaxSmall, static_cast<void*>(arenaBase));
     return ok;
@@ -424,6 +489,9 @@ bool Install() {
 
 [[maybe_unused]] const bool installed = [] {
     const char* value = std::getenv("APS5_FAST_HEAP");
+    const char* largeValue = std::getenv("APS5_FAST_HEAP_LARGE");
+    largeDefault = largeValue == nullptr || largeValue[0] != '0';
+    largeEnabled.store(largeDefault, std::memory_order_relaxed);
     return value != nullptr && value[0] == '1' && Install();
 }();
 

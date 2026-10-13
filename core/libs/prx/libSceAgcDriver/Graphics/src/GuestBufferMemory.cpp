@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #ifdef _WIN32
 #include <windows.h>
@@ -143,6 +144,8 @@ struct HostImports {
     std::uint64_t unimportableEpoch = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> unimportable;
     std::uint64_t unimportableHits = 0;
+    // Requests served by a span import covering them (see importAllocation).
+    std::uint64_t spanReuses = 0;
 };
 
 HostImports& Imports() {
@@ -352,6 +355,22 @@ bool sameRange(const HostImport& entry, const GuestAllocations::Lease& lease) {
 const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t base, std::uint64_t bytes, const GuestAllocations::Lease& lease) {
     if (const auto found = state.imports.find(base); found != state.imports.end()) {
         if (found->second.bytes == bytes && sameRange(found->second, lease)) return &found->second;
+        // A span import starting here (several adjacent ranges imported as one, made for a region
+        // crossing their boundary) that covers the request and still has every part registered
+        // unchanged maps the same memory at the same offsets as an import of the range alone would.
+        // Retiring it for that import, and the span again at the next crossing region, would move
+        // the imports epoch (and replace every address space) at each alternation.
+        // APS5_NO_SPAN_IMPORT_REUSE=1 retires it as before.
+        static const bool reuseSpansDefault = std::getenv("APS5_NO_SPAN_IMPORT_REUSE") == nullptr;
+        if (LiveFlag("span_reuse", reuseSpansDefault) && found->second.bytes >= bytes && spanStillRegistered(found->second, lease)) {
+            ++state.spanReuses;
+            return &found->second;
+        }
+        static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
+        if (trace) {
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1, std::memory_order_relaxed) < 400) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx retired for a re-import of 0x%llx bytes (same registered range: %d)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(found->second.bytes), static_cast<unsigned long long>(bytes), sameRange(found->second, lease) ? 1 : 0);
+        }
         retireImport(context, state, found, lease);
     }
     const auto alignment = context.hostImportAlignment;
@@ -1114,6 +1133,13 @@ bool WaitForLeases() noexcept {
 void ensurePinWaiter() {
     static const bool registered = [] {
         GuestAllocations::GuestAllocationsSetPinWaiter_nid_postfix(&WaitForLeases);
+        // libc and libkernel switches the driver's live flags drive (they cannot read them).
+        static const bool keepSameDefault = std::getenv("APS5_KEEP_SAME_PROTECT") != nullptr;
+        GuestAllocations::GuestAllocationsSetKeepSameQuery_nid_postfix(+[] { return LiveFlag("keep_same_protect", keepSameDefault); });
+        static const bool leaseSnapshotDefault = std::getenv("APS5_NO_LEASE_SNAPSHOT") == nullptr;
+        GuestAllocations::GuestAllocationsSetSnapshotQuery_nid_postfix(+[] { return LiveFlag("lease_snapshot", leaseSnapshotDefault); });
+        static const bool unlockedWatchDefault = std::getenv("APS5_COLLECT_UNLOCKED_WATCH") != nullptr;
+        GuestArena::GuestArenaSetUnlockedWatchQuery_nid_postfix(+[] { return LiveFlag("unlocked_watch", unlockedWatchDefault); });
         return true;
     }();
     static_cast<void>(registered);
@@ -1521,7 +1547,32 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     const auto delta = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>(now - before); };
     const auto space = AddressSpaceCounters();
     const auto& spaceSeen = totals.spaceSeen;
+    {
+        // Span-import reuses since the last line (importAllocation), printed apart from the main line.
+        static std::uint64_t reusedBefore = 0;
+        std::uint64_t reused = 0;
+        {
+            auto& imports = Imports();
+            std::lock_guard importsLock(imports.mutex);
+            reused = imports.spanReuses;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[address] span imports reused for single-range requests (10 s): %llu\n", static_cast<unsigned long long>(reused - reusedBefore));
+        reusedBefore = reused;
+    }
     AgcDriver::ProfilePrint_nid_no_patch("[address] %llu address-based builds (10 s), us per build: lease %.0f, imports pass %.0f, mirror prepare %.0f, compare %.0f (%.0f blocks, %.1f copied), snapshots %.0f; space hits %llu / rebuilds: generation %llu, epoch %llu, device %llu, waiter drop %llu, first %llu; unpublished %llu, dissolved: overlap %llu, imports %llu%s; [bda-table] hits %llu / misses %llu (space tables %llu), first entry: expired %llu, hash differs low %llu / heap %llu, same hash %llu, none held %llu\n", static_cast<unsigned long long>(totals.builds), per(totals.sums.leaseUs), per(totals.sums.importsUs), per(totals.sums.mirrorsUs), per(totals.sums.compareUs), per(static_cast<double>(totals.sums.blocksCompared)), per(static_cast<double>(totals.sums.blocksCopied)), per(totals.snapshotsUs), delta(space.hits, spaceSeen.hits), delta(space.rebuiltGeneration, spaceSeen.rebuiltGeneration), delta(space.rebuiltEpoch, spaceSeen.rebuiltEpoch), delta(space.rebuiltDevice, spaceSeen.rebuiltDevice), delta(space.rebuiltWaiterDrop, spaceSeen.rebuiltWaiterDrop), delta(space.rebuiltFirst, spaceSeen.rebuiltFirst), delta(space.unpublished, spaceSeen.unpublished), delta(space.dissolvedOverlap, spaceSeen.dissolvedOverlap), delta(space.dissolvedImports, spaceSeen.dissolvedImports), space.enabled ? "" : " (cache off)", delta(table.hits, seen.hits), delta(table.misses, seen.misses), delta(table.spaceTables, seen.spaceTables), delta(table.firstExpired, seen.firstExpired), delta(table.firstDiffersLow, seen.firstDiffersLow), delta(table.firstDiffersHeap, seen.firstDiffersHeap), delta(table.firstSameHash, seen.firstSameHash), delta(table.firstEmpty, seen.firstEmpty));
+    {
+        // The lookup index of the BDA tables built since the last line, printed once
+        // bda_dense_buckets has been on (both states then, so a live toggle reads as an A/B). Whole
+        // span: the index over every range (flag off, or no cluster of 16+ entries below the
+        // mirrors). A window mean above ~4 entries per bucket says the window wants more buckets
+        // (APS5_BDA_BUCKETS=16384); entries outside the window take the full search.
+        const auto buckets = BdaResources::TakeBucketCounters();
+        if (buckets.requested) {
+            const auto mean = [](const BdaResources::BucketShapeStats& shape) { return shape.buckets != 0 ? static_cast<double>(shape.entries) / static_cast<double>(shape.buckets) : 0.0; };
+            const auto perTable = [&](double value) { return buckets.windowed != 0 ? value / static_cast<double>(buckets.windowed) : 0.0; };
+            AgcDriver::ProfilePrint_nid_no_patch("[bda-buckets] tables built (10 s): window %llu, whole span %llu (flag off %llu, no cluster %llu), no index %llu; per windowed table: span %.1f MiB, entries inside %.0f / outside %.0f; entries per non-empty bucket: window mean %.1f max %llu, whole span mean %.1f max %llu\n", static_cast<unsigned long long>(buckets.windowed), static_cast<unsigned long long>(buckets.flagOff + buckets.noCluster), static_cast<unsigned long long>(buckets.flagOff), static_cast<unsigned long long>(buckets.noCluster), static_cast<unsigned long long>(buckets.noIndex), perTable(static_cast<double>(buckets.windowBytes) / 1048576.0), perTable(static_cast<double>(buckets.inside)), perTable(static_cast<double>(buckets.outside)), mean(buckets.window), static_cast<unsigned long long>(buckets.window.maxEntries), mean(buckets.whole), static_cast<unsigned long long>(buckets.whole.maxEntries));
+        }
+    }
     totals.tableSeen = table;
     totals.spaceSeen = space;
     totals.builds = 0;
@@ -3128,6 +3179,42 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
         }
         result.emplace_back(region.begin, region.end);
     }
+    return result;
+}
+
+std::optional<GuestBufferMemory::StreamRegions> GuestBufferMemory::StreamableRegions(std::size_t limit, StreamRefusal* why) const {
+    const auto refuse = [&](StreamRefusal reason) -> std::optional<StreamRegions> {
+        if (why != nullptr) *why = reason;
+        return std::nullopt;
+    };
+    if (why != nullptr) *why = StreamRefusal::None;
+    // An address-based build maps whole registered heaps through the space; a hit could never
+    // rebind them per range.
+    if (space != nullptr) return refuse(StreamRefusal::Space);
+    if (!uploaded || committed) return std::nullopt;
+    StreamRegions result;
+    for (const auto& region : regions) {
+        const auto bytes = region.end - region.begin;
+        // Draw builds never stage (AllowDeviceStaging is for dispatches); a staged region's copy-in
+        // and copy-back are per use, which a draw hit does not record.
+        if (region.gpuCopy && region.deviceLocal) return refuse(StreamRefusal::Staged);
+        // The same predicate as DirectRegions: these stay bound in place and proved by serial.
+        const bool fixedMirror = region.mirror != nullptr && !region.mirror->writable && !region.mirror->heap;
+        if (region.direct != nullptr || fixedMirror) {
+            result.direct.emplace_back(region.begin, region.end);
+            continue;
+        }
+        if (region.mirror != nullptr) return refuse(StreamRefusal::WritableMirror);
+        // Uncommitted pages read as zeros in the upload; a hit's moved check refuses inaccessible
+        // pages, so such a template would never be served.
+        if (region.sparse) return refuse(StreamRefusal::Sparse);
+        if (!(region.hostBacked || region.writable)) return refuse(StreamRefusal::Snapshot);
+        // A written range needs its write-back and pending-write note, which a template never has.
+        if (WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return refuse(StreamRefusal::Written);
+        if (bytes > limit) return refuse(StreamRefusal::Large);
+        result.copied.emplace_back(region.begin, region.end);
+    }
+    if (result.copied.empty()) return std::nullopt;
     return result;
 }
 

@@ -341,16 +341,127 @@ public:
         put("(%llu conversions logged)", static_cast<unsigned long long>(total));
     }
 
+    // [collect-libc] (APS5_PROFILE_COLLECT): where Collect's time goes, printed every 10 s.
+    struct CollectProfile {
+        std::atomic<std::uint64_t> unlockedRetries{0};
+        std::atomic<std::uint64_t> calls{0}, totalTicks{0}, lockWaits{0}, lockWaitTicks{0}, cleanSkips{0}, residentRuns{0}, residentFresh{0}, viewPages{0}, viewArms{0}, privateRegions{0}, queryTicks{0}, watchCalls{0}, watchTicks{0}, watchPages{0};
+        // GetWriteWatch call durations: <1, <4, <16, <64, <256, >=256 us (calls, ticks).
+        std::array<std::atomic<std::uint64_t>, 6> watchHistogram{};
+        std::array<std::atomic<std::uint64_t>, 6> watchHistogramTicks{};
+        std::atomic<std::int64_t> reported{0};
+    };
+    static std::atomic<bool (*)()>& unlockedWatchQuery() {
+        static std::atomic<bool (*)()> query{nullptr};
+        return query;
+    }
+    static bool unlockedWatch() {
+        static const bool enabled = std::getenv("APS5_COLLECT_UNLOCKED_WATCH") != nullptr;
+        if (const auto query = unlockedWatchQuery().load(std::memory_order_acquire)) return query();
+        return enabled;
+    }
+    static bool collectProfiled() {
+        static const bool enabled = std::getenv("APS5_PROFILE_COLLECT") != nullptr;
+        return enabled;
+    }
+    static CollectProfile& collectProfile() {
+        static CollectProfile profile;
+        return profile;
+    }
+    static std::int64_t profileNow() {
+        LARGE_INTEGER now;
+        QueryPerformanceCounter(&now);
+        return now.QuadPart;
+    }
+    static double profileMs(std::uint64_t ticks) {
+        static const double scale = [] {
+            LARGE_INTEGER frequency;
+            QueryPerformanceFrequency(&frequency);
+            return 1e3 / static_cast<double>(frequency.QuadPart);
+        }();
+        return static_cast<double>(ticks) * scale;
+    }
+    static void reportCollectProfile() {
+        auto& profile = collectProfile();
+        const auto now = profileNow();
+        auto last = profile.reported.load(std::memory_order_relaxed);
+        if (last == 0) {
+            profile.reported.compare_exchange_strong(last, now);
+            return;
+        }
+        if (profileMs(static_cast<std::uint64_t>(now - last)) < 10e3 || !profile.reported.compare_exchange_strong(last, now)) return;
+        const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+        const auto ms = [](std::atomic<std::uint64_t>& value) { return profileMs(value.exchange(0, std::memory_order_relaxed)); };
+        const auto calls = take(profile.calls);
+        const auto total = ms(profile.totalTicks);
+        const auto waits = take(profile.lockWaits);
+        const auto waited = ms(profile.lockWaitTicks);
+        const auto clean = take(profile.cleanSkips);
+        const auto resident = take(profile.residentRuns);
+        const auto fresh = take(profile.residentFresh);
+        const auto viewPages = take(profile.viewPages);
+        const auto viewArms = take(profile.viewArms);
+        const auto regions = take(profile.privateRegions);
+        const auto queried = ms(profile.queryTicks);
+        const auto watchCalls = take(profile.watchCalls);
+        const auto watched = ms(profile.watchTicks);
+        const auto watchPages = take(profile.watchPages);
+        const auto retries = take(profile.unlockedRetries);
+        char histogram[256];
+        int used = 0;
+        static const char* const names[] = {"<1us", "<4us", "<16us", "<64us", "<256us", ">=256us"};
+        for (std::size_t i = 0; i < profile.watchHistogram.size() && used < static_cast<int>(sizeof(histogram)) - 40; ++i) {
+            used += std::snprintf(histogram + used, sizeof(histogram) - used, " %s %llu/%.0fms", names[i], take(profile.watchHistogram[i]), ms(profile.watchHistogramTicks[i]));
+        }
+        std::fprintf(stderr, "[collect-libc] (10 s) %llu calls %.1f ms (lock waits %llu, %.1f ms); clean skips %llu; resident runs %llu (%llu fresh); view pages %llu (%llu armed aliases); private regions %llu (VirtualQuery %.1f ms); GetWriteWatch %llu calls %.1f ms over %llu MiB (%llu unlocked calls redone locked); durations%s\n", calls, total, waits, waited, clean, resident, fresh, viewPages, viewArms, regions, queried, watchCalls, watched, watchPages * 4096ull >> 20, retries, histogram);
+    }
+
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
-        std::lock_guard lock(mutex);
+        if (!collectProfiled()) return collect(address, bytes, pages, count, clear);
+        const auto start = profileNow();
+        const bool result = collect(address, bytes, pages, count, clear);
+        auto& profile = collectProfile();
+        profile.calls.fetch_add(1, std::memory_order_relaxed);
+        profile.totalTicks.fetch_add(static_cast<std::uint64_t>(profileNow() - start), std::memory_order_relaxed);
+        reportCollectProfile();
+        return result;
+    }
+
+    bool collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear) {
+        const bool profiled = collectProfiled();
+        std::unique_lock lock(mutex, std::defer_lock);
+        if (!profiled) {
+            lock.lock();
+        } else if (!lock.try_lock()) {
+            const auto waitStart = profileNow();
+            lock.lock();
+            collectProfile().lockWaits.fetch_add(1, std::memory_order_relaxed);
+            collectProfile().lockWaitTicks.fetch_add(static_cast<std::uint64_t>(profileNow() - waitStart), std::memory_order_relaxed);
+        }
+        const auto watch = [&](DWORD flags, std::uintptr_t at, std::size_t length, void** out, ULONG_PTR* found, DWORD* granularity) {
+            if (!profiled) return GetWriteWatch(flags, reinterpret_cast<void*>(at), length, out, found, granularity);
+            const auto watchStart = profileNow();
+            const auto result = GetWriteWatch(flags, reinterpret_cast<void*>(at), length, out, found, granularity);
+            auto& profile = collectProfile();
+            profile.watchCalls.fetch_add(1, std::memory_order_relaxed);
+            profile.watchPages.fetch_add(length / 4096, std::memory_order_relaxed);
+            const auto ticks = static_cast<std::uint64_t>(profileNow() - watchStart);
+            profile.watchTicks.fetch_add(ticks, std::memory_order_relaxed);
+            const auto us = profileMs(ticks) * 1000.0;
+            const std::size_t bucket = us < 1 ? 0 : us < 4 ? 1 : us < 16 ? 2 : us < 64 ? 3 : us < 256 ? 4 : 5;
+            profile.watchHistogram[bucket].fetch_add(1, std::memory_order_relaxed);
+            profile.watchHistogramTicks[bucket].fetch_add(ticks, std::memory_order_relaxed);
+            return result;
+        };
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
+        bool retryLocked = false;
         for (auto cursor = address; cursor < end;) {
             const auto nextClean = cleanRanges.upper_bound(cursor);
             if (nextClean != cleanRanges.begin()) {
                 const auto clean = std::prev(nextClean);
                 if (cursor < clean->second) {
+                    if (profiled) collectProfile().cleanSkips.fetch_add(1, std::memory_order_relaxed);
                     cursor = std::min(end, clean->second);
                     continue;
                 }
@@ -365,6 +476,10 @@ public:
                 const auto lastBit = (stop - 1 - run->first) >> 12;
                 bool fresh = false;
                 for (auto bit = firstBit; state.fresh != 0 && bit <= lastBit && !fresh; ++bit) fresh = (state.collected[bit >> 6] >> (bit & 63) & 1) == 0;
+                if (profiled) {
+                    collectProfile().residentRuns.fetch_add(1, std::memory_order_relaxed);
+                    if (fresh) collectProfile().residentFresh.fetch_add(1, std::memory_order_relaxed);
+                }
                 if (fresh) {
                     if (lastBit - firstBit + 1 > capacity - *count) {
                         for (auto at = cursor; *count < capacity; at += 4096) pages[(*count)++] = reinterpret_cast<void*>(at);
@@ -381,11 +496,34 @@ public:
                         }
                     }
                 } else {
-                    ULONG_PTR available = capacity - *count;
+                    // At most the segment's pages: GetWriteWatch's cost grows with the output count
+                    // it is given (a 65,536-entry buffer costs ~7 us per call against ~0.3 us for a
+                    // run's 48 pages), and it cannot report more pages than the range holds.
+                    ULONG_PTR available = std::min<ULONG_PTR>(capacity - *count, (((stop + 4095) & ~std::uintptr_t{4095}) - (cursor & ~std::uintptr_t{4095})) / 4096);
                     if (available == 0) return true;
                     DWORD granularity = 0;
                     const auto before = *count;
-                    if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(cursor), stop - cursor, pages + *count, &available, &granularity) != 0) fail("collect resident guest writes");
+                    const DWORD flags = clear ? WRITE_WATCH_FLAG_RESET : 0;
+                    if (unlockedWatch() && watchResident && !armResident() && !retryLocked) {
+                        // APS5_COLLECT_UNLOCKED_WATCH=1: the kernel call over a settled run needs
+                        // nothing of this object but the addresses, so the mutex is released for it
+                        // and collects of other threads (and the mappers) run meanwhile. A run
+                        // converted meanwhile (cut, shared, evicted, unmapped) makes the call fail,
+                        // and the segment is resolved again under the mutex; a call that succeeded
+                        // on the old allocation reported its writes. The next segment is looked up
+                        // afresh after relocking.
+                        lock.unlock();
+                        const auto result = watch(flags, cursor, stop - cursor, pages + *count, &available, &granularity);
+                        lock.lock();
+                        if (result != 0) {
+                            retryLocked = true;
+                            if (profiled) collectProfile().unlockedRetries.fetch_add(1, std::memory_order_relaxed);
+                            continue;
+                        }
+                    } else if (watch(flags, cursor, stop - cursor, pages + *count, &available, &granularity) != 0) {
+                        fail("collect resident guest writes");
+                    }
+                    retryLocked = false;
                     *count += available;
                     if (*count == capacity) return true;
                     if (clear && watchResident) armClean(cursor, stop, pages + before, *count - before);
@@ -394,6 +532,7 @@ public:
             } else if (found != views.end()) {
                 auto& view = found->second;
                 const auto stop = std::min(end, base + pageBytes);
+                if (profiled) collectProfile().viewPages.fetch_add(1, std::memory_order_relaxed);
                 if (view.protection == PAGE_NOACCESS) return false;
                 const bool pinned = view.page->pins != 0;
                 if (pinned || view.seen != view.page->generation) {
@@ -412,19 +551,25 @@ public:
                         const DWORD protection = other.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
                         if (!VirtualProtect(reinterpret_cast<void*>(alias), pageBytes, protection, &previous)) fail("arm shared memory write tracking");
                         other.armed = true;
+                        if (profiled) collectProfile().viewArms.fetch_add(1, std::memory_order_relaxed);
                     }
                     view.seen = view.page->generation;
                     rememberClean(base, base + pageBytes);
                 }
                 cursor = stop;
             } else {
+                const auto queryStart = profiled ? profileNow() : 0;
                 const auto memory = query(cursor);
+                if (profiled) {
+                    collectProfile().privateRegions.fetch_add(1, std::memory_order_relaxed);
+                    collectProfile().queryTicks.fetch_add(static_cast<std::uint64_t>(profileNow() - queryStart), std::memory_order_relaxed);
+                }
                 if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
                 const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
-                ULONG_PTR available = capacity - *count;
+                ULONG_PTR available = std::min<ULONG_PTR>(capacity - *count, (((stop + 4095) & ~std::uintptr_t{4095}) - (cursor & ~std::uintptr_t{4095})) / 4096);
                 if (available == 0) return true;
                 DWORD granularity = 0;
-                if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(cursor), stop - cursor, pages + *count, &available, &granularity) != 0) fail("collect private guest writes");
+                if (watch(clear ? WRITE_WATCH_FLAG_RESET : 0, cursor, stop - cursor, pages + *count, &available, &granularity) != 0) fail("collect private guest writes");
                 *count += available;
                 if (*count == capacity) return true;
                 cursor = stop;

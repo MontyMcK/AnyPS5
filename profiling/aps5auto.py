@@ -224,7 +224,10 @@ class Game:
             return image
         # Only a run that is dumping frames (a dump in the last two minutes) is worth waiting for.
         if dump_fallback and newest_frame_dump(self.frames_dir, newer_than=requested - 120.0):
-            dump = newest_frame_dump(self.frames_dir, newer_than=requested, wait=min(timeout, 10.0))
+            # A covered window can wait for the next dump (one every APS5_DUMP_FRAMES_EVERY frames, which
+            # at the race's frame rate can be tens of seconds away); a black capture needs only a moment.
+            covered = 'covered' in str(reply.get('error', ''))
+            dump = newest_frame_dump(self.frames_dir, newer_than=requested, wait=min(timeout, 45.0 if covered else 10.0))
             if dump:
                 image = Image.load(dump)
                 image.info = dict(reply, ok=True, method='frame-dump', path=dump)

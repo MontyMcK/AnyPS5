@@ -327,10 +327,19 @@ void DrawPipeline::Prepare(Commit job, std::vector<Range> writes, std::uint64_t 
     prepWake.notify_one();
 }
 
+namespace {
+// Per-thread waits inside the pipeline (ms), for the [slow-prep] lines.
+thread_local double threadTurnWaitMs = 0;
+thread_local double threadRoomWaitMs = 0;
+thread_local double threadDrainWaitMs = 0;
+}
+
 void DrawPipeline::waitPrepTurn(std::uint64_t sequence) {
     const TraceScope trace(Trace::PrepTurn, Trace::PrepTurnEnd);
+    const auto start = std::chrono::steady_clock::now();
     std::unique_lock lock(prepMutex);
     prepTurnChanged.wait(lock, [&] { return prepTurn == sequence; });
+    threadTurnWaitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
 void DrawPipeline::finishPrepTurn(std::uint64_t sequence) {
@@ -384,6 +393,7 @@ void DrawPipeline::pushItem(Item item) {
         idle.wait(lock, [&] { return items.size() < Depth(); });
         --idleWaiters;
         fullWaitNs += elapsedNs(start);
+        threadRoomWaitMs += static_cast<double>(elapsedNs(start)) / 1e6;
     }
     depthSum += items.size();
     ++enqueued;
@@ -399,6 +409,7 @@ void DrawPipeline::pushItem(Item item) {
 
 void DrawPipeline::prepRun() {
     Active() = true;
+    GuestMemory::SetCollectRole(2);
     for (;;) {
         std::pair<std::uint64_t, Commit> job;
         {
@@ -412,6 +423,33 @@ void DrawPipeline::prepRun() {
         const auto start = std::chrono::steady_clock::now();
         bool failed = false;
         PipeTrace(Trace::Prep, static_cast<std::uint32_t>(job.first & 0xffffu));
+        const auto syncsBefore = Graphics::ThreadHookSyncs();
+        struct Waits {
+            double turn, room, drain, lock;
+        };
+        const Waits waitsBefore{threadTurnWaitMs, threadRoomWaitMs, threadDrainWaitMs, GuestMemory::ThreadGpuLockWaitMs()};
+        struct SlowPrep {
+            std::chrono::steady_clock::time_point start;
+            std::pair<double, std::uint64_t> syncsBefore;
+            Waits waitsBefore;
+            ~SlowPrep() {
+                // [slow-prep] (APS5_PROFILE_DRAW): a preparation job over 5 ms, with the GPU-sync
+                // waits it made, since one slow job stalls the in-order hand-off behind it.
+                static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+                if (!profile) return;
+                const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                if (ms < 5.0) return;
+                // At most 25 lines per 10 s, so every phase of a run (boot, load, race) gets some.
+                static std::atomic<std::int64_t> windowStart{0};
+                static std::atomic<int> told{0};
+                const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+                auto began = windowStart.load(std::memory_order_relaxed);
+                if (now - began > 10'000'000'000ll && windowStart.compare_exchange_strong(began, now)) told.store(0, std::memory_order_relaxed);
+                if (told.fetch_add(1, std::memory_order_relaxed) >= 25) return;
+                const auto syncs = Graphics::ThreadHookSyncs();
+                std::fprintf(stderr, "[slow-prep] %.1f ms (GPU-sync waits %.1f ms in %llu; waited for: turn %.1f ms, committer room %.1f ms, drains %.1f ms, GPU mutex %.1f ms)\n", ms, syncs.first - syncsBefore.first, static_cast<unsigned long long>(syncs.second - syncsBefore.second), threadTurnWaitMs - waitsBefore.turn, threadRoomWaitMs - waitsBefore.room, threadDrainWaitMs - waitsBefore.drain, GuestMemory::ThreadGpuLockWaitMs() - waitsBefore.lock);
+            }
+        } slowPrep{start, syncsBefore, waitsBefore};
         try {
             job.second();
         } catch (const std::exception& error) {
@@ -457,6 +495,17 @@ void DrawPipeline::drainPrep() {
 
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, bool unknownWrites, std::shared_ptr<ForkJob> fork) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    // A job the queue thread hands over (a pipelined DMA store or copy, an ordered fill or label,
+    // a pipelined dispatch) collects under the epoch of the packet that made it, as the queue
+    // thread would have: it follows the token current here. Without it the committer would collect
+    // under whatever token the last draw followed, an older ordering point. Draw commits follow
+    // their own token inside (the later FollowEpoch wins); a newer token only asks for newer walks.
+    if (!OnPrepThread()) {
+        commit = [token = EpochToken().load(std::memory_order_acquire), inner = std::move(commit)] {
+            FollowEpoch(token);
+            inner();
+        };
+    }
     static const bool orderedHandoff = std::getenv("APS5_NO_ORDERED_HANDOFF") == nullptr;
     if (orderedHandoff && SplitDraws() && !OnPrepThread() && prepOutstanding.load(std::memory_order_acquire) != 0) {
         // Behind the outstanding preparations, in their order, instead of waiting for them.
@@ -564,6 +613,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 }
 
 void DrawPipeline::run() {
+    GuestMemory::SetCollectRole(1);
     static const auto holdBudget = [] {
         const char* text = std::getenv("APS5_COMMIT_HOLD_US");
         const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 300ull;
@@ -628,6 +678,31 @@ void DrawPipeline::run() {
 
 bool DrawPipeline::runCommit(const Commit& commit, std::uint64_t sequence, std::shared_ptr<ReplaySegment> segment) {
     const auto start = std::chrono::steady_clock::now();
+    // [slow-commit] (APS5_PROFILE_DRAW): a commit over 5 ms with what it waited for, at most 25
+    // lines per 10 s; a slow commit stalls every preparation queued behind it.
+    struct SlowCommit {
+        std::chrono::steady_clock::time_point start;
+        const Commit& commit;
+        std::pair<double, std::uint64_t> syncs = Graphics::ThreadHookSyncs();
+        double locked = GuestMemory::ThreadLockedGpuWaitMs();
+        double mutex = GuestMemory::ThreadGpuLockWaitMs();
+        ~SlowCommit() {
+            static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+            if (!profile) return;
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            if (ms < 5.0) return;
+            static std::atomic<std::int64_t> windowStart{0};
+            static std::atomic<int> told{0};
+            const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+            auto began = windowStart.load(std::memory_order_relaxed);
+            if (now - began > 10'000'000'000ll && windowStart.compare_exchange_strong(began, now)) told.store(0, std::memory_order_relaxed);
+            if (told.fetch_add(1, std::memory_order_relaxed) >= 25) return;
+            const auto after = Graphics::ThreadHookSyncs();
+            const char* kind = commit.target_type().name();
+            const auto length = std::strlen(kind);
+            std::fprintf(stderr, "[slow-commit] %.1f ms (GPU-sync %.1f ms in %llu, locked GPU waits %.1f ms, GPU mutex %.1f ms) kind ...%s\n", ms, after.first - syncs.first, static_cast<unsigned long long>(after.second - syncs.second), GuestMemory::ThreadLockedGpuWaitMs() - locked, GuestMemory::ThreadGpuLockWaitMs() - mutex, length > 90 ? kind + length - 90 : kind);
+        }
+    } slowCommit{start, commit};
     std::exception_ptr fatal;
     bool failed = false;
     PipeTrace(Trace::Commit);
@@ -786,6 +861,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     ++drains[index];
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
     drainWaitNs[index] += elapsedNs(start);
+    threadDrainWaitMs += static_cast<double>(elapsedNs(start)) / 1e6;
     rethrowFailure();
 }
 

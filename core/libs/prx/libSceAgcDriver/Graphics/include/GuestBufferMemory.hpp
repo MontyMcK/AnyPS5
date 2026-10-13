@@ -254,6 +254,24 @@ public:
     // through a device-local staging copy of the import (nothing was copied through the CPU, so the
     // upload can serve a later identical build), else nothing.
     std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> DirectRegions() const;
+    // Stream templates (ShaderResources::StreamRing): an upload DirectRegions refuses only because
+    // some regions were copied through the CPU can still serve a later identical draw when every
+    // such region is small (at most `limit` bytes), read-only to the shader, live guest bytes (not a
+    // snapshot) and not sparse: a hit then copies the current bytes of those ranges into a per-draw
+    // ring slice instead of trusting the copy this upload made. `direct` gets the regions
+    // DirectRegions would have listed (imports and read-only mirrors, proved by serial as before),
+    // `copied` the CPU-copied ones (outside imports, or a non-staged misaligned copy inside one).
+    // Nothing (and `why`, when given, the first refusal met) when a region is none of these: a
+    // range the shader may write, one over the limit, a sparse heap, a writable or heap mirror (its
+    // shadow is diffed at write-back), a snapshot, a staged region, or an address-based space;
+    // nothing with `why` None when no region was copied at all (DirectRegions decides) or the upload
+    // is not complete. Changes nothing (the [reuse] counters call it with the switch off too).
+    enum class StreamRefusal : std::uint8_t { None, Written, Large, Sparse, WritableMirror, Snapshot, Staged, Space, Count };
+    struct StreamRegions {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> direct;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> copied;
+    };
+    std::optional<StreamRegions> StreamableRegions(std::size_t limit, StreamRefusal* why) const;
     // Every region the recorded work reads in place through a host import, as [begin, end): the
     // regions bound in place (`direct`), an address-based build's leased heaps included. A region
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.

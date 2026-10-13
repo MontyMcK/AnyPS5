@@ -42,6 +42,11 @@ struct TableEntry {
     std::weak_ptr<Buffer> buffer;
     std::uint64_t spaceSerial = 0;
     bool deviceLocal = false;
+    // Built with the dense window (BdaBucketWindow::windowed): the index layout is part of the key,
+    // or a build after a live toggle would keep binding the other layout's tables by the serial
+    // (exact either way, but the A/B would measure the wrong one). Keyed on the layout built, not
+    // the flag: with no cluster the flag-on table is the whole-span one and shares its entry.
+    bool dense = false;
 };
 
 struct TableCache {
@@ -161,50 +166,28 @@ bool FaultBufferPoolEnabled() {
 
 constexpr std::size_t FaultHeaderBytes = (ShaderRecompiler::BdaAbi::WrittenOverflowWord + 1) * sizeof(std::uint32_t);
 
-// APS5_BDA_BUCKETS=N caps the lookup index at N buckets (0: no index, every lookup searches all ranges).
-std::size_t bucketLimit() {
-    static const std::size_t limit = [] {
-        const char* text = std::getenv("APS5_BDA_BUCKETS");
-        return text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{4096};
-    }();
-    return limit;
-}
-
 struct BucketIndex {
     ShaderRecompiler::BdaAbi::BucketHeader header{};
     std::vector<std::uint32_t> bounds;
 };
 
-std::pair<std::uint32_t, std::size_t> bucketShape(const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
-    const auto limit = bucketLimit();
-    if (limit == 0 || ranges.size() < 16) return {0, 0};
-    const auto first = ranges.front().begin;
-    const auto last = ranges.back().end;
-    std::uint32_t shift = 12;
-    const auto bucketsFor = [&](std::uint32_t bits) { return (last - (first & ~((std::uint64_t{1} << bits) - 1u)) + (std::uint64_t{1} << bits) - 1u) >> bits; };
-    while (shift < 48 && bucketsFor(shift) > limit) ++shift;
-    const auto count = bucketsFor(shift);
-    if (count == 0 || count > limit) return {0, 0};
-    return {shift, static_cast<std::size_t>(count)};
+std::size_t bucketBytes(const BdaBucketWindow& window) {
+    return window.count == 0 ? 0 : sizeof(ShaderRecompiler::BdaAbi::BucketHeader) + window.count * 2u * sizeof(std::uint32_t);
 }
 
-std::size_t bucketBytes(const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
-    const auto count = bucketShape(ranges).second;
-    return count == 0 ? 0 : sizeof(ShaderRecompiler::BdaAbi::BucketHeader) + count * 2u * sizeof(std::uint32_t);
-}
-
-BucketIndex buildBuckets(const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
+// Per bucket, the ranges [low, high) that intersect it. The sweep works for a window starting past
+// the first ranges (the dense window): `low` skips the ranges that end below the bucket.
+BucketIndex buildBuckets(const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, const BdaBucketWindow& window) {
     BucketIndex index;
-    const auto [shift, count] = bucketShape(ranges);
-    if (count == 0) return index;
-    index.header.base = ranges.front().begin & ~((std::uint64_t{1} << shift) - 1u);
-    index.header.shift = shift;
-    index.bounds.resize(count * 2u);
+    if (window.count == 0) return index;
+    index.header.base = window.base;
+    index.header.shift = window.shift;
+    index.bounds.resize(window.count * 2u);
     std::size_t low = 0;
     std::size_t high = 0;
-    for (std::size_t bucket = 0; bucket < count; ++bucket) {
-        const auto start = index.header.base + (static_cast<std::uint64_t>(bucket) << shift);
-        const auto stop = start + (std::uint64_t{1} << shift);
+    for (std::size_t bucket = 0; bucket < window.count; ++bucket) {
+        const auto start = index.header.base + (static_cast<std::uint64_t>(bucket) << window.shift);
+        const auto stop = start + (std::uint64_t{1} << window.shift);
         while (low < ranges.size() && ranges[low].end <= start) ++low;
         while (high < ranges.size() && ranges[high].begin < stop) ++high;
         index.bounds[bucket * 2u] = static_cast<std::uint32_t>(low);
@@ -213,6 +196,123 @@ BucketIndex buildBuckets(const std::vector<ShaderRecompiler::BdaAbi::Range>& ran
     return index;
 }
 
+// [bda-buckets] (see BdaResources::TakeBucketCounters): gathered only under APS5_PROFILE_DRAW, on
+// table builds (cache misses), and reported once the dense window has been asked for, so a run that
+// never sets bda_dense_buckets prints what it printed before.
+struct BucketCounters {
+    std::mutex mutex;
+    BdaResources::BucketStats stats;
+};
+
+BucketCounters& Buckets() {
+    static BucketCounters counters;
+    return counters;
+}
+
+std::atomic<bool> denseRequested{false};
+
+void countBuckets(const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, const BdaBucketWindow& window, const BucketIndex& index, bool dense) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    // Nothing is printed until the window has been asked for, so do not time the walk before then.
+    if (!profile || !denseRequested.load(std::memory_order_relaxed)) return;
+    std::uint64_t inside = 0;
+    if (window.windowed) {
+        const auto stop = window.base + (static_cast<std::uint64_t>(window.count) << window.shift);
+        for (const auto& range : ranges) inside += range.end > window.base && range.begin < stop ? 1u : 0u;
+    }
+    BdaResources::BucketShapeStats shape;
+    for (std::size_t bucket = 0; bucket < window.count; ++bucket) {
+        const std::uint64_t entries = index.bounds[bucket * 2u + 1u] - index.bounds[bucket * 2u];
+        if (entries == 0) continue;
+        ++shape.buckets;
+        shape.entries += entries;
+        shape.maxEntries = std::max(shape.maxEntries, entries);
+    }
+    auto& counters = Buckets();
+    std::lock_guard lock(counters.mutex);
+    auto& stats = counters.stats;
+    if (window.count == 0) ++stats.noIndex;
+    else if (window.windowed) ++stats.windowed;
+    else if (dense) ++stats.noCluster;
+    else ++stats.flagOff;
+    if (window.windowed) {
+        stats.windowBytes += static_cast<std::uint64_t>(window.count) << window.shift;
+        stats.inside += inside;
+        stats.outside += ranges.size() - inside;
+    }
+    auto& into = window.windowed ? stats.window : stats.whole;
+    into.buckets += shape.buckets;
+    into.entries += shape.entries;
+    into.maxEntries = std::max(into.maxEntries, shape.maxEntries);
+}
+
+}
+
+std::size_t BdaBucketLimit() {
+    // APS5_BDA_BUCKETS=N caps the lookup index at N buckets (0: no index, every lookup searches all ranges).
+    static const std::size_t limit = [] {
+        const char* text = std::getenv("APS5_BDA_BUCKETS");
+        return text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{4096};
+    }();
+    return limit;
+}
+
+bool BdaDenseBuckets() {
+    static const bool requested = std::getenv("APS5_BDA_DENSE_BUCKETS") != nullptr;
+    const bool dense = LiveFlag("bda_dense_buckets", requested);
+    if (dense && !denseRequested.load(std::memory_order_relaxed)) denseRequested.store(true, std::memory_order_relaxed);
+    return dense;
+}
+
+BdaBucketWindow BdaBucketShape(const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges, std::size_t limit, bool dense) {
+    if (limit == 0 || ranges.size() < 16) return {};
+    // [first, last) in at most `limit` buckets of the smallest power of two from 4 KiB.
+    const auto fit = [limit](std::uint64_t first, std::uint64_t last) -> BdaBucketWindow {
+        const auto bucketsFor = [&](std::uint32_t bits) { return (last - (first & ~((std::uint64_t{1} << bits) - 1u)) + (std::uint64_t{1} << bits) - 1u) >> bits; };
+        std::uint32_t shift = 12;
+        while (shift < 48 && bucketsFor(shift) > limit) ++shift;
+        const auto count = bucketsFor(shift);
+        if (count == 0 || count > limit) return {};
+        return {first & ~((std::uint64_t{1} << shift) - 1u), shift, static_cast<std::size_t>(count), false};
+    };
+    if (dense) {
+        // Clusters split where the next range starts more than 4 GiB past the previous one's end:
+        // the exe image and system heaps below 0x10000000, the guest heap at 0x10_0000_0000 and
+        // up, the image mirrors at 0x7ff6.... The mirrors are left out: they are a few large
+        // ranges, and the lookups that serialize (the BVH refits' waterfall V#s) read guest memory.
+        constexpr std::uint64_t ClusterGap = std::uint64_t{4} << 30u;
+        constexpr std::uint64_t MirrorFloor = 0x7000'0000'0000ull;
+        std::size_t bestBegin = 0, bestEnd = 0, begin = 0;
+        for (std::size_t at = 1; at <= ranges.size(); ++at) {
+            if (at < ranges.size() && !(ranges[at].begin > ranges[at - 1u].end && ranges[at].begin - ranges[at - 1u].end > ClusterGap)) continue;
+            if (ranges[begin].begin < MirrorFloor) {
+                const auto entries = at - begin, best = bestEnd - bestBegin;
+                const auto span = ranges[at - 1u].end - ranges[begin].begin;
+                if (entries > best || (entries == best && span < ranges[bestEnd - 1u].end - ranges[bestBegin].begin)) {
+                    bestBegin = begin;
+                    bestEnd = at;
+                }
+            }
+            begin = at;
+        }
+        if (bestEnd - bestBegin >= 16) {
+            auto window = fit(ranges[bestBegin].begin, ranges[bestEnd - 1u].end);
+            if (window.count != 0) {
+                window.windowed = true;
+                return window;
+            }
+        }
+    }
+    return fit(ranges.front().begin, ranges.back().end);
+}
+
+BdaResources::BucketStats BdaResources::TakeBucketCounters() {
+    auto& counters = Buckets();
+    std::lock_guard lock(counters.mutex);
+    auto stats = counters.stats;
+    counters.stats = {};
+    stats.requested = denseRequested.load(std::memory_order_relaxed);
+    return stats;
 }
 
 BdaResources::BdaResources(const Context& context) : device(context.device) {
@@ -240,18 +340,30 @@ BdaResources::~BdaResources() {
     static const bool clock = std::getenv("APS5_BDA_CLOCK") != nullptr;
     if (clock && fault != nullptr) {
         namespace Abi = ShaderRecompiler::BdaAbi;
-        static std::atomic<std::uint64_t> lookup{0}, total{0}, calls{0};
+        // Split by dispatch and draw (SetCompute): only the dispatches' (Phase A, GPU-bound) share
+        // can turn into frame time, since the draws' phase is bound by the committer on the CPU.
+        struct Sums {
+            std::atomic<std::uint64_t> lookup{0}, total{0}, calls{0};
+        };
+        static Sums sums[2];
         static std::atomic<std::int64_t> reportAt{0};
         auto* words = reinterpret_cast<std::uint32_t*>(fault->Bytes().data());
-        lookup.fetch_add(words[Abi::ClockLookupWord], std::memory_order_relaxed);
-        total.fetch_add(words[Abi::ClockTotalWord], std::memory_order_relaxed);
-        calls.fetch_add(words[Abi::ClockCallsWord], std::memory_order_relaxed);
+        auto& into = sums[compute ? 1 : 0];
+        into.lookup.fetch_add(words[Abi::ClockLookupWord], std::memory_order_relaxed);
+        into.total.fetch_add(words[Abi::ClockTotalWord], std::memory_order_relaxed);
+        into.calls.fetch_add(words[Abi::ClockCallsWord], std::memory_order_relaxed);
         words[Abi::ClockLookupWord] = words[Abi::ClockTotalWord] = words[Abi::ClockCallsWord] = 0;
         const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
         auto due = reportAt.load(std::memory_order_relaxed);
         if (now >= due && reportAt.compare_exchange_strong(due, now + 5'000'000'000ll)) {
-            const auto l = lookup.exchange(0), t = total.exchange(0), c = calls.exchange(0);
-            std::fprintf(stderr, "[bda-clock] lookup %.1f%% of subgroup cycles (%llu of %llu x64), %llu lookups\n", t != 0 ? 100.0 * static_cast<double>(l) / static_cast<double>(t) : 0.0, static_cast<unsigned long long>(l), static_cast<unsigned long long>(t), static_cast<unsigned long long>(c));
+            std::uint64_t l[2], t[2], c[2];
+            for (int kind = 0; kind < 2; ++kind) {
+                l[kind] = sums[kind].lookup.exchange(0);
+                t[kind] = sums[kind].total.exchange(0);
+                c[kind] = sums[kind].calls.exchange(0);
+            }
+            const auto share = [](std::uint64_t part, std::uint64_t whole) { return whole != 0 ? 100.0 * static_cast<double>(part) / static_cast<double>(whole) : 0.0; };
+            std::fprintf(stderr, "[bda-clock] lookup %.1f%% of subgroup cycles (%llu of %llu x64), %llu lookups; compute %.1f%% (%llu lookups) / graphics %.1f%% (%llu lookups)\n", share(l[0] + l[1], t[0] + t[1]), static_cast<unsigned long long>(l[0] + l[1]), static_cast<unsigned long long>(t[0] + t[1]), static_cast<unsigned long long>(c[0] + c[1]), share(l[1], t[1]), static_cast<unsigned long long>(c[1]), share(l[0], t[0]), static_cast<unsigned long long>(c[0]));
         }
     }
     if (fault == nullptr || !FaultBufferPoolEnabled() || (mayWrite && !checked)) return;
@@ -269,6 +381,9 @@ BdaResources::~BdaResources() {
 
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
     const bool deviceLocal = (LivePerformanceControls().Get() & PerformanceControls::BdaTableDeviceLocal) != 0;
+    // Read once: the table's size and its index must come from the same value, and a table whose
+    // index words disagree with its size fails every lookup (InvalidTable).
+    const bool dense = BdaDenseBuckets();
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
@@ -295,7 +410,8 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     const auto& tableRanges = joining ? joined : ranges;
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
-    tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + tableRanges.size() * sizeof(ShaderRecompiler::BdaAbi::Range) + bucketBytes(tableRanges);
+    const auto window = BdaBucketShape(tableRanges, BdaBucketLimit(), dense);
+    tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + tableRanges.size() * sizeof(ShaderRecompiler::BdaAbi::Range) + bucketBytes(window);
     Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
     auto& cache = Tables();
     std::uint64_t hash = 0;
@@ -308,7 +424,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         }
         if (serial != 0) {
             for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
-                if (it->spaceSerial != serial || it->deviceLocal != deviceLocal) continue;
+                if (it->spaceSerial != serial || it->deviceLocal != deviceLocal || it->dense != window.windowed) continue;
                 if (auto shared = it->buffer.lock(); shared != nullptr) {
                     ++cache.hits;
                     ++cache.classes.spaceTables;
@@ -326,7 +442,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             // Compare the hash before taking a strong reference: locking a non-matching entry's
             // buffer could make this thread its last owner (a concurrent reap releasing it) and
             // run the pool release under the cache mutex; expired() takes no reference.
-            if (it->hash != hash || it->deviceLocal != deviceLocal) {
+            if (it->hash != hash || it->deviceLocal != deviceLocal || it->dense != window.windowed) {
                 if (it->buffer.expired()) {
                     it = cache.entries.erase(it);
                 } else {
@@ -352,7 +468,8 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             ++it;
         }
     }
-    const auto buckets = buildBuckets(tableRanges);
+    const auto buckets = buildBuckets(tableRanges, window);
+    countBuckets(tableRanges, window, buckets, dense);
     static std::atomic<int> tablesLogged{0};
     if (std::getenv("APS5_TRACE_BDA_TABLES") != nullptr && tablesLogged.fetch_add(1, std::memory_order_relaxed) < 40) {
         std::uint64_t largest = 0, total = 0;
@@ -386,7 +503,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cache.entries.clear();
             cache.device = context.device;
         }
-        cache.entries.push_front({hash, cached.has_value() ? ranges : std::move(built), table, serial, deviceLocal});
+        cache.entries.push_front({hash, cached.has_value() ? ranges : std::move(built), table, serial, deviceLocal, window.windowed});
         while (cache.entries.size() > tableCacheEntries()) cache.entries.pop_back();
     }
 }
@@ -411,6 +528,7 @@ std::unique_ptr<BdaResources> BdaResources::ShareTable(const Context& context) c
     shared->table = table;
     shared->tableBytes = tableBytes;
     shared->mayWrite = mayWrite;
+    shared->compute = compute;
     return shared;
 }
 

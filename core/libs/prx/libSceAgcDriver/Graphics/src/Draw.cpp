@@ -242,9 +242,10 @@ struct DrawOutcome {
 };
 
 // The resources of a draw: a recipe hit (reserved for the draw recipe step), a resource-cache
-// template hit, a build, or an address-based (BDA) build.
-enum DrawKind : std::size_t { KindRecipeHit, KindTemplateHit, KindBuild, KindBda, KindBdaHit, KindCount };
-constexpr std::array<const char*, KindCount> DrawKindNames{"recipe hit", "template hit", "build", "BDA", "BDA template hit"};
+// template hit, a build, an address-based (BDA) build, a BDA template hit, or a hit on a stream
+// template (ShaderResources::StreamRing; printed only once one happened).
+enum DrawKind : std::size_t { KindRecipeHit, KindTemplateHit, KindBuild, KindBda, KindBdaHit, KindStreamHit, KindCount };
+constexpr std::array<const char*, KindCount> DrawKindNames{"recipe hit", "template hit", "build", "BDA", "BDA template hit", "stream template hit"};
 
 struct DrawProfile {
     std::mutex mutex;
@@ -298,6 +299,10 @@ struct DrawProfile {
     std::uint64_t cacheMisses = 0;
     std::uint64_t cacheInvalidated = 0;
     std::uint64_t uncacheable = 0;
+    // Stream templates (the [reuse] line): valid ones whose moved check refused the hit (the draw
+    // built), and ones dropped when found with the switch off.
+    std::uint64_t streamRefused = 0;
+    std::uint64_t streamDropped = 0;
     // Shader validation memo (see CachedFragmentOutputs).
     std::uint64_t validateHits = 0;
     std::uint64_t validateMisses = 0;
@@ -469,6 +474,8 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
     for (std::size_t kind = 0; kind < KindCount && room(); ++kind) {
+        // Without a stream hit the line stays as it was before stream templates existed.
+        if (kind == KindStreamHit && profile.kindCounts[kind] == 0) continue;
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %.0f (%llu)", DrawKindNames[kind], average(profile.kindUs[kind], profile.kindCounts[kind]), static_cast<unsigned long long>(profile.kindCounts[kind]));
     }
     // The longest draw and the longest single phase of any draw (which phase a long 'draw' hold
@@ -508,6 +515,27 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         const auto perHit = [&](double us) { return address.timedHits != 0 ? us / static_cast<double>(address.timedHits) : 0.0; };
         std::fprintf(stderr, "[rescache] address templates (cumulative): %llu hits (%llu moved guest buffers rebound), %llu inserted; misses: space replaced %llu, imports %llu, proof %llu, moved buffers %llu, moved outside the space %llu, snapshot outside %llu; us per hit: moved check %.1f, space %.1f, proof %.1f, finish %.1f, descriptor set %.1f\n", static_cast<unsigned long long>(address.hits), static_cast<unsigned long long>(address.movedBuffers), static_cast<unsigned long long>(address.detached), missed(Miss::Replaced), missed(Miss::Imports), missed(Miss::Proof), missed(Miss::Moved), missed(Miss::MovedOutside), missed(Miss::Outside), perHit(address.movedUs), perHit(address.spaceUs), perHit(address.proofUs), perHit(address.finishUs), perHit(address.setUs));
     }
+    {
+        // Draw builds by noteReusable's verdict over the last 10 s (see ShaderResources::ReuseStats):
+        // with the stream_ring switch off, 'streamable' over 'draw builds' is the share of builds
+        // stream templates would serve; with it on, the stream hits and their copies.
+        static ShaderResources::ReuseStats last;
+        const auto now = ShaderResources::ReuseCounters();
+        const auto delta = [](std::uint64_t current, std::uint64_t previous) { return static_cast<unsigned long long>(current - previous); };
+        constexpr std::array<const char*, static_cast<std::size_t>(GuestBufferMemory::StreamRefusal::Count)> refusalNames{"other", "written", "over limit", "sparse", "writable mirror", "snapshot", "staged", "address space"};
+        std::string refusals;
+        for (std::size_t index = 0; index < refusalNames.size(); ++index) {
+            if (const auto count = delta(now.copyRefused[index], last.copyRefused[index]); count != 0) refusals += " " + std::string(refusalNames[index]) + " " + std::to_string(count);
+        }
+        const auto builds = delta(now.builds, last.builds);
+        const auto streamable = delta(now.streamableOff, last.streamableOff) + delta(now.streamMade, last.streamMade);
+        std::fprintf(stderr, "[reuse] (10 s) %llu draw builds: in place %llu, stream templates made %llu, streamable with the switch off %llu (%.0f%% of builds streamable); refused: completion or lease %llu, per-use texture %llu, data over 64 KiB %llu, copied region:%s%s, straddled %llu, no serial %llu; copied %llu ranges (%.1f KiB); stream hits %llu, refused at hit %llu, dropped by the switch %llu; streamed %llu ranges (%.1f KiB), verified %llu\n",
+            builds, delta(now.inPlace, last.inPlace), delta(now.streamMade, last.streamMade), delta(now.streamableOff, last.streamableOff), builds != 0 ? 100.0 * static_cast<double>(streamable) / static_cast<double>(builds) : 0.0,
+            delta(now.completion, last.completion), delta(now.perUseTexture, last.perUseTexture), delta(now.largeData, last.largeData), refusals.empty() ? " none" : "", refusals.c_str(), delta(now.straddled, last.straddled), delta(now.noSerial, last.noSerial),
+            delta(now.copiedRanges, last.copiedRanges), static_cast<double>(now.copiedBytes - last.copiedBytes) / 1024.0, static_cast<unsigned long long>(profile.kindCounts[KindStreamHit]), static_cast<unsigned long long>(profile.streamRefused), static_cast<unsigned long long>(profile.streamDropped),
+            delta(now.streamedRanges, last.streamedRanges), static_cast<double>(now.streamedBytes - last.streamedBytes) / 1024.0, delta(now.verified, last.verified));
+        last = now;
+    }
     if (DrawSpeculationEnabled()) reportSpeculation();
     if (DrawTokensEnabled() || InputTokensEnabled() || TargetTokensEnabled()) reportTokens();
     profile.totalsUs.fill(0);
@@ -526,6 +554,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.kindUs.fill(0);
     profile.kindCounts.fill(0);
     profile.cacheHits = profile.cacheMisses = profile.cacheInvalidated = profile.uncacheable = 0;
+    profile.streamRefused = profile.streamDropped = 0;
     profile.validateHits = profile.validateMisses = 0;
     profile.recipeHits = 0;
     profile.recipeMisses.fill(0);
@@ -1782,6 +1811,17 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         const auto sameMoved = [](std::span<const ShaderResources::MovedBuffer> left, std::span<const ShaderResources::MovedBuffer> right) {
             return std::equal(left.begin(), left.end(), right.begin(), right.end(), [](const ShaderResources::MovedBuffer& a, const ShaderResources::MovedBuffer& b) { return a.allocation == b.allocation && a.address == b.address && a.size == b.size && a.words == b.words; });
         };
+        // A stream template made while the stream_ring switch was on is dropped once the switch is
+        // off, so an A/B toggle compares against today's behaviour: the draw builds as before.
+        if (cached != nullptr && cached->Streamed() && !ShaderResources::StreamRing()) {
+            ForkTrap("resource invalidated");
+            SharedResourceCache().Remove(resolved.contentKey, cached.get());
+            countCache(&DrawProfile::cacheInvalidated);
+            countCache(&DrawProfile::streamDropped);
+            cached = nullptr;
+            speculatedProof = false;
+            speculatedUse = nullptr;
+        }
         if (cached != nullptr && cached->AddressReusable() && ForkLogged() != nullptr) {
             auto speculated = forkSpeculation;
             if (speculated == nullptr || speculated->kind != DrawSpeculation::Kind::Address || speculated->device != context.device || speculated->source != cached || speculated->use == nullptr || speculated->key != resolved.contentKey) {
@@ -1858,10 +1898,11 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 splitLap(splitStats.aliasNs);
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
-                outcome.kind = KindTemplateHit;
+                outcome.kind = resolved.resources->Streamed() ? KindStreamHit : KindTemplateHit;
                 countCache(&DrawProfile::cacheHits);
             } else if (valid) {
                 countCache(&DrawProfile::cacheMisses);
+                if (cached->Streamed()) countCache(&DrawProfile::streamRefused);
             } else {
                 ForkTrap("resource invalidated");
                 SharedResourceCache().Remove(resolved.contentKey);
@@ -2093,7 +2134,9 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     // next serial), or waited for by the caller (any wait releases it at once).
     if (resources->HoldsLease()) CountLeaseOutcome(outcome.waited, outcome.waited ? 0 : recorder.Submissions() + 1);
     // Every use of a (possibly shared) resources object registers its GPU writes anew.
+    Recorder::SetNoteProgram(1);
     resources->MarkGpuWrites(recorder);
+    Recorder::SetNoteProgram(0);
     // The write-back (fault check, copied buffers) runs when the batch completed; a fault is
     // reported by the recorder ("deferred write-back failed") instead of thrown out of the draw.
     if (listed) {
@@ -2931,7 +2974,9 @@ void drawPrepared(const Context& context, const State& state, const Pm4::DrawPar
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
-        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && RecipeEligibleTargets(state, resolved.moved)) *recipeOut = makeDrawRecipe(context, state, shaders, resources, contentKey, pipeline, framebuffer, owners, targetViews, inputs, masked, !resolved.moved.empty());
+        // A stream template's recipe always recomputes moved buffers on its hits (its streamed
+        // elements are moved on every use, also when this draw is the build itself).
+        if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && RecipeEligibleTargets(state, resolved.moved) && (!resources->Streamed() || MovedDrawRecipes())) *recipeOut = makeDrawRecipe(context, state, shaders, resources, contentKey, pipeline, framebuffer, owners, targetViews, inputs, masked, !resolved.moved.empty() || resources->Streamed());
         timing.Mark("draw_and_resource_release");
         report(outcome.waited ? (outcome.reason == SyncLease ? " recorded then waited (lease)" : " recorded then waited (copied writes)") : completion ? " recorded with completion" : " recorded");
         return;
@@ -3532,9 +3577,10 @@ void ApplyDraw(const Context& context, DrawPlan& plan) {
     flushRecordStores(plan.record);
     emitRecord(context, state, draw, shaders, plan.inputs, plan.record, plan.recordPlan, plan.outcome, plan.timer, plan.ownWaitedMs);
     const auto& resources = plan.resolved.resources;
-    if (plan.recipeAllowed && DrawRecipes() && plan.resolved.cacheable && !plan.outcome.waited && resources->Reusable() && RecipeEligibleTargets(state, plan.resolved.moved)) {
+    // As in drawPrepared: a stream template's recipe always recomputes moved buffers.
+    if (plan.recipeAllowed && DrawRecipes() && plan.resolved.cacheable && !plan.outcome.waited && resources->Reusable() && RecipeEligibleTargets(state, plan.resolved.moved) && (!resources->Streamed() || MovedDrawRecipes())) {
         if (plan.framebuffer == nullptr) plan.framebuffer = plan.pipeline->AcquireFramebuffer(plan.targetViews, plan.owners, state.renderExtent, state.renderLayers);
-        *plan.recipeOut = makeDrawRecipe(context, state, shaders, resources, plan.resolved.contentKey, plan.pipeline, plan.framebuffer, plan.owners, plan.targetViews, plan.inputs, plan.masked, !plan.resolved.moved.empty());
+        *plan.recipeOut = makeDrawRecipe(context, state, shaders, resources, plan.resolved.contentKey, plan.pipeline, plan.framebuffer, plan.owners, plan.targetViews, plan.inputs, plan.masked, !plan.resolved.moved.empty() || resources->Streamed());
     }
     report(plan.outcome.waited ? (plan.outcome.reason == SyncLease ? " recorded then waited (lease)" : " recorded then waited (copied writes)") : plan.outcome.completion ? " recorded with completion" : " recorded");
 }
@@ -4414,6 +4460,16 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     auto resources = recipe.templateRef.lock();
     if (resources == nullptr) return miss(DrawRecipeMiss::TemplateGone);
     Require(resources->Reusable(), "draw recipe over a non-reusable template");
+    // A recipe over a stream template never reaches resolveDrawResources' drop, so drop it here too
+    // once the stream_ring switch is off (the A/B compares against today's behaviour).
+    if (resources->Streamed() && !ShaderResources::StreamRing()) {
+        SharedResourceCache().Remove(recipe.key, resources.get());
+        countCache(&DrawProfile::cacheInvalidated);
+        countCache(&DrawProfile::streamDropped);
+        recorder->Keep(std::move(resources));
+        timer.phase(PhaseLookup);
+        return miss(DrawRecipeMiss::Proof);
+    }
     const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool proved = resources->ProveCurrent(shaders, &result.proof);
     if (profile) result.proofUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - proofStart).count();

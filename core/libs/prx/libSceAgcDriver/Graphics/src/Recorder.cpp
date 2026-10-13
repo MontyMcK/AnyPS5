@@ -1213,6 +1213,10 @@ void ReportHookSyncs(HookSyncStats& stats) {
 
 // Wraps one pending-write sync (constructed before it, under the GpuMutex): gathers what the sync
 // waits for and, in the destructor, the time it took and whether the bytes changed.
+// Per-thread totals of the hook's GPU-sync waits (profiling only), for the slow-job lines.
+thread_local double threadHookSyncMs = 0;
+thread_local std::uint64_t threadHookSyncCount = 0;
+
 class HookSyncScope {
 public:
     HookSyncScope(const Recorder& recorder, std::uint64_t address, std::size_t bytes) : enabled(HookSyncProfiled()), address(address), bytes(bytes) {
@@ -1236,6 +1240,8 @@ public:
         if (!enabled) return;
         const auto now = std::chrono::steady_clock::now();
         const auto ms = std::chrono::duration<double, std::milli>(now - start).count();
+        threadHookSyncMs += ms;
+        ++threadHookSyncCount;
         auto& stats = HookSyncs();
         auto& totals = stats.byKey[key];
         ++totals.count;
@@ -1668,6 +1674,20 @@ bool Recorder::wideLabelInLocked(std::uint64_t address, std::size_t bytes) const
     return false;
 }
 
+bool Recorder::CurrentLabelDword(std::uint64_t address, std::uint32_t& value) {
+    if (address % 4 != 0) return false;
+    std::lock_guard tableLock(labelTableMutex);
+    if (labelTableOwner == nullptr) return false;
+    const auto& table = labelTableOwner->labels;
+    const auto found = table.find(address);
+    if (found == table.end()) return false;
+    const auto& entry = found->second;
+    if (entry.batch == nullptr || entry.overwritten || entry.behindCompletion) return false;
+    if (labelTableOwner->wideLabelInLocked(address, 4)) return false;
+    value = entry.value;
+    return true;
+}
+
 std::optional<std::uint64_t> Recorder::LookupLabelValue(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp) {
     const auto hit = LookupLabel(address, bytes, afterStamp);
     if (!hit.has_value()) return std::nullopt;
@@ -1825,6 +1845,7 @@ std::uint32_t BarrierSkipMask() {
 void Recorder::prepareCommands() {
     ForkQuiesce("commands");
     ensureOpen();
+    closeDispatchRun();
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
@@ -1864,6 +1885,68 @@ void Recorder::MarkCovered(VkAccessFlags access) {
     ForkTrap("covered access");
     ForkQuiesce("covered access");
     if (open != nullptr && !open->tracker.elided) open->coveredAccess = access;
+}
+
+namespace {
+thread_local std::uint64_t dispatchRunToken = 0;
+std::atomic<std::uint64_t> dispatchRunsContinued{0};
+std::atomic<std::uint64_t> dispatchRunsClosed{0};
+std::atomic<std::uint64_t> dispatchRunStores{0};
+}
+
+bool Recorder::DispatchRunsEnabled() {
+    static const bool requested = EnvSwitch("APS5_DISPATCH_RUNS");
+    return LiveFlag("dispatch_runs", requested);
+}
+
+bool Recorder::DispatchRunDataEnabled() {
+    static const bool requested = EnvSwitch("APS5_DISPATCH_RUN_DATA");
+    return DispatchRunsEnabled() && LiveFlag("dispatch_run_data", requested);
+}
+
+bool Recorder::DispatchRunStoresEnabled() {
+    static const bool requested = EnvSwitch("APS5_DISPATCH_RUN_STORES");
+    return DispatchRunsEnabled() && LiveFlag("dispatch_run_stores", requested);
+}
+
+void Recorder::SetDispatchRunToken(std::uint64_t token) {
+    dispatchRunToken = token;
+}
+
+std::uint64_t Recorder::DispatchRunToken() {
+    return dispatchRunToken;
+}
+
+bool Recorder::ContinuesDispatchRun(std::uint64_t token) const {
+    return token != 0 && open != nullptr && open->dispatchRun == token && !open->renderPass.open && !open->run.open;
+}
+
+VkCommandBuffer Recorder::CommandsInDispatchRun() {
+    ForkTrap("dispatch run commands");
+    Require(open != nullptr && open->dispatchRun != 0, "no dispatch run is open in the recorder");
+    dispatchRunsContinued.fetch_add(1, std::memory_order_relaxed);
+    open->coveredAccess = 0;
+    return open->commands;
+}
+
+void Recorder::LeaveDispatchRunOpen(std::uint64_t token) {
+    Require(open != nullptr && token != 0, "no batch is open for the dispatch run");
+    open->dispatchRun = token;
+}
+
+void Recorder::closeDispatchRun() {
+    if (open == nullptr || open->dispatchRun == 0) return;
+    open->dispatchRun = 0;
+    dispatchRunsClosed.fetch_add(1, std::memory_order_relaxed);
+    // The run's dispatches' writes reach everything recorded after it, as each dispatch's own
+    // trailing barrier would (VulkanDevice::recordDispatch).
+    constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
+    const auto timing = BeginGpuTiming(CommandClass::DispatchTrailing);
+    // The transfer source covers the stores recorded inside the run (DispatchRunStoresEnabled).
+    recordBarrier(open->commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, dispatchedAccess);
+    CountBarriers(CommandClass::DispatchTrailing);
+    EndGpuTiming(timing);
+    if (!open->tracker.elided) open->coveredAccess = dispatchedAccess;
 }
 
 bool Recorder::ContinuesRenderPass(std::uint64_t key) const {
@@ -2030,12 +2113,23 @@ void Recorder::ensureOpen() {
 }
 
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
+    lastStoreInRun = false;
     if (bytes.empty()) return;
     ForkQuiesce("label store");
     ensureOpen();
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
     storeCount.fetch_add(1, std::memory_order_relaxed);
+    if (open->dispatchRun != 0 && open->dispatchRun == DispatchRunToken() && run.queued.empty() && !run.open && open->keyStores.empty() && !open->renderPass.open && !BarrierTracking() && DispatchRunStoresEnabled()) {
+        // A WRITE_DATA inside the dispatch run it belongs to: in place, not behind the run's
+        // dispatches (the run stays open), and visible to the dispatches recorded after it.
+        dispatchRunStores.fetch_add(1, std::memory_order_relaxed);
+        lastStoreInRun = true;
+        function(cmdUpdateBuffer, "vkCmdUpdateBuffer")(open->commands, buffer, offset, bytes.size(), bytes.data());
+        recordBarrier(open->commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        CountBarriers(CommandClass::LabelRun);
+        return;
+    }
     if (LabelRunsPerBatch()) {
         // Queued for the batch's run: a store inside the last queued one replaces its bytes, a
         // contiguous one joins it (a joined range overlapping an earlier queued store takes the
@@ -2061,6 +2155,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     // ahead of every store of the run.
     if (!open->keyStores.empty()) recordKeyStores(true);
     if (open->renderPass.open) endOpenRenderPass();
+    closeDispatchRun();
     open->coveredAccess = 0;
     // Two transfers to the same bytes have no order of their own within the run.
     const auto overlapsRecorded = [&] { return std::any_of(run.recorded.begin(), run.recorded.end(), [&](const auto& store) { return std::get<0>(store) == buffer && offset < std::get<2>(store) && std::get<1>(store) < end; }); };
@@ -2133,6 +2228,7 @@ bool Recorder::closeStoreRun(bool atSubmit) {
         // land ahead of every store of the run, and the pass a draw left open ends.
         if (!open->keyStores.empty()) recordKeyStores(true);
         if (open->renderPass.open) endOpenRenderPass();
+        closeDispatchRun();
         const auto commands = open->commands;
         run.timing = beginTiming(ClassKey(CommandClass::LabelRun));
         bool elided = false;
@@ -2275,7 +2371,7 @@ void reportBarriers() {
         std::snprintf(text, sizeof(text), " %s %llu", CommandClassNames[i], static_cast<unsigned long long>(mergedCount));
         mergedLine += text;
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[barriers] %llu recorded (10 s) by class:%s; merged %llu:%s", static_cast<unsigned long long>(total), line.c_str(), static_cast<unsigned long long>(merged), mergedLine.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[barriers] %llu recorded (10 s) by class:%s; merged %llu:%s; dispatch runs: %llu dispatches continued a run, %llu runs closed, %llu stores inside runs", static_cast<unsigned long long>(total), line.c_str(), static_cast<unsigned long long>(merged), mergedLine.c_str(), static_cast<unsigned long long>(dispatchRunsContinued.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(dispatchRunsClosed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(dispatchRunStores.exchange(0, std::memory_order_relaxed)));
     if (Recorder::BarrierTracking()) {
         std::uint64_t emitted = 0, skipped = 0;
         std::string classes, kinds;
@@ -3134,6 +3230,40 @@ void Recorder::OnComplete(std::function<void()> action) {
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
 }
 
+namespace {
+struct NoteSiteEntry {
+    std::uint64_t note = 0;
+    const void* site = nullptr;
+    std::uint64_t program = 0;
+};
+thread_local const void* t_noteSite = nullptr;
+thread_local std::uint64_t t_noteProgram = 0;
+std::array<NoteSiteEntry, 8192> noteSites{};
+std::mutex noteSitesMutex;
+bool NoteSitesOn() {
+    static const bool on = std::getenv("APS5_TRACE_DCC_SYNC") != nullptr;
+    return on;
+}
+}
+
+void Recorder::SetNoteProgram(std::uint64_t program) {
+    if (NoteSitesOn()) t_noteProgram = program;
+}
+
+std::uint64_t Recorder::NoteProgram(std::uint64_t note) {
+    if (!NoteSitesOn() || note == 0) return 0;
+    std::lock_guard lock(noteSitesMutex);
+    const auto& entry = noteSites[note % noteSites.size()];
+    return entry.note == note ? entry.program : 0;
+}
+
+const void* Recorder::NoteSite(std::uint64_t note) {
+    if (!NoteSitesOn() || note == 0) return nullptr;
+    std::lock_guard lock(noteSitesMutex);
+    const auto& entry = noteSites[note % noteSites.size()];
+    return entry.note == note ? entry.site : nullptr;
+}
+
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
@@ -3142,6 +3272,10 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
     open->writeValues.push_back(static_cast<std::int16_t>(value));
+    if (NoteSitesOn()) {
+        std::lock_guard lock(noteSitesMutex);
+        noteSites[writeNoteCount % noteSites.size()] = {writeNoteCount, std::exchange(t_noteSite, nullptr), t_noteProgram};
+    }
     if (!ownLabel) markOverwritten(address, end);
     // A poller waiting on this range learns that the open batch may now hold its producer.
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
@@ -3182,6 +3316,7 @@ void Recorder::markOverwritten(std::uint64_t address, std::uint64_t end) {
 }
 
 void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
+    if (NoteSitesOn()) t_noteSite = __builtin_return_address(0);
     ForkTrap("pending write");
     if (bytes != 0) ForkQuiesce("pending write");
     if (!noteWrite(address, bytes)) return;
@@ -3192,6 +3327,7 @@ void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
 }
 
 void Recorder::NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value) {
+    if (NoteSitesOn()) t_noteSite = __builtin_return_address(0);
     ForkTrap("pending fill");
     ForkQuiesce("pending fill");
     if (!noteWrite(address, bytes, false, value)) return;
@@ -3203,7 +3339,9 @@ void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::u
     ForkTrap("pending writes");
     if (!ranges.empty()) ForkQuiesce("pending writes");
     bool publish = false;
+    const void* site = NoteSitesOn() ? __builtin_return_address(0) : nullptr;
     for (const auto& [begin, end] : ranges) {
+        t_noteSite = site;
         if (end > begin && noteWrite(begin, static_cast<std::size_t>(end - begin))) publish = true;
     }
     if (!publish) return;
@@ -3486,7 +3624,7 @@ void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes
         open->wideLabels.push_back(wideLabels.emplace(address, address + bytes.size()));
         wideLabelBytes = std::max<std::uint64_t>(wideLabelBytes, bytes.size());
     }
-    if (activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
+    if (!std::exchange(lastStoreInRun, false) && activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
         pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
     }
     noteWriteOn(*open, address, bytes.size(), true);
@@ -3698,6 +3836,7 @@ void Recorder::Submit() {
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
+    closeDispatchRun();
     endSamples(*open);
     if (pendingSamples.size() >= SampleFoldCapacity) foldSamples(*open, 0);
     const bool hostReadCovered = (open->run.open || !open->run.queued.empty()) && closeStoreRun(true);
@@ -4104,6 +4243,10 @@ void ReportSyncWaits(SyncWaitStats& stats) {
 
 }
 
+std::pair<double, std::uint64_t> ThreadHookSyncs() {
+    return {threadHookSyncMs, threadHookSyncCount};
+}
+
 bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int source, const void* site) {
     // Only for the outermost acquisition: a nested hook (inside a dispatch's hold) must not give
     // up the caller's mutex, and a thread that waits here holds nothing the relock could invert
@@ -4196,6 +4339,8 @@ bool Recorder::syncThroughUnlocked(std::uint64_t address, std::uint64_t end, int
             holdCounters.hookUnlockedWaitMsBySource[source] += ms;
         }
         holdCounters.hookRelockMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waited).count();
+        threadHookSyncMs += ms;
+        ++threadHookSyncCount;
         auto& stats = SyncWaits();
         auto& siteStats = stats.bySite[static_cast<std::size_t>(readSite)];
         ++siteStats.count;

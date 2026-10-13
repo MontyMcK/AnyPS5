@@ -3096,7 +3096,7 @@ struct DispatchCounters {
     std::array<double, DispatchRows> phaseTotals{};
     std::uint64_t profiledDispatches = 0;
     IndirectHold indirectHold;
-    std::uint64_t cacheHits = 0, cacheMisses = 0, cacheInvalidated = 0, templateRefreshed = 0, templateSameWords = 0;
+    std::uint64_t cacheHits = 0, cacheMisses = 0, cacheInvalidated = 0, templateRefreshed = 0, templateSameWords = 0, templateRunData = 0;
     double templateRevalidateMs = 0;
     std::uint64_t procLookups = 0, preBarriersRecorded = 0, preBarriersSkipped = 0;
     std::chrono::steady_clock::time_point cacheReport = std::chrono::steady_clock::now();
@@ -3667,7 +3667,26 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     bool argumentsElided = false;
     bool elided = false;
     VkCommandBuffer commands = VK_NULL_HANDLE;
-    if (Graphics::Recorder::BarrierTracking()) {
+    // A direct dispatch in a guest dispatch run (Recorder::DispatchRunsEnabled) overlaps the run's
+    // earlier dispatches: no leading barrier, its trailing one owed to the next other command. A
+    // data refresh writes buffers an earlier dispatch of the run may still read, so it ends the run.
+    const auto runToken = Graphics::Recorder::DispatchRunToken();
+    const bool inRun = runToken != 0 && argumentImport == nullptr && record.argumentSource == VK_NULL_HANDLE && !Graphics::Recorder::BarrierTracking() && Graphics::Recorder::DispatchRunsEnabled();
+    bool continuesRun = false;
+    // A continuing dispatch whose data words differ takes them through a per-dispatch set
+    // (dispatch_run_data) rather than ending the run for the in-place refresh.
+    std::shared_ptr<Graphics::ShaderResources::DrawBindings> runData;
+    bool runDataHandled = false;
+    if (inRun && refreshes && Graphics::Recorder::DispatchRunDataEnabled() && recorder.ContinuesDispatchRun(runToken)) {
+        bool usable = false;
+        runData = resources.DataBindings(recorder, *record.shader, record.resourceKeyMatched, usable);
+        runDataHandled = usable;
+        if (usable) ++d.templateRunData;
+    }
+    if (inRun && (!refreshes || runDataHandled) && recorder.ContinuesDispatchRun(runToken)) {
+        commands = recorder.CommandsInDispatchRun();
+        continuesRun = true;
+    } else if (Graphics::Recorder::BarrierTracking()) {
         if (argumentImport != nullptr) {
             const std::pair<std::uint64_t, std::uint64_t> argumentRange{arguments, arguments + 12};
             argumentsElided = recorder.NoteAccess(CommandClass::IndirectArguments, Graphics::Recorder::Access{std::span(&argumentRange, 1), {}, {}, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT});
@@ -3682,7 +3701,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recorder.Keep(record.objects);
     recorder.Keep(record.resources);
     recordStep(PhaseRecordKeeps);
-    if (record.dataRefresh != RecordedDispatch::DataRefresh::None) {
+    if (record.dataRefresh != RecordedDispatch::DataRefresh::None && !runDataHandled) {
         // The template's data buffers take this dispatch's words: a transfer write the pre-dispatch
         // barrier makes visible (so it is recorded whatever the previous command covered), ordered
         // after an earlier dispatch's reads of the buffers by that dispatch's trailing barrier. A
@@ -3729,6 +3748,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     constexpr VkAccessFlags shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     if (elided) {
         Graphics::Recorder::CountSkipped(CommandClass::DispatchLeading);
+    } else if (continuesRun) {
+        ++d.preBarriersSkipped;
+        Graphics::Recorder::CountMerged(CommandClass::DispatchLeading);
     } else if ((covered & shaderAccess) == shaderAccess && barrierElision) {
         ++d.preBarriersSkipped;
         Graphics::Recorder::CountMerged(CommandClass::DispatchLeading);
@@ -3740,7 +3762,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         ++d.preBarriersRecorded;
     }
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
-    resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
+    if (runData != nullptr) resources.BindSet(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, runData->allocation.set);
+    else resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
     if (record.pushStages != 0) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::PipelinePushConstantBytes, record.pushBytes->data());
     }
@@ -3752,6 +3775,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recorder.EndGpuTiming(gpuTiming);
     if (elided) {
         Graphics::Recorder::CountSkipped(CommandClass::DispatchTrailing);
+    } else if (inRun) {
+        recorder.LeaveDispatchRunOpen(runToken);
     } else {
         const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
         constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
@@ -3761,7 +3786,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.MarkCovered(dispatchedAccess);
     }
     recordStep(PhaseRecordBind);
+    Graphics::Recorder::SetNoteProgram(record.programAddress);
     resources.MarkGpuWrites(recorder);
+    Graphics::Recorder::SetNoteProgram(0);
     recordStep(PhaseRecordMarks);
     // Only copied written buffers (and BDA fault checks) need work once the GPU is done; without them
     // the batch can signal its labels from the GPU.
@@ -3943,7 +3970,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     }
     if (profile && std::chrono::steady_clock::now() - d.cacheReport > std::chrono::seconds(10)) {
         d.cacheReport = std::chrono::steady_clock::now();
-        AgcDriver::ProfilePrint_nid_no_patch("[rescache] %llu hits, %llu misses, %llu invalidated, %zu entries (dispatch + draw); template hits: %llu refreshed the data buffers (revalidate %.1f ms), %llu had the same words; Find calls %llu, Touch calls %llu\n", static_cast<unsigned long long>(d.cacheHits), static_cast<unsigned long long>(d.cacheMisses), static_cast<unsigned long long>(d.cacheInvalidated), state->resourceCache.Size(), static_cast<unsigned long long>(d.templateRefreshed), d.templateRevalidateMs, static_cast<unsigned long long>(d.templateSameWords), static_cast<unsigned long long>(ResourceCache::Finds()), static_cast<unsigned long long>(ResourceCache::Touches()));
+        AgcDriver::ProfilePrint_nid_no_patch("[rescache] %llu hits, %llu misses, %llu invalidated, %zu entries (dispatch + draw); template hits: %llu refreshed the data buffers (revalidate %.1f ms), %llu had the same words, %llu took run data slices; Find calls %llu, Touch calls %llu\n", static_cast<unsigned long long>(d.cacheHits), static_cast<unsigned long long>(d.cacheMisses), static_cast<unsigned long long>(d.cacheInvalidated), state->resourceCache.Size(), static_cast<unsigned long long>(d.templateRefreshed), d.templateRevalidateMs, static_cast<unsigned long long>(d.templateSameWords), static_cast<unsigned long long>(d.templateRunData), static_cast<unsigned long long>(ResourceCache::Finds()), static_cast<unsigned long long>(ResourceCache::Touches()));
         AgcDriver::ProfilePrint_nid_no_patch("[vk] deviceProc lookups inside the device call: %llu (%.2f per dispatch); pre-dispatch barriers recorded %llu, skipped %llu\n", static_cast<unsigned long long>(d.procLookups), d.profiledDispatches != 0 ? static_cast<double>(d.procLookups) / static_cast<double>(d.profiledDispatches) : 0.0, static_cast<unsigned long long>(d.preBarriersRecorded), static_cast<unsigned long long>(d.preBarriersSkipped));
         reportRecipes();
     }

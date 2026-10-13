@@ -95,6 +95,10 @@ void BumpCollectEpoch();
 // Threads that follow one queue's epoch token (the draw pipeline's committer and preparation
 // workers) share an epoch and a collect memo: a walk one of them made satisfies the others' checks.
 void FollowCollectEpoch(std::uint64_t token);
+// Called by the thread that advanced a queue's epoch token right after its BumpCollectEpoch: the
+// token's ordering point for the block walk memo (APS5_BLOCK_COLLECT_MEMO), so followers of the
+// token may use walks any thread started after it.
+void NoteEpochToken(std::uint64_t token);
 bool SharedEpochMemo();
 std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();
@@ -122,6 +126,10 @@ std::uint64_t TrackerGeneration();
 // the stamps collects make (dirty pages), not the MarkWritten stamps of the driver's own GPU label
 // records, which share the title's label blocks. False when the arena is not write-watched.
 bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+// UnchangedSinceCollected at 4 KiB page grain: the range's own pages carry no CPU store stamped
+// after `generation` (other pages of its 64 KiB blocks may), and no block holding it was replaced
+// as a whole (a private mapping restored, which stamps blocks without pages) since then.
+bool CpuPagesUnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // Per 64 KiB tracker block of [address, address + bytes) (block 0 holds `address`): `changed[k]`
 // receives whether the block was stamped after generations[k] (UnchangedSince over that block
 // alone), `cpu[k]`, when given, whether a collect stamped it after (a CPU store, as
@@ -155,6 +163,11 @@ public:
 
 private:
     void acquired();
+    // Live `lock_handoff` (env APS5_LOCK_HANDOFF): a thread that gave up its outermost hold while
+    // other threads waited lets one of them take the mutex before it takes it again. The SRW lock
+    // is not fair: a releaser that re-acquires at once (the draw committer, once per draw) wins
+    // against the waiter it just woke, and a queue worker can wait behind many of its holds.
+    void yieldToWaiter();
     // The lock itself: an SRW lock made recursive by its owner's thread id and depth on Windows
     // (winpthread's recursive mutex costs several times as much per acquisition), std::recursive_mutex
     // elsewhere or with APS5_STD_GPU_MUTEX=1.
@@ -170,6 +183,8 @@ private:
     std::atomic<const void*> owner{nullptr};
     std::uint32_t depth = 0;
     std::atomic<std::uint32_t> contenders{0};
+    // Outermost acquisitions so far: a yielding thread waits for it to move (lock_handoff).
+    std::atomic<std::uint64_t> generation{0};
 };
 GpuMutexType& GpuMutex();
 // Called on the thread that just gave up its outermost hold, right after the mutex was released:
@@ -213,6 +228,14 @@ void NoteLockedGpuWait(double ms);
 // Bytes the calling thread's write-watch collects walked so far (0 without the memory profile):
 // a caller reads the difference across a span of its own work.
 std::uint64_t ThreadCollectedBytes();
+// The calling thread's waits for GpuMutex so far, in ms (counted under APS5_PROFILE_DRAW only).
+double ThreadGpuLockWaitMs();
+// The calling thread's fence/timeline waits made while holding GpuMutex so far (ms; profiling only).
+double ThreadLockedGpuWaitMs();
+// The calling thread's role on the [collect-walks] line (APS5_PROFILE_COLLECT): 1 the draw
+// committer, 2 a draw preparation worker; threads that never set one count as queue workers when
+// they carry a queue tag, otherwise as other.
+void SetCollectRole(std::uint8_t role);
 // A code address (a return address) as an offset into its module, in the form of the [guestmem]
 // callers (symbolized with nm against the driver's image). Takes the loader lock: for reports only.
 unsigned long long CodeOffset(const void* address);

@@ -13,6 +13,7 @@
 #include <cstdlib>
 #ifdef _WIN32
 #include <windows.h>
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #endif
 
 namespace AgcDriver::DriverDetail {
@@ -355,8 +356,10 @@ bool Driver::queue0Before(std::uint64_t received) const {
 }
 
 bool Driver::orderReleased(std::uint32_t queue, std::uint64_t received) const {
+    // Live `async_unordered` (env APS5_ASYNC_UNORDERED): wait-free async submissions are not held
+    // behind earlier queue-0 submissions (the console runs the queues concurrently).
     static const bool unordered = std::getenv("APS5_ASYNC_UNORDERED") != nullptr;
-    if (unordered || !queue0Before(received)) return true;
+    if (Graphics::LiveFlag("async_unordered", unordered) || !queue0Before(received)) return true;
     const auto awaited = queue0Awaited.load(std::memory_order_acquire);
     if (awaited == 0) return false;
     if (workers.at(queue).unfinishedWrites.contains(awaited & ~std::uint64_t{3})) return true;

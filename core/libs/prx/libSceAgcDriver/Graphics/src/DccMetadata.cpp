@@ -1,10 +1,21 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+#include <array>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -282,23 +293,124 @@ void NoteKeysFillOnGpu(std::uint64_t begin, std::size_t count, DccKeys keys) {
 
 namespace {
 
+// Live `dcc_wait_unlocked` (env APS5_DCC_WAIT_UNLOCKED): a key read that must wait for recorded
+// GPU work gives up the device lock for the wait when the caller's hold is the outermost (the flush
+// hook's unlocked wait, Recorder::SyncThrough): the draw committer otherwise waits for the GPU while
+// every queue worker waits for it.
+bool DccWaitUnlocked() {
+    static const bool requested = std::getenv("APS5_DCC_WAIT_UNLOCKED") != nullptr;
+    return LiveFlag("dcc_wait_unlocked", requested);
+}
+
+// Why PendingStoreKeys gave no answer ([dcc-sync], APS5_PROFILE_DRAW): the memo belongs to another
+// recorder, no entry overlaps the range, entries overlap without one covering it, an entry without
+// a write note covers it, a unit shadow overlaps, or a later write than the covering store's note.
+enum class MemoMiss : std::size_t { Answered, Recorder, None, Partial, NoNote, Shadowed, NewerWrite, Count };
+thread_local MemoMiss t_memoMiss = MemoMiss::Answered;
+
 std::optional<DccKeys> PendingStoreKeys(Recorder& recorder, std::uint64_t begin, std::size_t count) {
     const auto end = begin + count;
     std::uint64_t note = 0;
     DccKeys keys = DccKeys::Mixed;
+    bool overlapped = false, unnoted = false;
     {
         auto& memo = Memo();
         std::lock_guard lock(memo.mutex);
-        if (MemoRecorder(memo) != &recorder) return std::nullopt;
+        if (MemoRecorder(memo) != &recorder) {
+            t_memoMiss = MemoMiss::Recorder;
+            return std::nullopt;
+        }
         for (const auto& store : memo.entries) {
-            if (store.note == 0 || store.begin > begin || store.end < end) continue;
+            if (store.begin < end && begin < store.end) overlapped = true;
+            if (store.begin > begin || store.end < end) continue;
+            if (store.note == 0) {
+                unnoted = true;
+                continue;
+            }
             note = store.note;
             keys = store.keys;
             break;
         }
     }
-    if (note == 0 || AnyShadowedOverlaps(begin, count) || recorder.NewestWriteNote(begin, count) != note) return std::nullopt;
+    if (note == 0) {
+        t_memoMiss = unnoted ? MemoMiss::NoNote : overlapped ? MemoMiss::Partial : MemoMiss::None;
+        return std::nullopt;
+    }
+    if (AnyShadowedOverlaps(begin, count)) {
+        t_memoMiss = MemoMiss::Shadowed;
+        return std::nullopt;
+    }
+    if (recorder.NewestWriteNote(begin, count) != note) {
+        t_memoMiss = MemoMiss::NewerWrite;
+        return std::nullopt;
+    }
+    t_memoMiss = MemoMiss::Answered;
     return keys;
+}
+
+// APS5_TRACE_DCC_SYNC=1: the first 60 key reads that wait, with the pending writes over their range
+// (which recorded work the wait is for: a key store, a fill, or a wider write such as a dispatch's
+// whole buffer range).
+void TraceKeySync(Recorder& recorder, int caller, std::uint64_t metaAddress, std::size_t count) {
+    static const bool trace = std::getenv("APS5_TRACE_DCC_SYNC") != nullptr;
+    static std::atomic<int> traced{0};
+    // At most 4 lines per 10 s, so the reads of later phases (a race) are sampled too.
+    static std::atomic<std::int64_t> window{0};
+    if (!trace) return;
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (auto began = window.load(std::memory_order_relaxed); now - began >= 10 && window.compare_exchange_strong(began, now)) traced.store(0, std::memory_order_relaxed);
+    if (traced.fetch_add(1, std::memory_order_relaxed) >= 4) return;
+    static constexpr const char* names[] = {"answered", "other recorder", "no entry", "partial cover", "no note", "shadowed", "newer write"};
+    const auto writes = recorder.PendingWritesOver(metaAddress, count);
+    std::string line;
+    for (std::size_t i = 0; i < writes.size() && i < 6; ++i) {
+        char part[192];
+        const auto* site = static_cast<const char*>(Recorder::NoteSite(writes[i].note));
+        std::uint64_t offset = 0;
+#ifdef _WIN32
+        HMODULE module = nullptr;
+        if (site != nullptr && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, site, &module)) offset = static_cast<std::uint64_t>(site - reinterpret_cast<const char*>(module));
+#endif
+        std::snprintf(part, sizeof(part), " [0x%llx+0x%llx note %llu value %d site +0x%llx program 0x%llx]", static_cast<unsigned long long>(writes[i].begin), static_cast<unsigned long long>(writes[i].end - writes[i].begin), static_cast<unsigned long long>(writes[i].note), writes[i].value, static_cast<unsigned long long>(offset), static_cast<unsigned long long>(Recorder::NoteProgram(writes[i].note)));
+        line += part;
+    }
+    std::fprintf(stderr, "[dcc-sync] %s keys 0x%llx+0x%zx (%s): %zu pending writes over it:%s; open batch %s, queued key stores %zu\n", caller == 0 ? "current" : "writers", static_cast<unsigned long long>(metaAddress), count, names[static_cast<std::size_t>(t_memoMiss)], writes.size(), line.c_str(), recorder.Recording() ? "yes" : "no", recorder.QueuedKeyStoreCount());
+}
+
+// A DCC key read that waited for the GPU (SyncThrough) because PendingStoreKeys could not answer:
+// counted by caller (current keys, key writers) and by the memo's miss reason, with the wait.
+void CountKeySync(int caller, std::size_t count, double ms) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    constexpr std::size_t Reasons = static_cast<std::size_t>(MemoMiss::Count);
+    static std::mutex mutex;
+    static std::array<std::uint64_t, Reasons * 2> syncs{};
+    static std::array<double, Reasons * 2> waited{};
+    static std::uint64_t bytes = 0;
+    static auto last = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    const auto slot = static_cast<std::size_t>(t_memoMiss) + (caller != 0 ? Reasons : 0);
+    ++syncs[slot];
+    waited[slot] += ms;
+    bytes += count;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    static constexpr const char* names[Reasons] = {"answered", "other recorder", "no entry", "partial cover", "no note", "shadowed", "newer write"};
+    std::string line;
+    for (std::size_t c = 0; c < 2; ++c) {
+        line += c == 0 ? " current keys:" : "; key writers:";
+        for (std::size_t r = 0; r < Reasons; ++r) {
+            if (syncs[c * Reasons + r] == 0) continue;
+            char part[96];
+            std::snprintf(part, sizeof(part), " %s %llu/%.0f ms", names[r], static_cast<unsigned long long>(syncs[c * Reasons + r]), waited[c * Reasons + r]);
+            line += part;
+        }
+    }
+    std::fprintf(stderr, "[dcc-sync] key reads that waited for the GPU (10 s, by memo miss: syncs/wait):%s; %.1f KiB of keys\n", line.c_str(), bytes / 1024.0);
+    syncs.fill(0);
+    waited.fill(0);
+    bytes = 0;
 }
 
 // Whether the keys already read as uncompressed: scans the same bytes as ReadDccKeys, so it counts
@@ -485,7 +597,10 @@ DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count) {
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
             if (const auto keys = PendingStoreKeys(*recorder, metaAddress, count)) return *keys;
             Recorder::CountSync(2);
-            recorder->SyncThrough(metaAddress, count);
+            TraceKeySync(*recorder, 0, metaAddress, count);
+            const auto started = std::chrono::steady_clock::now();
+            recorder->SyncThrough(metaAddress, count, DccWaitUnlocked());
+            CountKeySync(0, count, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
         }
     }
     bool memoized = false;
@@ -711,7 +826,10 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     if (recorder == nullptr || !recorder->PendingWriteOverlaps(metaAddress, count) || PendingStoreKeys(*recorder, metaAddress, count).has_value()) return std::nullopt;
     if (PendingFillsLeaveUncompressed(*recorder, resource, count)) return DccKeys::Uncompressed;
     Recorder::CountSync(2);
-    recorder->SyncThrough(metaAddress, count);
+    TraceKeySync(*recorder, 1, metaAddress, count);
+    const auto started = std::chrono::steady_clock::now();
+    recorder->SyncThrough(metaAddress, count, DccWaitUnlocked());
+    CountKeySync(1, count, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
     return std::nullopt;
 }
 

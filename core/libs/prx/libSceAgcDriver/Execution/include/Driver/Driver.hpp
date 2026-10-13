@@ -206,6 +206,7 @@ private:
     void observeRange(std::uint64_t address, std::span<const std::byte> before);
     static void observePendingWrite(std::uint64_t address, bool unchanged);
     static bool knownValueCurrent(const WrittenBuffer& writer);
+    static void countCaptureQuery(ShaderMemory::PendingWrite policy, std::uint64_t ValidateCounters::*reason, std::size_t bytes);
     ShaderMemory::PendingWrite classifyPendingWrite(std::uint64_t address, std::size_t bytes, std::uint64_t ValidateCounters::*& reason, const PendingView& pending, std::span<std::byte> known = {});
     static ShaderMemory::PendingWrite queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known);
     template<typename TVisit>
@@ -247,6 +248,8 @@ private:
     static EpochBumps& epochBumps();
     static void bumpEpoch(std::uint64_t EpochBumps::*counter);
     static std::chrono::steady_clock::time_point& lastEpochBump();
+    // The write tracker's generation at the calling worker's latest epoch bump (APS5_ENTRY_EPOCH_SKIP).
+    static std::uint64_t& lastBumpGeneration();
     static std::deque<const std::uint32_t*>& releasedTails();
     void noteReleasedTails(const Submission& submission);
     static bool packetEpoch();

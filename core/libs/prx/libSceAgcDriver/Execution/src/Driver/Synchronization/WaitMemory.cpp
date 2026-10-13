@@ -83,6 +83,40 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
         ++outcomes.atEntry;
+        // APS5_ENTRY_EPOCH_SKIP=1: a wait satisfied at entry by this queue's own label orders no CPU
+        // store, as one the label table answers for this queue does not (takeLabel below): the value
+        // must be the table's entry of this queue, and no CPU store may have touched the label's page
+        // since this worker's latest ordering point (a CPU-written label orders the CPU's stores
+        // before it; written before that point, those stores are already ordered by it). A label
+        // another queue's GPU work wrote keeps the bump: that work may follow CPU stores. Under
+        // APS5_PROFILE_COLLECT alone the decision is only counted.
+        static const bool entrySkip = std::getenv("APS5_ENTRY_EPOCH_SKIP") != nullptr;
+        static const bool counted = std::getenv("APS5_PROFILE_COLLECT") != nullptr;
+        if (entrySkip || counted) {
+            struct EntryStats {
+                std::atomic<std::uint64_t> entries{0}, skipped{0}, noHit{0}, otherQueue{0}, valueMismatch{0}, cpuStore{0}, noBump{0};
+                std::atomic<std::int64_t> reported{0};
+            };
+            static EntryStats stats;
+            stats.entries.fetch_add(1, std::memory_order_relaxed);
+            const auto generation = lastBumpGeneration();
+            Graphics::Recorder::LabelRefusal refusal{};
+            const auto hit = generation == 0 ? std::nullopt : Graphics::Recorder::LookupLabel(awaited, awaitedBytes, received, &refusal);
+            if (generation == 0) stats.noBump.fetch_add(1, std::memory_order_relaxed);
+            else if (!hit.has_value()) stats.noHit.fetch_add(1, std::memory_order_relaxed);
+            else if (hit->queue != queue) stats.otherQueue.fetch_add(1, std::memory_order_relaxed);
+            else if (!Pm4::WaitComparesValue(packet, hit->value)) stats.valueMismatch.fetch_add(1, std::memory_order_relaxed);
+            else if (!GuestMemory::CpuPagesUnchangedSinceCollected(awaited, awaitedBytes, generation)) stats.cpuStore.fetch_add(1, std::memory_order_relaxed);
+            else {
+                stats.skipped.fetch_add(1, std::memory_order_relaxed);
+                if (entrySkip) epochPoint.bump = false;
+            }
+            const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+            auto last = stats.reported.load(std::memory_order_relaxed);
+            if (now - last > 10'000'000'000ll && stats.reported.compare_exchange_strong(last, now)) {
+                std::fprintf(stderr, "[entry-epoch] (10 s) waits satisfied at entry %llu: own label, no CPU store since the bump %llu (%s); kept: no table entry %llu, other queue %llu, value differs %llu, CPU store %llu, no earlier bump %llu\n", static_cast<unsigned long long>(stats.entries.exchange(0)), static_cast<unsigned long long>(stats.skipped.exchange(0)), entrySkip ? "bump skipped" : "counted only", static_cast<unsigned long long>(stats.noHit.exchange(0)), static_cast<unsigned long long>(stats.otherQueue.exchange(0)), static_cast<unsigned long long>(stats.valueMismatch.exchange(0)), static_cast<unsigned long long>(stats.cpuStore.exchange(0)), static_cast<unsigned long long>(stats.noBump.exchange(0)));
+            }
+        }
         return;
     }
     if (heldAtSubmit || storedSince(packet, awaited, awaitedBytes, received)) return;
