@@ -32,6 +32,18 @@ std::uint32_t EmitBdaAtomic(SpirvValueEmitContext& ctx, const IrValue& inst, std
 std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, bool everyDword = false);
 bool BdaByteReadsForced();
 bool BdaHintFastPath();
+bool ElectScalarBdaReads();
+// APS5_BDA_INLINE_HIT=1: a lookup call (get/probe) tests the lookup cache inline and calls only on a
+// miss. Part of the shader disk cache version.
+bool BdaInlineCacheHit();
+std::uint32_t EmitBdaLookupCall(SpirvEmitterState& state, std::uint32_t function, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, std::uint32_t permission);
+// APS5_BDA_CLOCK=1 (measurement): the entry clock at the program's start and, at each return, one
+// lane per subgroup adds the lookup cycles, the invocation's cycles and its lookups to the fault
+// buffer's clock words (see BdaAbi::ClockLookupWord).
+void EmitBdaClockEntry(SpirvEmitterState& state);
+void EmitBdaClockReport(SpirvEmitterState& state);
+// Whether `inst` reads through a scalar memory instruction (its address is wave-uniform).
+bool ScalarBdaAccess(const IrProgram& program, const IrValue& inst);
 std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, bool subtract);
 std::uint32_t AddBdaImmediate(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::int32_t immediate);
 

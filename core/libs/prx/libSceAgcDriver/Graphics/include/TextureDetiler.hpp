@@ -43,11 +43,15 @@ namespace AgcDriver::Graphics {
         // restricts the move to part of the mip (a partial upload or write-back, StorageTexture),
         // leaving the other elements of both buffers alone.
         void Dispatch(VkCommandBuffer commands, TextureTileMode tileMode, std::uint32_t elementBytes, VkBuffer source, std::uint64_t sourceOffset, VkBuffer destination, std::uint64_t destinationOffset, const TileMipLayout& layout, bool retile = false, std::uint32_t slice = 0, bool thick = false, const DetileWindow& window = {});
+        // The same move with the image itself as the linear side (push descriptors only): `view` is a
+        // same-size unsigned 2D-array view of one mip (in the general layout), `slice` its layer;
+        // `retile` stores the texels into `tiled`, otherwise the tiled bytes are stored into the image.
+        void DispatchImage(VkCommandBuffer commands, TextureTileMode tileMode, std::uint32_t elementBytes, VkImageView view, VkBuffer tiled, std::uint64_t tiledOffset, const TileMipLayout& layout, bool retile, std::uint32_t slice, const DetileWindow& window);
         // Recycles the descriptor sets of the previous batch; call before recording a new command batch.
         void BeginBatch();
 
     private:
-        VkPipeline pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick);
+        VkPipeline pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool imageIo = false);
         void release() noexcept;
         VkDescriptorSet allocateSet();
 

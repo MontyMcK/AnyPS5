@@ -59,7 +59,13 @@ inline constexpr std::uint32_t WrittenPageSlots = 4096;
 inline constexpr std::uint32_t WrittenPageProbes = 8;
 inline constexpr std::uint32_t WrittenOverflowWord = sizeof(Fault) / sizeof(std::uint32_t);
 inline constexpr std::uint32_t WrittenSlotsWord = WrittenOverflowWord + 1;
-inline constexpr std::size_t FaultBufferBytes = (WrittenSlotsWord + WrittenPageSlots) * sizeof(std::uint32_t);
+// APS5_BDA_CLOCK=1 (measurement): per subgroup, the shader-clock cycles spent in address lookups,
+// the cycles of the whole invocation and the lookups made, each added in units of 64 cycles (calls
+// as counted), summed by the driver as the buffers are recycled.
+inline constexpr std::uint32_t ClockLookupWord = WrittenSlotsWord + WrittenPageSlots;
+inline constexpr std::uint32_t ClockTotalWord = ClockLookupWord + 1;
+inline constexpr std::uint32_t ClockCallsWord = ClockLookupWord + 2;
+inline constexpr std::size_t FaultBufferBytes = (ClockLookupWord + 3) * sizeof(std::uint32_t);
 static_assert((WrittenPageSlots & (WrittenPageSlots - 1)) == 0);
 
 }

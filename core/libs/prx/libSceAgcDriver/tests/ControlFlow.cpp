@@ -1,6 +1,7 @@
 #include "ControlFlow/GraphBuilder.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "ControlFlow/Structurizer.hpp"
+#include "ControlFlow/UserDataCalls.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "Recompiler.hpp"
 #include <algorithm>
@@ -279,6 +280,10 @@ void verifyNullSwappc() {
         swappc.source0.kind == RdnaOperandKind::ScalarRegister && swappc.source0.reg == 12u, "s_swappc_b64 null, s[12:13] does not decode as s_setpc_b64 s[12:13]");
     const std::array<std::uint32_t, 3> front{0x7e020281u, 0xbefd2106u, 0xbf810000u};
     require(DecodeRdnaFrontProgram(front).code.size() == 2u, "a front program ending in s_swappc_b64 null, s[6:7] does not end there");
+    // A local program ends at its jump into the hull half; the words after it are not code.
+    const std::array<std::uint32_t, 4> local{0x7e020281u, 0xbe802006u, 0x00000000u, 0x00000000u};
+    const auto localProgram = DecodeShaderProgram(ShaderBinary{ShaderStage::Local, 0x1000u, local, 0u, {}});
+    require(localProgram.instructions.size() == 2u && localProgram.instructions.back().op == RdnaOpcode::SEndpgm && localProgram.instructions.back().programCounter == 4u, "a local program does not end at its s_setpc_b64 s[6:7] into the hull half");
     verifyJumpTable("dword jump table after its base", DwordTableGetpcFirst, 0x20u, {0x20u, 0x18u, 0x10u}, {0x3cu, 0x44u, 0x4cu});
     verifyJumpTable("dword jump table after its index", DwordTableIndexFirst, 0x1cu, {0x18u, 0x10u, 0x08u}, {0x38u, 0x40u, 0x48u});
     verifyLongBranch("long branch through vcc", LongBranchVcc, 0x10u, 0x18u);

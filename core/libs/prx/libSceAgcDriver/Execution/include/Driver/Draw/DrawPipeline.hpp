@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <deque>
 #include <map>
+#include <memory>
 #include <exception>
 #include <functional>
 #include <mutex>
@@ -20,6 +21,8 @@
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
+
+struct ReplaySegment;
 
 class DrawPipeline {
 public:
@@ -78,6 +81,9 @@ public:
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, bool unknownWrites = false, std::shared_ptr<ForkJob> fork = {});
     void Drain(DrainReason reason, std::uint32_t opcode = 0x100);
+    // Drain, except that it returns as soon as `ready` holds (polled while the pipeline runs): a
+    // memory wait the other queues satisfy needs no empty pipeline. Returns whether it returned early.
+    bool DrainUnless(DrainReason reason, std::uint32_t opcode, const std::function<bool()>& ready);
     bool Busy() const { return outstanding.load(std::memory_order_acquire) != 0 || prepOutstanding.load(std::memory_order_acquire) != 0; }
     static bool SplitDraws();
     void Prepare(Commit job, std::vector<Range> writes = {}, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {});
@@ -99,6 +105,7 @@ public:
     Window CheckWindow(std::uint64_t fromExclusive, std::uint64_t toExclusive, std::span<const Range> reads);
     bool WindowClear(std::uint64_t fromExclusive, std::uint64_t toExclusive, std::span<const Range> reads) { return CheckWindow(fromExclusive, toExclusive, reads) == Window::Clear; }
     static std::uint64_t& CommittingSequence();
+    std::uint64_t CommitNsTotal();
 
 private:
     struct Item {
@@ -109,6 +116,7 @@ private:
         std::uint64_t sequence = 0;
         bool unknown = false;
         std::shared_ptr<ForkJob> fork;
+        std::shared_ptr<ReplaySegment> segment;
     };
     struct Applied {
         std::uint64_t sequence = 0;
@@ -118,7 +126,7 @@ private:
     static constexpr std::size_t AppliedCapacity = 4096;
     DrawPipeline() = default;
     void run();
-    bool runCommit(const Commit& commit, std::uint64_t sequence);
+    bool runCommit(const Commit& commit, std::uint64_t sequence, std::shared_ptr<ReplaySegment> segment);
     void gatherForkRun(std::vector<ForkJob*>& jobs);
     std::size_t runForked(std::span<ForkJob* const> jobs);
     std::size_t runStream();
@@ -144,8 +152,12 @@ private:
     std::atomic<bool> committerIdle{false};
     std::thread thread;
     std::uint64_t commits = 0;
+    std::uint64_t earlyWaits = 0;
+    std::uint64_t earlyWaitNs = 0;
     std::uint64_t commitNs = 0;
+    std::uint64_t commitNsTotal = 0;
     std::uint64_t commitErrors = 0;
+    std::uint64_t starvedSubmits = 0;
     std::uint64_t enqueued = 0;
     std::uint64_t fullWaitNs = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(DrainReason::Count)> drains{};

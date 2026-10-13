@@ -113,6 +113,19 @@ struct SpirvEmitterState {
     std::uint32_t bdaAtomicPointerFunction = 0;
     std::uint32_t bdaNoteWriteFunction = 0;
     std::uint32_t bdaFaultFunction = 0;
+    std::uint32_t bdaCacheBegin = 0;
+    std::uint32_t bdaCacheEnd = 0;
+    std::uint32_t bdaCacheBase = 0;
+    std::uint32_t bdaCachePermissions = 0;
+    // APS5_BDA_VICTIM: the range the lookup cache held before its current one (0: not emitted).
+    std::uint32_t bdaVictimBegin = 0;
+    std::uint32_t bdaVictimEnd = 0;
+    std::uint32_t bdaVictimBase = 0;
+    std::uint32_t bdaVictimPermissions = 0;
+    // APS5_BDA_CLOCK=1: Private u64 entry clock and lookup cycles, Private u32 lookup count.
+    std::uint32_t bdaClockEntry = 0;
+    std::uint32_t bdaClockLookup = 0;
+    std::uint32_t bdaClockCalls = 0;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
     std::uint32_t bdaStopValue = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).

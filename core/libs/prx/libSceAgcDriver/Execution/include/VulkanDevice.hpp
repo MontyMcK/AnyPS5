@@ -48,6 +48,10 @@ public:
     // three-step form below so the GPU wait happens without the mutex.
     void WaitIdle();
     void PrepareForReplacement();
+    // Gives a headless device the window (surface, swapchain, presentation state) instead of the
+    // driver replacing it with a windowed device; false when this device cannot present to it.
+    // Requires the GPU mutex.
+    bool AttachWindow(const PresentationWindow& window);
     // Sends recorded work to the GPU without waiting for it. With `reapFirst` it first retires batches
     // that already finished, so the in-flight list stays short (APS5_NO_OPPORTUNISTIC_REAP=1 skips
     // that). A reap runs completion actions, and a write-back can wait for a later batch under the
@@ -307,6 +311,7 @@ private:
     // The device's Graphics::Context: a copy of the one built at setup (its instance functions
     // resolved then, its function table filled then), or with APS5_NO_CONTEXT_CACHE=1 built anew.
     Graphics::Context graphicsContext() const;
+    void setupPresentation(const PresentationWindow& window);
     ShaderRecompiler::SpirvTarget buildTarget() const;
     Graphics::Context buildContext() const;
     // Body of Dispatch and DispatchIndirect: `arguments` 0 dispatches x, y, z groups.

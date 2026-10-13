@@ -334,7 +334,8 @@ void DefineOutputs(SpirvEmitterState& state) {
 void DefineDescriptors(SpirvEmitterState& state) {
     const IrBindingLayout& layout = state.program.Metadata().bindings;
     const IrShaderStage stage = state.program.Resources().stage;
-    if (layout.UsesPushData() || stage == IrShaderStage::Mesh) {
+    // A stage writing gl_Layer reads its layer limit from the push block (LayerLimitPushDword).
+    if (layout.UsesPushData() || stage == IrShaderStage::Mesh || state.layerVariable != 0) {
         const auto type = PushConstantBlockType(state);
         state.pushConstantVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
         state.module.AddName(type, "BufferResource");

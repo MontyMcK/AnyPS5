@@ -34,6 +34,7 @@
 #include <string>
 #include <unordered_map>
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuCheckpoints.hpp"
 
 namespace AgcDriver::Graphics {
 namespace {
@@ -509,7 +510,7 @@ struct StorageTextureCache {
     std::list<CachedStorageTexture> entries;
     std::unordered_map<StorageKey, std::list<CachedStorageTexture>::iterator, StorageKeyHash> index;
     std::unordered_map<const StorageTexture*, std::list<CachedStorageTexture>::iterator> byImage;
-    std::unordered_map<std::uint64_t, std::pair<StorageKey, std::uint64_t>> arrays;
+    std::unordered_multimap<std::uint64_t, std::pair<StorageKey, std::uint64_t>> arrays;
     std::uint64_t bytes = 0;
 };
 
@@ -540,14 +541,56 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
     return cache.entries.end();
 }
 
+// Moves whenever a storage image leaves the cache: a proof made while it was unchanged knows every
+// image it found cached still is.
+std::atomic<std::uint64_t> storageEvictions{0};
+
+bool FastProofEnabled() {
+    static const bool enabled = std::getenv("APS5_FAST_PROOF") != nullptr;
+    return LiveFlag("fast_proof", enabled);
+}
+
+bool VerifyFastProof() {
+    static const bool enabled = std::getenv("APS5_VERIFY_FAST_PROOF") != nullptr;
+    return enabled;
+}
+
+struct FastProofCounts {
+    std::atomic<std::uint64_t> calls{0}, accepted{0}, noTokens{0}, pending{0}, evicted{0}, generation{0}, stamps{0};
+    std::atomic<std::int64_t> reported{0};
+};
+
+FastProofCounts& FastProofStats() {
+    static FastProofCounts counts;
+    return counts;
+}
+
+// [fast-proof] every 10 s under APS5_PROFILE_DRAW: speculated proofs taken without their checks,
+// and why the others ran them.
+void ReportFastProof() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& stats = FastProofStats();
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto last = stats.reported.load(std::memory_order_relaxed);
+    if (now - last <= 10'000'000'000ll || !stats.reported.compare_exchange_strong(last, now)) return;
+    std::fprintf(stderr, "[fast-proof] (10 s) %llu speculated proofs: %llu accepted without checks; checked because: no tokens %llu, stamps moved %llu, pending registry moved %llu, storage evicted %llu, image generation moved %llu\n", static_cast<unsigned long long>(stats.calls.exchange(0)), static_cast<unsigned long long>(stats.accepted.exchange(0)), static_cast<unsigned long long>(stats.noTokens.exchange(0)), static_cast<unsigned long long>(stats.stamps.exchange(0)), static_cast<unsigned long long>(stats.pending.exchange(0)), static_cast<unsigned long long>(stats.evicted.exchange(0)), static_cast<unsigned long long>(stats.generation.exchange(0)));
+}
+
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
 void evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it) {
+    storageEvictions.fetch_add(1, std::memory_order_acq_rel);
     it->texture->SetCached(false);
     it->texture->Flush();
     cache.bytes -= it->texture->GuestBytes();
     cache.index.erase(it->key);
     cache.byImage.erase(it->texture.get());
-    if (const auto array = cache.arrays.find(it->texture->Descriptor().baseAddress); array != cache.arrays.end() && array->second.first == it->key) cache.arrays.erase(array);
+    const auto [first, last] = cache.arrays.equal_range(it->texture->Descriptor().baseAddress);
+    for (auto array = first; array != last; ++array) {
+        if (array->second.first != it->key) continue;
+        cache.arrays.erase(array);
+        break;
+    }
     cache.entries.erase(it);
 }
 
@@ -666,19 +709,84 @@ std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std
         allocated.mipCount = AllocatedLevels(resource);
         if (const auto found = findStorage(cache, {context.device, SurfaceKey(context, allocated)}); found != cache.entries.end()) evictStorage(cache, found);
     }
-    if (layerViews && resource.dimension == TextureDimension::k2D && (std::string_view(g_refreshSite) == "storage" || (std::string_view(g_refreshSite) == "render-target" && resource.mipCount > 1))) {
-        if (const auto array = cache.arrays.find(resource.baseAddress); array != cache.arrays.end() && array->second.first.device == context.device) {
-            const auto found = findStorage(cache, array->second.first);
-            if (found != cache.entries.end()) {
-                const auto& surface = found->texture->Descriptor();
-                if (surface.width == resource.width && surface.height == resource.height && surface.mipCount == resource.mipCount && surface.tileMode == resource.tileMode && array->second.first.words[7] == static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format)) && !MetadataMoved(*found->texture, resource) && array->second.second == (guestBytes != 0 ? guestBytes : DescribeSurface(resource).guestBytes)) {
-                    found->texture->Refresh();
-                    cache.entries.splice(cache.entries.begin(), cache.entries, found);
-                    counters.storageHits.fetch_add(1, std::memory_order_relaxed);
-                    if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
-                    return found->texture;
-                }
+    // Debug aid: APS5_TRACE_STORAGE_AT=<hex address> prints the first 200 storage lookups at that base.
+    static const std::uint64_t traceAt = [] { const char* text = std::getenv("APS5_TRACE_STORAGE_AT"); return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull; }();
+    if (traceAt != 0 && resource.baseAddress == traceAt) {
+        static std::atomic<int> traced{0};
+        if (traced.fetch_add(1, std::memory_order_relaxed) < 200) std::fprintf(stderr, "[storage-at] lookup %ux%u layers %u mips %u dim %u fmt %u site %s arrays %zu entry %s\n", resource.width, resource.height, resource.depthOrLastArray + 1u, resource.mipCount, static_cast<unsigned>(resource.dimension), resource.format, g_refreshSite, static_cast<std::size_t>(cache.arrays.count(resource.baseAddress)), findStorage(cache, key) != cache.entries.end() ? "cached" : "new");
+    }
+    // Debug aid: APS5_TRACE_LAYER_VIEWS names why a 2D lookup at an array image's base does not take
+    // the array's layer (once per address and reason).
+    static const bool traceLayers = std::getenv("APS5_TRACE_LAYER_VIEWS") != nullptr;
+    const auto traceLayer = [&](const char* why) {
+        if (!traceLayers) return;
+        static std::mutex traceMutex;
+        static std::set<std::pair<std::uint64_t, std::string>> seen;
+        std::lock_guard traceLock(traceMutex);
+        if (seen.size() < 256 && seen.emplace(resource.baseAddress, why).second) std::fprintf(stderr, "[layer-views] 0x%llx %ux%u mips %u dim %u site %s dcc 0x%llx: %s\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.mipCount, static_cast<unsigned>(resource.dimension), g_refreshSite, static_cast<unsigned long long>(resource.dccAddress), why);
+    };
+    if (traceLayers && resource.dimension == TextureDimension::k2D && cache.arrays.find(resource.baseAddress) == cache.arrays.end()) {
+        for (const auto& entry : cache.entries) {
+            const auto& other = entry.texture->Descriptor();
+            if (entry.key.device == context.device && other.baseAddress == resource.baseAddress && entry.texture.get() != nullptr && (other.dimension == TextureDimension::k2DArray || other.dimension == TextureDimension::kCube)) {
+                traceLayer(other.dccAddress != 0 ? "an array image at the base is unregistered (it has DCC)" : "an array image at the base is unregistered (geometry)");
+                break;
             }
+        }
+    }
+    if (layerViews && resource.dimension == TextureDimension::k2D && !(std::string_view(g_refreshSite) == "storage" || (std::string_view(g_refreshSite) == "render-target" && resource.mipCount > 1)) && cache.arrays.contains(resource.baseAddress)) traceLayer("the lookup site takes no layer view");
+    if (layerViews && resource.dimension == TextureDimension::k2D && (std::string_view(g_refreshSite) == "storage" || (std::string_view(g_refreshSite) == "render-target" && resource.mipCount > 1))) {
+        // Arrays of several shapes take turns at one base (cube maps of each size reuse one heap
+        // block): the one whose layer is this surface serves it.
+        const auto layerBytes = guestBytes != 0 ? guestBytes : DescribeSurface(resource).guestBytes;
+        const auto format = static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format));
+        const auto [first, last] = cache.arrays.equal_range(resource.baseAddress);
+        for (auto array = first; array != last; ++array) {
+            if (array->second.first.device != context.device) continue;
+            const auto found = findStorage(cache, array->second.first);
+            if (found == cache.entries.end()) {
+                traceLayer("the registered array image is gone");
+                continue;
+            }
+            const auto& surface = found->texture->Descriptor();
+            if (traceLayers) {
+                char why[160];
+                const char* reason = surface.width != resource.width || surface.height != resource.height ? "extent differs" : surface.mipCount != resource.mipCount ? "mip count differs" : surface.tileMode != resource.tileMode ? "tile mode differs" : array->second.first.words[7] != format ? "storage format differs" : MetadataMoved(*found->texture, resource) ? "metadata moved" : array->second.second != layerBytes ? "layer bytes differ" : "matched";
+                std::snprintf(why, sizeof(why), "array %ux%u mips %u layer 0x%llx (lookup layer 0x%llx): %s", surface.width, surface.height, surface.mipCount, static_cast<unsigned long long>(array->second.second), static_cast<unsigned long long>(layerBytes), reason);
+                traceLayer(why);
+            }
+            if (surface.width == resource.width && surface.height == resource.height && surface.mipCount == resource.mipCount && surface.tileMode == resource.tileMode && array->second.first.words[7] == format && !MetadataMoved(*found->texture, resource) && array->second.second == layerBytes) {
+                found->texture->Refresh();
+                cache.entries.splice(cache.entries.begin(), cache.entries, found);
+                counters.storageHits.fetch_add(1, std::memory_order_relaxed);
+                if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
+                return found->texture;
+            }
+        }
+        if (first != last) {
+            char why[96];
+            std::snprintf(why, sizeof(why), "%ux%u mips %u fell through to its own 2D image", resource.width, resource.height, resource.mipCount);
+            traceLayer(why);
+        }
+    }
+    if (layerViews && resource.dimension == TextureDimension::k2DArray && std::string_view(g_refreshSite) == "render-target") {
+        // A color target that is one layer of an array surface (APS5_RT_SLICE_LAYERS: cube faces)
+        // takes the array image registered at its base with the same geometry: an attachment view
+        // ignores the sampled swizzle that gives the two lookups different keys.
+        const auto layerBytes = DescribeSurface(resource).layerBytes;
+        const auto format = static_cast<std::uint32_t>(StorageFormatForGuest(context, resource.format));
+        const auto [first, last] = cache.arrays.equal_range(resource.baseAddress);
+        for (auto array = first; array != last; ++array) {
+            if (array->second.first.device != context.device || array->second.second != layerBytes || array->second.first.words[7] != format) continue;
+            const auto found = findStorage(cache, array->second.first);
+            if (found == cache.entries.end()) continue;
+            const auto& surface = found->texture->Descriptor();
+            if (surface.width != resource.width || surface.height != resource.height || surface.mipCount != resource.mipCount || surface.tileMode != resource.tileMode || surface.depthOrLastArray != resource.depthOrLastArray || MetadataMoved(*found->texture, resource)) continue;
+            found->texture->Refresh();
+            cache.entries.splice(cache.entries.begin(), cache.entries, found);
+            counters.storageHits.fetch_add(1, std::memory_order_relaxed);
+            if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
+            return found->texture;
         }
     }
     auto it = findStorage(cache, key);
@@ -712,9 +820,19 @@ std::shared_ptr<StorageTexture> lookupStorageTexture(const Context& context, std
     cache.entries.push_front(std::move(entry));
     cache.index[key] = cache.entries.begin();
     cache.byImage[texture.get()] = cache.entries.begin();
+    if (layerViews && resource.dimension == TextureDimension::k2DArray && resource.dccAddress != 0) traceLayer("an array image here has DCC and is not registered");
     if (layerViews && resource.dimension == TextureDimension::k2DArray && resource.dccAddress == 0) {
         const auto geometry = DescribeSurface(resource);
-        if (!geometry.thick && geometry.layers >= 2 && geometry.layerBytes * geometry.layers == geometry.guestBytes) cache.arrays[resource.baseAddress] = {key, geometry.layerBytes};
+        if (traceLayers) {
+            static std::mutex registerMutex;
+            static std::set<std::array<std::uint32_t, 8>> registered;
+            std::lock_guard registerLock(registerMutex);
+            if (registered.size() < 256 && registered.insert(key.words).second) std::fprintf(stderr, "[layer-views] array 0x%llx %ux%u mips %u: %u layers of 0x%llx bytes, 0x%llx in all%s: %s\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.mipCount, geometry.layers, static_cast<unsigned long long>(geometry.layerBytes), static_cast<unsigned long long>(geometry.guestBytes), geometry.thick ? " (thick)" : "", !geometry.thick && geometry.layers >= 2 && geometry.layerBytes * geometry.layers == geometry.guestBytes ? "registered" : "refused");
+        }
+        if (!geometry.thick && geometry.layers >= 2 && geometry.layerBytes * geometry.layers == geometry.guestBytes) {
+            const auto [first, last] = cache.arrays.equal_range(resource.baseAddress);
+            if (std::none_of(first, last, [&](const auto& array) { return array.second.first == key; })) cache.arrays.emplace(resource.baseAddress, std::make_pair(key, geometry.layerBytes));
+        }
     }
     texture->SetCached(true);
     counters.storageCreated.fetch_add(1, std::memory_order_relaxed);
@@ -819,6 +937,7 @@ void ClearCachedTextures(VkDevice device) {
             ++it;
             continue;
         }
+        storageEvictions.fetch_add(1, std::memory_order_acq_rel);
         it->texture->SetCached(false);
         storage.bytes -= it->texture->GuestBytes();
         storage.index.erase(it->key);
@@ -1169,6 +1288,10 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                         const bool written = element >= binding.bufferWritten.size() || binding.bufferWritten[element];
                         const bool atomic = element < binding.bufferAtomic.size() && binding.bufferAtomic[element];
                         const auto index = addGuestBuffer(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 4, 4), target, indexAddress, indexBytes, written, atomic);
+                        if (const auto traceWrites = DebugValue(DebugKey::TraceBufferWrites); traceWrites != 0 && written && allocations[index].address <= traceWrites && traceWrites < allocations[index].address + allocations[index].size) {
+                            static std::atomic<int> traced{0};
+                            if (traced.fetch_add(1) < 400) std::fprintf(stderr, "[trace-buffer-write] 0x%llx+0x%zx binding %u element %u by shader 0x%llx stage %d (packet 0x%x)\n", static_cast<unsigned long long>(allocations[index].address), allocations[index].size, binding.binding, element, static_cast<unsigned long long>(GpuCheckpoints::VariantAddress(shader.program->variantId)), static_cast<int>(shader.stage), GuestMemory::CurrentPacket().opcode);
+                        }
                         const auto& push = shader.program->pushConstants;
                         if (!push.empty()) {
                             const auto position = shader.program->memoryOffsetDword * 4u + element;
@@ -1619,7 +1742,49 @@ bool ShaderResources::writeAddressSet(std::span<const MovedBuffer> moved, std::s
     return true;
 }
 
+namespace {
+
+// Whether an address speculation records its moved images on the prep thread (live `spec_images`,
+// env APS5_SPEC_IMAGE_RECORDS), so the committer's rebind is the fastTexture predicate.
+bool SpeculatedImageRecords() {
+    static const bool enabled = std::getenv("APS5_SPEC_IMAGE_RECORDS") != nullptr;
+    return LiveFlag("spec_images", enabled);
+}
+
+// Rebinds served by the record (0) and records the predicate refused (1).
+std::array<std::atomic<std::uint64_t>, 2>& SpeculatedImageCounts() {
+    static std::array<std::atomic<std::uint64_t>, 2> counts{};
+    return counts;
+}
+
+}
+
 bool ShaderResources::rebindSpeculatedImages(std::span<const SpeculatedImage> images) {
+    // APS5_PROFILE_LOOKUP: [rebind-split] the texture lookups apart from the descriptor writes.
+    static const bool split = std::getenv("APS5_PROFILE_LOOKUP") != nullptr;
+    static std::atomic<std::uint64_t> rebinds{0}, rebound{0}, lookupNs{0}, writeNs{0};
+    static std::atomic<std::int64_t> reported{0};
+    const auto started = split ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    auto looked = started;
+    struct Report {
+        bool enabled;
+        const std::chrono::steady_clock::time_point& started;
+        const std::chrono::steady_clock::time_point& looked;
+        std::size_t images;
+        ~Report() {
+            if (!enabled) return;
+            const auto now = std::chrono::steady_clock::now();
+            lookupNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(looked - started).count()), std::memory_order_relaxed);
+            writeNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - looked).count()), std::memory_order_relaxed);
+            rebound.fetch_add(images, std::memory_order_relaxed);
+            const auto count = rebinds.fetch_add(1, std::memory_order_relaxed) + 1;
+            const auto stamp = now.time_since_epoch().count();
+            auto last = reported.load(std::memory_order_relaxed);
+            if (stamp - last <= 10'000'000'000ll || !reported.compare_exchange_strong(last, stamp)) return;
+            rebinds.store(0);
+            std::fprintf(stderr, "[rebind-split] %llu rebinds, %.2f images each (records: %llu fast, %llu refused), us per rebind: texture lookups %.2f descriptor writes %.2f\n", static_cast<unsigned long long>(count), static_cast<double>(rebound.exchange(0)) / static_cast<double>(count), static_cast<unsigned long long>(SpeculatedImageCounts()[0].exchange(0)), static_cast<unsigned long long>(SpeculatedImageCounts()[1].exchange(0)), static_cast<double>(lookupNs.exchange(0)) / 1000.0 / static_cast<double>(count), static_cast<double>(writeNs.exchange(0)) / 1000.0 / static_cast<double>(count));
+        }
+    } report{split, started, looked, images.size()};
     const auto& source = *addressSource;
     std::vector<VkDescriptorImageInfo> infos;
     infos.reserve(images.size());
@@ -1628,12 +1793,31 @@ bool ShaderResources::rebindSpeculatedImages(std::span<const SpeculatedImage> im
     for (const auto& image : images) {
         if (image.at >= textures.size() || image.at >= source.textureDepthCompare.size() || image.at >= source.textureUnnormalized.size()) return false;
         const auto words = std::span<const std::uint32_t>(image.words);
-        const auto resource = DecodeTextureResource(words);
+        const auto resource = image.recorded ? image.resource : DecodeTextureResource(words);
         std::shared_ptr<Texture> texture;
-        try {
-            texture = cachedTexture(source.context, words, resource, ViewComponents(resource), DescribeSurface(resource).guestBytes, source.textureDepthCompare[image.at]);
-        } catch (const std::exception&) {
-            return false;
+        if (image.recorded) {
+            ImageRecord record;
+            record.sampled = true;
+            record.decoded = true;
+            record.words = image.words;
+            record.resource = image.resource;
+            record.guestBytes = image.guestBytes;
+            record.components = image.components;
+            record.keys = image.keys;
+            record.generation = image.generation;
+            record.texture = image.texture;
+            record.source = image.source;
+            record.entryKeys = image.entryKeys;
+            record.entryGeneration = image.entryGeneration;
+            texture = fastTexture(record);
+            SpeculatedImageCounts()[texture != nullptr ? 0 : 1].fetch_add(1, std::memory_order_relaxed);
+        }
+        if (texture == nullptr) {
+            try {
+                texture = cachedTexture(source.context, words, resource, ViewComponents(resource), DescribeSurface(resource).guestBytes, source.textureDepthCompare[image.at]);
+            } catch (const std::exception&) {
+                return false;
+            }
         }
         if (texture == nullptr) return false;
         bool baseLevel = false;
@@ -1654,6 +1838,7 @@ bool ShaderResources::rebindSpeculatedImages(std::span<const SpeculatedImage> im
         write.descriptorCount = 1;
         writes.push_back(write);
     }
+    if (split) looked = std::chrono::steady_clock::now();
     for (std::size_t k = 0; k < writes.size(); ++k) writes[k].pImageInfo = &infos[k];
     if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     AddressCounts().movedBuffers.fetch_add(images.size(), std::memory_order_relaxed);
@@ -1840,7 +2025,10 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
         // must not serve a build with another (the variant implies it, this makes it explicit).
         packBits(binding.bufferWritten);
         visit(static_cast<std::uint32_t>(binding.imageSamplers.size()));
-        for (const auto sampler : binding.imageSamplers) visit(sampler);
+        for (const auto sampler : binding.imageSamplers) {
+            visit(static_cast<std::uint32_t>(sampler));
+            visit(static_cast<std::uint32_t>(sampler >> 32u));
+        }
     }
 }
 
@@ -2659,6 +2847,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         if (BuildProfiled()) Revalidations().proofsVerified.fetch_add(1, std::memory_order_relaxed);
     }
     bool fast = memoHit || (!noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted));
+    if (fast) GuestMemory::NoteProbeEvent(memoHit ? "memo lookup" : "memo fast revalidate");
     // T1 (design_cpu_final M3, rule RT1): a Pending failure whose overlapping images are foreign
     // to the surfaces is resolved by the own objects' refresh (what the walk's lookups would do to
     // them) and the fast proof run again, which is then authoritative (it accepts what stays
@@ -2791,6 +2980,8 @@ ShaderResources::SpeculationMiss ShaderResources::SpeculateProof(ProofSpeculatio
     speculation.depths.clear();
     speculation.scanned = false;
     speculation.tokens = false;
+    speculation.evictions = storageEvictions.load(std::memory_order_acquire);
+    speculation.stamps = GuestMemory::StampSerial();
     const bool tokens = DrawTokensEnabled();
     if (tokens) {
         speculation.collectEpoch = GuestMemory::ThreadCollectEpoch();
@@ -2808,7 +2999,8 @@ ShaderResources::SpeculationMiss ShaderResources::SpeculateProof(ProofSpeculatio
             const auto& surface = validatedTextures[i];
             if (!surface.valid) return Miss::Record;
             if (surface.depth) {
-                if (ForkLogged() == nullptr) return Miss::Depth;
+                static const bool depthDefault = std::getenv("APS5_SPEC_DEPTH") != nullptr;
+                if (ForkLogged() == nullptr && !LiveFlag("spec_depth", depthDefault)) return Miss::Depth;
                 speculation.depths.push_back(i);
                 continue;
             }
@@ -2823,13 +3015,20 @@ ShaderResources::SpeculationMiss ShaderResources::SpeculateProof(ProofSpeculatio
     auto& images = ShaderRecompiler::ThreadOwned(imagesSlot);
     queries.clear();
     images.clear();
-    for (const auto& surface : speculation.surfaces) {
+    const bool fast = FastProofEnabled();
+    for (auto& surface : speculation.surfaces) {
         if (surface.image != nullptr && surface.image->Descriptor().dccAddress != 0) return Miss::Keys;
         if (GuestMemory::CollectWrites(surface.address, surface.bytes) == 0) return Miss::Collect;
         if (surface.image != nullptr) {
             if (DepthSurfaceAt(surface.address)) return Miss::Depth;
             if (!surface.image->Cached()) return Miss::Evicted;
             images.push_back(surface.image);
+            // The committer's check of the image (memory unchanged since its generation), made here
+            // too for the fast accept, which then needs only the generation to stay put.
+            if (fast) {
+                surface.generation = surface.image->Generation();
+                queries.push_back({surface.address, surface.bytes, surface.generation});
+            }
         } else {
             queries.push_back({surface.address, surface.bytes, surface.generation});
         }
@@ -2845,7 +3044,9 @@ ShaderResources::SpeculationMiss ShaderResources::SpeculateProof(ProofSpeculatio
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
         if (GuestMemory::CollectWrites(own.baseAddress, bytes) == 0) return Miss::Collect;
         if (!image->Cached()) return Miss::Evicted;
-        speculation.surfaces.push_back({own.baseAddress, bytes, image, 0, i, true});
+        const auto imageGeneration = fast ? image->Generation() : 0;
+        if (fast) queries.push_back({own.baseAddress, bytes, imageGeneration});
+        speculation.surfaces.push_back({own.baseAddress, bytes, image, imageGeneration, i, true});
         speculation.pending.push_back({own.baseAddress, own.baseAddress + bytes, image, nullptr, false});
         images.push_back(image);
     }
@@ -2934,8 +3135,43 @@ ShaderResources::SpeculationMiss ShaderResources::ProveSpeculated(const ProofSpe
             std::abort();
         }
     }
-    if (const auto miss = checks(memoized); miss != Miss::None) return miss;
-    if (!StorageImagesCached(context, images)) return Miss::Evicted;
+    // The fast accept (live `fast_proof`, env APS5_FAST_PROOF): with the token window clear, the
+    // collect epoch, unwatch and allocation serials what the prep thread proved under, the pending
+    // registry unchanged since (its serial) and no storage image evicted since, every check below
+    // would repeat the prep thread's answer, so they are skipped. APS5_VERIFY_FAST_PROOF=1 runs
+    // them anyway and aborts on a disagreement.
+    auto& fastStats = FastProofStats();
+    const bool evictionsSame = speculation.evictions == storageEvictions.load(std::memory_order_acquire);
+    const bool generationsSame = std::all_of(speculation.surfaces.begin(), speculation.surfaces.end(), [](const ProofSpeculation::Surface& surface) { return surface.image == nullptr || (surface.generation != 0 && surface.image->Generation() == surface.generation); });
+    const bool stampsSame = speculation.stamps == GuestMemory::StampSerial();
+    const bool fastAccept = memoized && FastProofEnabled() && speculation.pendingSerial == serialBefore && evictionsSame && generationsSame && stampsSame;
+    if (FastProofEnabled()) {
+        fastStats.calls.fetch_add(1, std::memory_order_relaxed);
+        if (!memoized) fastStats.noTokens.fetch_add(1, std::memory_order_relaxed);
+        else if (!stampsSame) fastStats.stamps.fetch_add(1, std::memory_order_relaxed);
+        else if (speculation.pendingSerial != serialBefore) fastStats.pending.fetch_add(1, std::memory_order_relaxed);
+        else if (!evictionsSame) fastStats.evicted.fetch_add(1, std::memory_order_relaxed);
+        else if (!fastAccept) fastStats.generation.fetch_add(1, std::memory_order_relaxed);
+        else fastStats.accepted.fetch_add(1, std::memory_order_relaxed);
+        ReportFastProof();
+    }
+    if (fastAccept && !VerifyFastProof()) {
+        images.clear();
+        collected.assign(speculation.surfaces.size(), GuestMemory::CollectedGeneration());
+        for (const auto& surface : speculation.surfaces) {
+            if (surface.image != nullptr) images.push_back(surface.image);
+        }
+    } else {
+        const auto miss = checks(memoized);
+        const bool cached = miss == Miss::None && StorageImagesCached(context, images);
+        if (fastAccept && (miss != Miss::None || !cached)) {
+            std::fprintf(stderr, "[fast-proof] APS5_VERIFY_FAST_PROOF: a fast-accepted proof fails the full checks (miss %zu, cached %d)\n", static_cast<std::size_t>(miss), cached ? 1 : 0);
+            std::fflush(stderr);
+            std::abort();
+        }
+        if (miss != Miss::None) return miss;
+        if (!cached) return Miss::Evicted;
+    }
     for (const auto* image : images) image->NoteProved();
     for (std::size_t k = 0; k < speculation.surfaces.size(); ++k) {
         const auto& surface = speculation.surfaces[k];
@@ -3055,7 +3291,24 @@ bool ShaderResources::SpeculateAddressUse(const std::shared_ptr<ShaderResources>
                     if (at < speculation.proof.skip.size()) speculation.proof.skip[at] = true;
                     SpeculatedImage image{at, source->addressTextureSlots[at], firstLayer, {}};
                     std::copy(words.begin(), words.end(), image.words.begin());
-                    speculation.movedImages.push_back(image);
+                    // The element's stage-A record (precollectImages): collect, keys, then the entry.
+                    if (SpeculatedImageRecords() && at < source->textureDepthCompare.size() && !source->textureDepthCompare[at]) {
+                        image.resource = resource;
+                        image.guestBytes = DescribeSurface(resource).guestBytes;
+                        image.generation = GuestMemory::CollectWrites(resource.baseAddress, static_cast<std::size_t>(image.guestBytes));
+                        image.components = ViewComponents(resource);
+                        image.keys = TextureClearKeys(resource, image.guestBytes);
+                        auto& cache = Textures();
+                        std::lock_guard lock(cache.mutex);
+                        if (const auto it = findTexture(cache, MakeTextureKey(source->context.device, words, image.components)); it != cache.entries.end()) {
+                            image.texture = it->texture;
+                            image.source = it->source;
+                            image.entryKeys = it->keys;
+                            image.entryGeneration = it->generation;
+                            image.recorded = true;
+                        }
+                    }
+                    speculation.movedImages.push_back(std::move(image));
                 }
             }
         }
@@ -3093,15 +3346,46 @@ std::shared_ptr<ShaderResources> ShaderResources::UseAddressSpeculation(const st
         speculation.miss = miss;
         return std::shared_ptr<ShaderResources>{};
     };
+    // APS5_PROFILE_LOOKUP: [spec-split] times the committer's steps of an accepted address speculation.
+    static const bool split = std::getenv("APS5_PROFILE_LOOKUP") != nullptr;
+    struct Split {
+        std::array<std::atomic<std::uint64_t>, 6> ns{};
+        std::atomic<std::uint64_t> uses{0};
+        std::atomic<std::int64_t> reported{0};
+    };
+    static Split splitStats;
+    auto lapAt = split ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto lap = [&](std::size_t step) {
+        if (!split) return;
+        const auto now = std::chrono::steady_clock::now();
+        splitStats.ns[step].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - lapAt).count()), std::memory_order_relaxed);
+        lapAt = now;
+    };
     if (use == nullptr || source == nullptr || !source->addressReusable || use->addressSource != source) return refuse(Miss::Identity);
     if (!source->MovedStillFree(speculation.moved, Recorder::Active(), &speculation.movedProof)) return refuse(Miss::MovedRecheck);
+    lap(0);
     const auto space = speculation.space.lock();
     if (space == nullptr) return refuse(Miss::Space);
     if (use->guestMemory.ShareSpace(source->addressSpaceSerial, source->guestMemory.Writes()) != GuestBufferMemory::SpaceShare::Taken) return refuse(Miss::Shared);
+    lap(1);
     if (!use->guestMemory.SharesSpace(space.get())) return refuse(Miss::Space);
+    lap(2);
     if (const auto miss = source->ProveSpeculated(speculation.proof); miss != Miss::None) return refuse(miss);
+    lap(3);
     if (!use->guestMemory.FinishSharedSpace()) return refuse(Miss::Finish);
+    lap(4);
     if (!speculation.movedImages.empty() && !use->rebindSpeculatedImages(speculation.movedImages)) return refuse(Miss::MovedImage);
+    lap(5);
+    if (split) {
+        const auto uses = splitStats.uses.fetch_add(1, std::memory_order_relaxed) + 1;
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto last = splitStats.reported.load(std::memory_order_relaxed);
+        if (now - last > 10'000'000'000ll && splitStats.reported.compare_exchange_strong(last, now)) {
+            splitStats.uses.store(0);
+            const auto us = [&](std::size_t step) { return static_cast<double>(splitStats.ns[step].exchange(0)) / 1000.0 / static_cast<double>(uses); };
+            std::fprintf(stderr, "[spec-split] %llu accepted address speculations, us per use: moved recheck %.2f space share %.2f shares space %.2f proof %.2f finish %.2f images %.2f\n", static_cast<unsigned long long>(uses), us(0), us(1), us(2), us(3), us(4), us(5));
+        }
+    }
     auto& counts = AddressCounts();
     counts.hits.fetch_add(1, std::memory_order_relaxed);
     if (speculation.movedGuest != 0) counts.movedBuffers.fetch_add(speculation.movedGuest, std::memory_order_relaxed);

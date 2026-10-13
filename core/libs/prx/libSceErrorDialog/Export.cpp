@@ -6,6 +6,7 @@
 #include "SceTypes.hpp"
 #include "HitLog.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libkernel/Automation/include/Automation.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -63,6 +64,7 @@ int APS5_VABI sceErrorDialogOpen(const void* param) {
  std::memcpy(&errorCode, static_cast<const std::uint8_t*>(param) + 4, sizeof(errorCode));
  std::memcpy(&userId, static_cast<const std::uint8_t*>(param) + 8, sizeof(userId));
  APS5_HIT("ERRORDIALOG", "open: error_code=0x%08X user_id=%d", errorCode, userId);
+ if (Automation::Enabled()) Automation::Fields().Str("dialog", "error").Str("op", "open").Hex("error_code", static_cast<std::uint32_t>(errorCode)).Emit("dialog");
  g_status = kStatusRunning;
  return kErrOk;
 }
@@ -89,6 +91,7 @@ int APS5_VABI sceErrorDialogTerminate(void) {
  std::lock_guard g(g_lock);
  if (g_status == kStatusNone) return kErrNotInitialized;
  g_status = kStatusNone;
+ if (Automation::Enabled()) Automation::Fields().Str("dialog", "error").Str("op", "terminate").Emit("dialog");
  return kErrOk;
 }
 

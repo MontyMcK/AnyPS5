@@ -156,9 +156,10 @@ public:
     bool Attachable() const { return attachable; }
     bool CubeCompatible() const { return cubeCompatible; }
     VkImageView AttachmentView(VkFormat format, std::uint32_t mip = 0, std::uint32_t depthSlice = 0, std::uint32_t layers = 1);
-    VkImageView AttachmentProxyView();
-    void RecordAttachmentProxyLoad(VkCommandBuffer commands, VkImageLayout attachmentLayout) const;
-    void RecordAttachmentProxyStore(VkCommandBuffer commands, VkImageLayout attachmentLayout) const;
+    // float11: a B10G11R11 proxy for a packed COLOR_11_11_10 image (R32_UINT), repacked on load/store.
+    VkImageView AttachmentProxyView(bool float11 = false, std::uint32_t mip = 0, std::uint32_t layer = 0, std::uint32_t layers = 1);
+    void RecordAttachmentProxyLoad(VkCommandBuffer commands, VkImageLayout attachmentLayout, std::uint32_t mip = 0, std::uint32_t layer = 0, std::uint32_t layers = 1) const;
+    void RecordAttachmentProxyStore(VkCommandBuffer commands, VkImageLayout attachmentLayout, std::uint32_t mip = 0, std::uint32_t layer = 0, std::uint32_t layers = 1) const;
     void WriteBack();
     // Deferred write-back (APS5_EAGER_WRITEBACK=1 stores at once instead).
     void MarkDirty();
@@ -176,6 +177,13 @@ public:
     // overlapping pending image, as before).
     static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr);
     static void FlushAllPending(const char* reason);
+    // Stores the pending results of every image of at most SmallStoreBytes guest bytes in
+    // host-imported memory, recorded behind the work recorded so far (no CPU wait); called at each
+    // flip. The guest CPU reads GPU results straight from memory, which no flush hook sees: a title
+    // that reads back a small image (a luminance or histogram target, read a frame or two later)
+    // would otherwise read whatever the memory held before. Returns how many images were stored.
+    static constexpr std::uint64_t SmallStoreBytes = 64 * 1024;
+    static std::size_t StoreSmallPending();
     // See PendingSerial: a change of a surface's source outside the registry (a unit shadow
     // retile) moves it too.
     static void BumpPendingSerial();
@@ -440,10 +448,34 @@ private:
     bool skippedResultsInside(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t borrowUnits(StorageTexture& source, const std::vector<bool>& units);
     void forgetBorrowed(std::uint32_t first, std::uint32_t count);
+    // Layer aliases (APS5_NO_LAYER_BORROW=1 disables): a pending image of the same per-layer layout
+    // over this image's memory at a whole number of layers away (a cube map and the 2D images of
+    // its faces at base + k * layerBytes). Its units over this image (this unit + offset) are taken
+    // on the device instead of being stored to guest memory and uploaded again, as pendingAlias
+    // does for an alias at the same base.
+    struct LayerAlias {
+        std::shared_ptr<StorageTexture> source;
+        std::int64_t offset = 0;
+        std::uint32_t first = 0;
+        std::uint32_t end = 0;
+    };
+    std::vector<LayerAlias> pendingLayerAliases() const;
+    // Whether the source's pending units over [first, end) may stay pending through this refresh
+    // (borrowUnits' rule: tracked, not maybe-written, no results of this image in the same unit).
+    bool layerAliasExempt(const LayerAlias& link) const;
+    // The image copies moving the selected units from the source (this unit + offset), or false
+    // when its windows do not pair with this image's one to one.
+    bool layerCopies(const StorageTexture& source, std::int64_t offset, const std::vector<bool>& units, std::vector<VkImageCopy>* regions) const;
+    void borrowLayerUnits(StorageTexture& source, std::int64_t offset, const std::vector<bool>& units);
+    void recordBorrowCopy(StorageTexture& source, const std::vector<VkImageCopy>& regions, std::uint64_t bytes);
     bool clearByKeysFill(DccKeys keys, std::uint8_t key);
     bool overlaps(std::uint64_t address, std::size_t bytes) const;
     bool pendingUnitInside(std::uint64_t address, std::size_t bytes) const;
     VkImageView createView(std::uint32_t mip, bool firstLayer, VkFormat format, std::uint32_t layer = 0) const;
+    // The format of rawView for this surface, or VK_FORMAT_UNDEFINED when it has none (a compressed
+    // or 3D surface, a linear one, or no storage support for the element-size format).
+    VkFormat rawFormat() const;
+    VkImageView rawView(std::uint32_t mip);
     void release() noexcept;
 
     Context context;
@@ -490,6 +522,15 @@ private:
     std::weak_ptr<StorageTexture> borrowedFrom;
     std::uint64_t borrowedVersion = 0;
     std::vector<bool> borrowedUnits;
+    // Units holding a layer alias's results (see pendingLayerAliases), per source and offset, at
+    // the source's version then.
+    struct LayerBorrow {
+        std::weak_ptr<StorageTexture> from;
+        std::int64_t offset = 0;
+        std::uint64_t version = 0;
+        std::vector<bool> units;
+    };
+    std::vector<LayerBorrow> layerBorrows;
     // Units of this image were borrowed since it was last written: the borrower's proofs
     // (the resource cache's serial memo) hold only while this image's version does, so the next
     // write here bumps the pending serial although the image was pending already.
@@ -502,12 +543,25 @@ private:
     std::map<std::uint32_t, VkImageView> firstLayerViews;
     std::map<std::pair<std::uint32_t, bool>, VkImageView> atomicViews;
     std::map<std::pair<std::uint32_t, bool>, VkImageView> uintViews;
+    // Per mip: the unsigned element-size 2D-array view over every image layer that the fused
+    // write-back reads (rawView).
+    std::map<std::uint32_t, VkImageView> rawViews;
     bool attachable = false;
     bool cubeCompatible = false;
     std::map<std::tuple<VkFormat, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> attachmentViews;
     VkImage proxyImage = VK_NULL_HANDLE;
     VkDeviceMemory proxyMemory = VK_NULL_HANDLE;
     VkImageView proxyView = VK_NULL_HANDLE;
+    VkImageView proxyStorageView = VK_NULL_HANDLE;
+    bool proxyFloat11 = false;
+    // The float11 proxy's views: attachment views (B10G11R11) keyed by (mip, first layer, layers),
+    // and per image layer (key mip | layer << 16) the R32 storage views of the proxy and of the
+    // image the repack moves between.
+    std::map<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> proxyAttachmentViews;
+    std::map<std::uint32_t, VkImageView> proxyStorageViews, proxyImageViews;
+    VkImageView proxySubresourceView(VkImage target, VkFormat format, VkImageUsageFlags usage, std::uint32_t mip, std::uint32_t layer, std::uint32_t layers = 1) const;
+    VkImageView proxyFloat11View(std::uint32_t mip, std::uint32_t layer, std::uint32_t layers);
+    void recordProxyRepack(VkCommandBuffer commands, VkImageLayout attachmentLayout, std::uint32_t mip, std::uint32_t layer, std::uint32_t layers, bool toNative) const;
     VkFormat storageFormat = VK_FORMAT_UNDEFINED;
     // Results are on the GPU only (guarded by the pending-write registry lock).
     bool dirty = false;

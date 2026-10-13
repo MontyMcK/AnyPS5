@@ -45,11 +45,28 @@ inline VkPipelineStageFlags PipelineStages(std::span<const CompiledShader> shade
     return result;
 }
 
+// Whether a vertex-pipeline stage writes gl_Layer (decorated BuiltIn Layer): it then reads the
+// framebuffer's last layer from push dword LayerLimitPushDword to clamp its layer as the hardware does.
+inline bool WritesLayer(const ShaderRecompiler::RecompileResult& program) {
+    const auto& words = program.spirv;
+    for (std::size_t cursor = 5; cursor + 3 < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        if (count == 0) break;
+        if ((words[cursor] & 0xffffu) == 71u && count >= 4 && words[cursor + 2] == 11u && words[cursor + 3] == 9u) return true;
+        cursor += count;
+    }
+    return false;
+}
+
+inline bool LayerLimited(const CompiledShader& shader) {
+    return shader.stage != ShaderRecompiler::ShaderStage::Mesh && shader.stage != ShaderRecompiler::ShaderStage::Fragment && shader.stage != ShaderRecompiler::ShaderStage::Compute && shader.program != nullptr && WritesLayer(*shader.program);
+}
+
 inline VkShaderStageFlags PushConstantStages(std::span<const CompiledShader> shaders) {
     VkShaderStageFlags result = 0;
     for (const auto& shader : shaders) {
         Require(shader.program != nullptr, "missing compiled shader");
-        if (!shader.program->pushConstants.empty() || shader.stage == ShaderRecompiler::ShaderStage::Mesh) result |= VulkanStage(shader.stage);
+        if (!shader.program->pushConstants.empty() || shader.stage == ShaderRecompiler::ShaderStage::Mesh || LayerLimited(shader)) result |= VulkanStage(shader.stage);
     }
     return result;
 }

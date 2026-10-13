@@ -5,6 +5,7 @@
 #include "SceTypes.hpp"
 #include "prx/libSceSaveDataDialog.native/SaveDataDialog.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libkernel/Automation/include/Automation.hpp"
 
 static int g_status = SAVE_DATA_DIALOG_STATUS_NONE;
 static int g_mode = 0;
@@ -71,12 +72,14 @@ int APS5_VABI sceSaveDataDialogOpen(const void* param) {
  }
  g_status = g_mode == SAVE_DATA_DIALOG_MODE_PROGRESS_BAR
   ? SAVE_DATA_DIALOG_STATUS_RUNNING : SAVE_DATA_DIALOG_STATUS_FINISHED;
+ if (Automation::Enabled()) Automation::Fields().Str("dialog", "savedata").Str("op", "open").Num("mode", g_mode).Str("dir", g_dir_name).Emit("dialog");
  return SAVE_DATA_DIALOG_OK;
 }
 
 int APS5_VABI sceSaveDataDialogClose(const void* closeParam) {
  (void)closeParam;
  g_status = SAVE_DATA_DIALOG_STATUS_FINISHED;
+ if (Automation::Enabled()) Automation::Fields().Str("dialog", "savedata").Str("op", "close").Emit("dialog");
  return SAVE_DATA_DIALOG_OK;
 }
 
@@ -85,6 +88,7 @@ int APS5_VABI sceSaveDataDialogIsReadyToDisplay(void) {
 }
 
 int APS5_VABI sceSaveDataDialogTerminate(void) {
+ if (Automation::Enabled()) Automation::Fields().Str("dialog", "savedata").Str("op", "terminate").Emit("dialog");
  g_status = SAVE_DATA_DIALOG_STATUS_NONE;
  g_mode = 0;
  g_user_data = nullptr;

@@ -1,5 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuCheckpoints.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/AddressLedger.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/NvPerfRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
@@ -81,7 +84,33 @@ VkPresentModeKHR RequestedPresentMode(TState& state, VkPhysicalDevice physical, 
 namespace {
 
 VkDevice faultDevice = VK_NULL_HANDLE;
+VkQueue faultQueue = VK_NULL_HANDLE;
+PFN_vkGetDeviceProcAddr faultDeviceProc = nullptr;
 PFN_vkGetDeviceFaultInfoEXT faultInfo = nullptr;
+
+// APS5_DEVICE_FAULT: VK_EXT_device_address_binding_report messages into the address ledger, so a
+// fault address can be named even when it belongs to an image or a buffer without a device address.
+VKAPI_ATTR VkBool32 VKAPI_CALL addressBindingMessage(VkDebugUtilsMessageSeverityFlagBitsEXT, VkDebugUtilsMessageTypeFlagsEXT types, const VkDebugUtilsMessengerCallbackDataEXT* data, void*) {
+    if ((types & VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT) == 0 || data == nullptr) return VK_FALSE;
+    for (auto* next = static_cast<const VkBaseInStructure*>(data->pNext); next != nullptr; next = next->pNext) {
+        if (next->sType != VK_STRUCTURE_TYPE_DEVICE_ADDRESS_BINDING_CALLBACK_DATA_EXT) continue;
+        const auto* binding = reinterpret_cast<const VkDeviceAddressBindingCallbackDataEXT*>(next);
+        const char* type = "object";
+        std::uint64_t object = 0;
+        if (data->objectCount != 0 && data->pObjects != nullptr) {
+            object = data->pObjects[0].objectHandle;
+            switch (data->pObjects[0].objectType) {
+                case VK_OBJECT_TYPE_IMAGE: type = "image"; break;
+                case VK_OBJECT_TYPE_BUFFER: type = "buffer"; break;
+                case VK_OBJECT_TYPE_DEVICE_MEMORY: type = "memory"; break;
+                case VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR: type = "acceleration structure"; break;
+                default: break;
+            }
+        }
+        Graphics::AddressLedger::Bound(binding->baseAddress, binding->size, type, object, binding->bindingType == VK_DEVICE_ADDRESS_BINDING_TYPE_UNBIND_EXT);
+    }
+    return VK_FALSE;
+}
 
 void reportDeviceFault() {
     static std::atomic<bool> reported{false};
@@ -100,6 +129,8 @@ void reportDeviceFault() {
     const auto result = faultInfo(faultDevice, &counts, &info);
     std::fprintf(stderr, "[device-fault] result %d, %u addresses, %u vendor records: %s\n", static_cast<int>(result), counts.addressInfoCount, counts.vendorInfoCount, info.description);
     for (const auto& address : addresses) std::fprintf(stderr, "[device-fault] address type %d reported 0x%llx precision 0x%llx\n", static_cast<int>(address.addressType), static_cast<unsigned long long>(address.reportedAddress), static_cast<unsigned long long>(address.addressPrecision));
+    for (const auto& address : addresses) Graphics::AddressLedger::Report(address.reportedAddress, address.addressPrecision);
+    Graphics::GpuCheckpoints::Report(faultDevice, faultQueue, faultDeviceProc);
     for (const auto& vendor : vendors) std::fprintf(stderr, "[device-fault] vendor %s code 0x%llx data 0x%llx\n", vendor.description, static_cast<unsigned long long>(vendor.vendorFaultCode), static_cast<unsigned long long>(vendor.vendorFaultData));
     std::fflush(stderr);
 }
@@ -138,7 +169,12 @@ public:
     void Enqueue(int index, std::uint32_t width, std::uint32_t height, std::uint32_t scale, std::vector<std::byte> pixels) {
         std::lock_guard lock(mutex);
         require(!stopping, "frame dump writer has stopped");
-        require(pixels.size() <= maxBytes - queuedBytes, "frame dump queue exceeded 64 MiB");
+        // A debug dump must never stop the title: while the writer is behind (disk slower than the
+        // dumps), the frame is dropped and reported instead.
+        if (pixels.size() > maxBytes - queuedBytes) {
+            if (dropped++ < 16) std::fprintf(stderr, "[gpu] frame dump %d dropped: the writer is %zu MiB behind\n", index, queuedBytes >> 20);
+            return;
+        }
         if (!worker.joinable()) worker = std::thread([this] { run(); });
         const auto bytes = pixels.size();
         pending.push_back({index, width, height, scale, std::move(pixels)});
@@ -181,6 +217,7 @@ private:
     std::mutex mutex;
     std::condition_variable changed;
     std::deque<Frame> pending;
+    std::uint64_t dropped = 0;
     std::thread worker;
     std::size_t queuedBytes = 0;
     bool stopping = false;
@@ -218,6 +255,10 @@ struct VulkanDevice::State {
     VkQueue queue = VK_NULL_HANDLE;
     VkCommandPool pool = VK_NULL_HANDLE;
     void* window = nullptr;
+    // The queue family of `queue`, and whether a headless device was made able to take a window later
+    // (surface instance extensions and the swapchain device extension enabled; see AttachWindow).
+    std::uint32_t family = 0;
+    bool presentationCapable = false;
     VkSurfaceKHR surface = VK_NULL_HANDLE;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     VkExtent2D extent{};
@@ -255,6 +296,7 @@ struct VulkanDevice::State {
     bool depthClipControl = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
+    bool pushDescriptors = false;
     bool maintenance8 = false;
     std::uint32_t srgbDecodeFormats = 0;
     bool depthClamp = false;
@@ -375,7 +417,7 @@ struct VulkanDevice::State {
     template<typename TFunction>
     TFunction DeviceFunction(const char* name) const {
         ++Graphics::DeviceProcLookups();
-        auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
+        auto function = reinterpret_cast<TFunction>(Graphics::CachedDeviceProc(deviceProc, device, name));
         if (function == nullptr) {
             throw std::runtime_error(std::string("Vulkan device function missing: ") + name);
         }
@@ -543,6 +585,7 @@ struct VulkanDevice::State {
     ~State() {
         contextReady = false;
         if (device != VK_NULL_HANDLE) {
+            Graphics::DrainDeferredVulkan();
             const auto idle = reinterpret_cast<PFN_vkDeviceWaitIdle>(deviceProc(device, "vkDeviceWaitIdle"))(device);
             if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
             // Resident images kept for unfinished presentations go before the caches they came from.
@@ -668,11 +711,54 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
                 throw std::runtime_error(std::string("Vulkan presentation: required instance extension missing: ") + name);
             }
         }
+        if (std::getenv("APS5_DEBUG_LABELS") != nullptr && std::any_of(available.begin(), available.end(), [](const auto& item) { return std::strcmp(item.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0; })) instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
+        create.ppEnabledExtensionNames = instanceExtensions.data();
+    } else if (std::getenv("APS5_NO_ATTACH_WINDOW") == nullptr) {
+        // A headless device (the title draws before its first flip) keeps the presentation extensions
+        // available, so the first flip attaches its window to this device (AttachWindow) instead of
+        // replacing it with a second one. APS5_NO_ATTACH_WINDOW=1 replaces the device as before.
+        std::uint32_t availableCount = 0;
+        const auto enumerateExtensions = state->InstanceFunction<PFN_vkEnumerateInstanceExtensionProperties>("vkEnumerateInstanceExtensionProperties");
+        check(enumerateExtensions(nullptr, &availableCount, nullptr), "vkEnumerateInstanceExtensionProperties");
+        std::vector<VkExtensionProperties> available(availableCount);
+        check(enumerateExtensions(nullptr, &availableCount, available.data()), "vkEnumerateInstanceExtensionProperties");
+        const auto has = [&](const char* name) { return std::any_of(available.begin(), available.end(), [&](const auto& item) { return std::strcmp(item.extensionName, name) == 0; }); };
+        if (has(VK_KHR_SURFACE_EXTENSION_NAME) && has("VK_KHR_win32_surface")) {
+            instanceExtensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+            instanceExtensions.push_back("VK_KHR_win32_surface");
+            state->presentationCapable = true;
+        }
+        if (std::getenv("APS5_DEBUG_LABELS") != nullptr && has(VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
+        create.ppEnabledExtensionNames = instanceExtensions.empty() ? nullptr : instanceExtensions.data();
+    }
+    if (std::getenv("APS5_DEVICE_FAULT") != nullptr && std::none_of(instanceExtensions.begin(), instanceExtensions.end(), [](const char* name) { return std::strcmp(name, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0; })) {
+        instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
         create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
         create.ppEnabledExtensionNames = instanceExtensions.data();
     }
+    if (Graphics::NvPerf::Enabled()) {
+        std::vector<const char*> wanted;
+        Graphics::NvPerf::AppendInstanceExtensions(wanted, application.apiVersion);
+        for (const auto* name : wanted) {
+            if (std::none_of(instanceExtensions.begin(), instanceExtensions.end(), [&](const char* have) { return std::strcmp(have, name) == 0; })) instanceExtensions.push_back(name);
+        }
+        create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
+        create.ppEnabledExtensionNames = instanceExtensions.empty() ? nullptr : instanceExtensions.data();
+    }
     check(state->InstanceFunction<PFN_vkCreateInstance>("vkCreateInstance")(&create, nullptr, &state->instance), "vkCreateInstance");
     APS5_LOG_OUT("Vulkan instance created instance=%p", reinterpret_cast<void*>(state->instance));
+    if (std::getenv("APS5_DEVICE_FAULT") != nullptr) {
+        if (const auto createMessenger = state->InstanceFunction<PFN_vkCreateDebugUtilsMessengerEXT>("vkCreateDebugUtilsMessengerEXT")) {
+            VkDebugUtilsMessengerCreateInfoEXT messenger{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+            messenger.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+            messenger.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT;
+            messenger.pfnUserCallback = addressBindingMessage;
+            static VkDebugUtilsMessengerEXT handle = VK_NULL_HANDLE;
+            if (createMessenger(state->instance, &messenger, nullptr, &handle) == VK_SUCCESS) std::fprintf(stderr, "[address-ledger] device address binding messenger installed\n");
+        }
+    }
     if (window != nullptr) {
         state->surface = window->createSurface(window->context, state->instance);
         require(state->surface != VK_NULL_HANDLE, "window returned a null surface");
@@ -769,6 +855,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->InstanceFunction<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(selected, &properties);
     state->properties = properties.properties;
     state->physical = selected;
+    state->family = family;
     state->srgbDecodeFormats = Graphics::SrgbDecodeFormats(state->InstanceFunction<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties"), selected);
     if ((state->subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT) != 0) {
         state->capabilities.push_back(spv::CapabilityGroupNonUniform);
@@ -833,7 +920,19 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         APS5_LOG_OUT("Shader clock driver=%d narrowSubgroupClock=%d", static_cast<int>(driver.driverID), state->narrowSubgroupClock ? 1 : 0);
     }
     std::vector<const char*> deviceExtensions;
-    if (window != nullptr) deviceExtensions.assign(presentationExtensions.begin(), presentationExtensions.end());
+    if (window != nullptr) {
+        deviceExtensions.assign(presentationExtensions.begin(), presentationExtensions.end());
+    } else if (state->presentationCapable) {
+        std::uint32_t extensionCount = 0;
+        const auto enumerateExtensions = state->InstanceFunction<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties");
+        check(enumerateExtensions(selected, nullptr, &extensionCount, nullptr), "vkEnumerateDeviceExtensionProperties");
+        std::vector<VkExtensionProperties> extensions(extensionCount);
+        check(enumerateExtensions(selected, nullptr, &extensionCount, extensions.data()), "vkEnumerateDeviceExtensionProperties");
+        state->presentationCapable = std::all_of(presentationExtensions.begin(), presentationExtensions.end(), [&](const char* name) {
+            return std::any_of(extensions.begin(), extensions.end(), [&](const auto& item) { return std::strcmp(item.extensionName, name) == 0; });
+        });
+        if (state->presentationCapable) deviceExtensions.assign(presentationExtensions.begin(), presentationExtensions.end());
+    }
     if (state->fragmentShaderBarycentric) {
         deviceExtensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         state->capabilities.push_back(spv::CapabilityFragmentBarycentricKHR);
@@ -1067,10 +1166,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->nullDescriptor = robustness2Features.nullDescriptor == VK_TRUE;
     }
     robustness2Features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
-    if (state->nullDescriptor) {
-        robustness2Features.nullDescriptor = VK_TRUE;
-        deviceExtensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
-    }
+    if (state->nullDescriptor) robustness2Features.nullDescriptor = VK_TRUE;
     state->samplerAnisotropy = true;
     state->textureCompressionBC = true;
     deviceInfo.pEnabledFeatures = &enabled;
@@ -1126,10 +1222,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         descriptorIndexingFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &descriptorIndexingFeatures;
     }
-    if (state->nullDescriptor) {
-        robustness2Features.pNext = byteFeatures.pNext;
-        byteFeatures.pNext = &robustness2Features;
-    }
+    // robustness2 (nullDescriptor) is chained once, unconditionally, below; chaining it here too put
+    // the same feature struct in the device chain twice.
     // Timeline semaphores let a queue worker wait for recorded batches without holding the GPU mutex
     // (see Recorder::WaitSerial). The instance is 1.1, so the KHR extension is used even on 1.2+
     // devices. Debug aid: APS5_NO_TIMELINE=1 leaves it off (drains wait under the mutex as before).
@@ -1196,9 +1290,51 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     robustness2.pNext = bdaFeatures.pNext;
     bdaFeatures.pNext = &robustness2;
     deviceExtensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
+    // APS5_PERF_COUNTERS_LIST=1: the hardware counters VK_KHR_performance_query offers on the queue family.
+    if (std::getenv("APS5_PERF_COUNTERS_LIST") != nullptr) {
+        std::fprintf(stderr, "[perf-query] VK_KHR_performance_query %s\n", hasExtension(VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME) ? "available" : "NOT available");
+        if (const auto enumerate = state->InstanceFunction<PFN_vkEnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR>("vkEnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR"); enumerate != nullptr && hasExtension(VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME)) {
+            std::uint32_t count = 0;
+            enumerate(selected, family, &count, nullptr, nullptr);
+            std::vector<VkPerformanceCounterKHR> counters(count, {VK_STRUCTURE_TYPE_PERFORMANCE_COUNTER_KHR});
+            std::vector<VkPerformanceCounterDescriptionKHR> descriptions(count, {VK_STRUCTURE_TYPE_PERFORMANCE_COUNTER_DESCRIPTION_KHR});
+            enumerate(selected, family, &count, counters.data(), descriptions.data());
+            std::fprintf(stderr, "[perf-query] %u counters\n", count);
+            for (std::uint32_t i = 0; i < count; ++i) std::fprintf(stderr, "[perf-query] %u %s | %s | %s | unit %d scope %d storage %d\n", i, descriptions[i].category, descriptions[i].name, descriptions[i].description, static_cast<int>(counters[i].unit), static_cast<int>(counters[i].scope), static_cast<int>(counters[i].storage));
+        }
+    }
+    if (hasExtension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME) && std::getenv("APS5_NO_PUSH_DESCRIPTORS") == nullptr) {
+        state->pushDescriptors = true;
+        deviceExtensions.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+    }
+    if (Graphics::GpuCheckpoints::Requested() && hasExtension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME)) {
+        deviceExtensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+        Graphics::GpuCheckpoints::Active() = true;
+        if (hasExtension(VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) {
+            deviceExtensions.push_back(VK_AMD_BUFFER_MARKER_EXTENSION_NAME);
+            Graphics::GpuCheckpoints::MarkersActive() = true;
+        }
+        std::fprintf(stderr, "[checkpoints] VK_NV_device_diagnostic_checkpoints enabled\n");
+    }
+    if (Graphics::NvPerf::Enabled()) {
+        std::vector<const char*> wanted;
+        Graphics::NvPerf::AppendDeviceExtensions(state->instance, selected, state->instanceProc, wanted);
+        for (const auto* name : wanted) {
+            if (std::none_of(deviceExtensions.begin(), deviceExtensions.end(), [&](const char* have) { return std::strcmp(have, name) == 0; })) deviceExtensions.push_back(name);
+        }
+    }
+    static VkPhysicalDeviceAddressBindingReportFeaturesEXT bindingReport{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT};
+    const bool reportBindings = std::getenv("APS5_DEVICE_FAULT") != nullptr && hasExtension(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+    if (reportBindings) deviceExtensions.push_back(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
     deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
     deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     deviceInfo.pNext = &bdaFeatures;
+    if (reportBindings) {
+        bindingReport.reportAddressBinding = VK_TRUE;
+        bindingReport.pNext = const_cast<void*>(deviceInfo.pNext);
+        deviceInfo.pNext = &bindingReport;
+        std::fprintf(stderr, "[address-ledger] VK_EXT_device_address_binding_report enabled\n");
+    }
     auto shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
     VkPhysicalDeviceFaultFeaturesEXT faultFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
     bool deviceFault = false;
@@ -1215,6 +1351,14 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
             deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
         }
     }
+    if (state->pipelineExecutableInfo) {
+        // APS5_PIPELINE_STATS: the feature chain the device is created with, for a refused creation.
+        std::fprintf(stderr, "[pipeline-stats] device chain:");
+        for (auto* link = static_cast<const VkBaseInStructure*>(deviceInfo.pNext); link != nullptr; link = link->pNext) std::fprintf(stderr, " %d", static_cast<int>(link->sType));
+        std::fprintf(stderr, "; executable info %u; extensions:", pipelineFeatures.pipelineExecutableInfo);
+        for (std::uint32_t i = 0; i < deviceInfo.enabledExtensionCount; ++i) std::fprintf(stderr, " %s", deviceInfo.ppEnabledExtensionNames[i]);
+        std::fprintf(stderr, "\n");
+    }
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
     if (deviceFault) {
         faultDevice = state->device;
@@ -1224,6 +1368,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     }
     state->shaderProfile = std::move(shaderProfile);
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
+    Graphics::NvPerf::Initialize(state->instance, selected, state->device, state->queue, family, state->instanceProc, state->deviceProc);
+    faultQueue = state->queue;
+    faultDeviceProc = state->deviceProc;
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -1247,7 +1394,15 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->recorder->Activate();
     state->context = buildContext();
     state->contextReady = true;
-    if (window != nullptr) {
+    if (window != nullptr) setupPresentation(*window);
+}
+
+// The swapchain and presentation state for the device's surface (state->surface, made for
+// `presentation`): by the windowed constructor, or by AttachWindow on a headless device.
+void VulkanDevice::setupPresentation(const PresentationWindow& presentation) {
+    const auto* window = &presentation;
+    const VkPhysicalDevice selected = state->physical;
+    {
         require(window->getDrawableSize != nullptr, "missing window drawable size query");
         std::uint32_t drawableWidth = 0;
         std::uint32_t drawableHeight = 0;
@@ -1313,6 +1468,32 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
 }
 
 VulkanDevice::~VulkanDevice() = default;
+
+bool VulkanDevice::AttachWindow(const PresentationWindow& window) {
+    GuestMemory::AssertGpuLockHeld("VulkanDevice::AttachWindow");
+    if (state->window != nullptr) return state->window == window.context;
+    if (!state->presentationCapable || window.context == nullptr || window.createSurface == nullptr || window.getDrawableSize == nullptr || window.width == 0 || window.height == 0) return false;
+    VkSurfaceKHR surface = VK_NULL_HANDLE;
+    try {
+        surface = window.createSurface(window.context, state->instance);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[device] attaching the window failed: %s; replacing the device\n", error.what());
+        return false;
+    }
+    if (surface == VK_NULL_HANDLE) return false;
+    VkBool32 supported = VK_FALSE;
+    const auto supportQuery = state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfaceSupportKHR>("vkGetPhysicalDeviceSurfaceSupportKHR");
+    if (supportQuery(state->physical, state->family, surface, &supported) != VK_SUCCESS || supported != VK_TRUE) {
+        state->InstanceFunction<PFN_vkDestroySurfaceKHR>("vkDestroySurfaceKHR")(state->instance, surface, nullptr);
+        std::fprintf(stderr, "[device] queue family %u cannot present to the window; replacing the device\n", state->family);
+        return false;
+    }
+    state->surface = surface;
+    state->window = window.context;
+    APS5_LOG_OUT("Vulkan surface attached surface=%p window=%p", reinterpret_cast<void*>(state->surface), state->window);
+    setupPresentation(window);
+    return true;
+}
 
 void VulkanDevice::PrepareForReplacement() {
     GuestMemory::AssertGpuLockHeld("VulkanDevice::PrepareForReplacement");
@@ -2128,6 +2309,15 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     if (dumpImagesAt != 0 && ++displayPresents == dumpImagesAt) Graphics::DumpCachedStorageImages(graphicsContext().device, "images_" + std::to_string(dumpImagesAt));
     Graphics::PollDebugControls();
     if (std::string label; Graphics::TakeDumpRequest(label)) Graphics::DumpCachedStorageImages(graphicsContext().device, "dump_" + label);
+    if (const auto guestAddress = Graphics::TakeDebugValue(Graphics::DebugKey::DumpGuest); guestAddress != 0) {
+        const auto requested = Graphics::DebugValue(Graphics::DebugKey::DumpGuestBytes);
+        std::vector<std::byte> bytes(requested != 0 ? requested : 4u << 20u);
+        GuestMemory::Read(guestAddress, bytes);
+        char name[64];
+        std::snprintf(name, sizeof(name), "dump_guest_%llx.bin", static_cast<unsigned long long>(guestAddress));
+        std::ofstream(name, std::ios::binary).write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        std::fprintf(stderr, "[debug-control] wrote %s (%zu bytes)\n", name, bytes.size());
+    }
     if (const auto depth = Graphics::TakeDebugValue(Graphics::DebugKey::DumpDepth); depth != 0) {
         char name[64];
         std::snprintf(name, sizeof(name), "dump_depth_%llx.raw", static_cast<unsigned long long>(depth));
@@ -2558,7 +2748,9 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
 ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
     const auto& limits = state->properties.limits;
     ShaderRecompiler::SpirvTarget target{VK_API_VERSION_1_1, state->meshShader ? 0x00010400u : 0x00010300u, state->subgroup.subgroupSize, ShaderRecompiler::BdaAbi::Version, state->capabilities, state->spirvExtensions, false, {limits.maxComputeWorkGroupSize[0], limits.maxComputeWorkGroupSize[1], limits.maxComputeWorkGroupSize[2]}, limits.maxComputeWorkGroupInvocations, limits.maxComputeSharedMemorySize, {}, {}};
-    target.fragmentShaderBarycentricEnabled = state->fragmentShaderBarycentric;
+    // APS5_NO_BARYCENTRIC_INTERP=1 (experiment): translate v_interp_p1/p2 to fixed-function
+    // interpolation instead of exact per-vertex math (the target takes part in the cache key).
+    target.fragmentShaderBarycentricEnabled = state->fragmentShaderBarycentric && std::getenv("APS5_NO_BARYCENTRIC_INTERP") == nullptr;
     target.nonConstantImageOffsets = state->maintenance8;
     target.narrowSubgroupClock = state->narrowSubgroupClock;
     target.srgbDecodeFormats = state->srgbDecodeFormats;
@@ -2647,6 +2839,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.primitiveListRestart = state->primitiveListRestart;
     context.imageViewMinLod = state->imageViewMinLod;
     context.pipelineExecutableInfo = state->pipelineExecutableInfo;
+    context.pushDescriptors = state->pushDescriptors;
     context.srgbDecodeFormats = state->srgbDecodeFormats;
     return context;
 }
@@ -2935,6 +3128,9 @@ struct RecipeCounters {
         std::atomic<std::uint64_t> dataRefreshed{0}, dataSkipped{0}, refreshByWords{0};
         std::atomic<std::uint64_t> restarts{0}, attaches{0}, verified{0}, verifyReplaced{0};
         std::atomic<std::uint64_t> precheckNs{0}, proofNs{0}, recordNs{0};
+        // Draw rows only: hits of depth recipes and of moved-buffer recipes, and the misses of
+        // DrawWithRecipe's depth proof (also in "targets gone") and moved-buffer recheck.
+        std::atomic<std::uint64_t> depthHits{0}, movedHits{0}, depthGone{0}, movedRefused{0};
     };
     std::array<Kind, 3> kinds;
     std::atomic<std::int64_t> lastReport{0};
@@ -2974,7 +3170,13 @@ void reportRecipes() {
         const auto precheckUs = perHit(counters.precheckNs);
         const auto proofUs = perHit(counters.proofNs);
         const auto recordUs = perHit(counters.recordNs);
-        AgcDriver::ProfilePrint_nid_no_patch("[recipe] %s (10 s): hits %llu; pre-check misses: %s; proofs: %s; rebuilds: %s; presyncs from the recipe %llu (recomputed %llu, waited %llu); data refreshes recorded %llu / skipped by hash %llu (%llu decided by words: data hits); restarts %llu, attaches %llu; us per hit: pre-check %.1f, proof %.1f, record %.1f; verified %llu (object replaced %llu)\n", kind == 0 ? "dispatch" : kind == 1 ? "indirect" : "draw", hits, misses.c_str(), proofs.c_str(), rebuilds.c_str(), take(counters.presyncsFromRecipe), take(counters.presyncsRecomputed), take(counters.presyncWaits), take(counters.dataRefreshed), take(counters.dataSkipped), take(counters.refreshByWords), take(counters.restarts), take(counters.attaches), precheckUs, proofUs, recordUs, take(counters.verified), take(counters.verifyReplaced));
+        std::string depthMoved;
+        if (kind == 2) {
+            char split[160];
+            std::snprintf(split, sizeof(split), " (depth %llu, moved buffers %llu); depth gone %llu, moved refused %llu", take(counters.depthHits), take(counters.movedHits), take(counters.depthGone), take(counters.movedRefused));
+            depthMoved = split;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[recipe] %s (10 s): hits %llu%s; pre-check misses: %s; proofs: %s; rebuilds: %s; presyncs from the recipe %llu (recomputed %llu, waited %llu); data refreshes recorded %llu / skipped by hash %llu (%llu decided by words: data hits); restarts %llu, attaches %llu; us per hit: pre-check %.1f, proof %.1f, record %.1f; verified %llu (object replaced %llu)\n", kind == 0 ? "dispatch" : kind == 1 ? "indirect" : "draw", hits, depthMoved.c_str(), misses.c_str(), proofs.c_str(), rebuilds.c_str(), take(counters.presyncsFromRecipe), take(counters.presyncsRecomputed), take(counters.presyncWaits), take(counters.dataRefreshed), take(counters.dataSkipped), take(counters.refreshByWords), take(counters.restarts), take(counters.attaches), precheckUs, proofUs, recordUs, take(counters.verified), take(counters.verifyReplaced));
     }
 }
 
@@ -3095,7 +3297,32 @@ struct RecordedDispatch {
     // Whether the data refresh recorded anything.
     bool refreshed = false;
     bool resourceKeyMatched = false;
+    // Indirect arguments an earlier recorded dispatch wrote into a copied region (its write-back to
+    // guest memory still pending): the GPU reads them from that buffer, in recorded order, through
+    // a small copy into an indirect buffer, instead of the CPU waiting for the write-back.
+    VkBuffer argumentSource = VK_NULL_HANDLE;
+    VkDeviceSize argumentSourceOffset = 0;
 };
+
+// APS5_NO_GPU_COPIED_ARGS=1: such indirect dispatches read their arguments on the CPU (a drain).
+bool gpuCopiedArguments() {
+    static const bool enabled = std::getenv("APS5_NO_GPU_COPIED_ARGS") == nullptr;
+    return enabled;
+}
+
+// [indirect-copied] every 10 s (APS5_PROFILE_DRAW): indirect dispatches whose arguments sit in a
+// copied buffer, read by the GPU from it or (no buffer found) on the CPU.
+void countCopiedArguments(bool gpu) {
+    static std::atomic<std::uint64_t> onGpu{0}, onCpu{0};
+    static std::atomic<std::int64_t> last{0};
+    (gpu ? onGpu : onCpu).fetch_add(1, std::memory_order_relaxed);
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto previous = last.load(std::memory_order_relaxed);
+    if (now - previous < 10 || !last.compare_exchange_strong(previous, now)) return;
+    std::fprintf(stderr, "[indirect-copied] arguments from copied buffers: %llu read by the GPU, %llu on the CPU\n", static_cast<unsigned long long>(onGpu.exchange(0)), static_cast<unsigned long long>(onCpu.exchange(0)));
+}
 
 VkDevice VulkanDevice::Device() const {
     return state->device;
@@ -3148,12 +3375,21 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
             case Graphics::DrawRecipeMiss::ObjectsGone: counters.precheckMisses[MissObjectsGone].fetch_add(1, std::memory_order_relaxed); break;
             case Graphics::DrawRecipeMiss::TemplateGone: counters.precheckMisses[MissTemplateGone].fetch_add(1, std::memory_order_relaxed); break;
             case Graphics::DrawRecipeMiss::Proof: counters.rebuilds[static_cast<std::size_t>(outcome.proof.failure)].fetch_add(1, std::memory_order_relaxed); break;
+            case Graphics::DrawRecipeMiss::DepthGone:
+                counters.depthGone.fetch_add(1, std::memory_order_relaxed);
+                counters.precheckMisses[MissObjectsGone].fetch_add(1, std::memory_order_relaxed);
+                break;
+            case Graphics::DrawRecipeMiss::MovedRefused: counters.movedRefused.fetch_add(1, std::memory_order_relaxed); break;
             default: break;
         }
         return RecipeOutcome::Rebuild;
     }
     counters.proofPaths[static_cast<std::size_t>(outcome.proof.path)].fetch_add(1, std::memory_order_relaxed);
     counters.hits.fetch_add(1, std::memory_order_relaxed);
+    if (outcome.depth) counters.depthHits.fetch_add(1, std::memory_order_relaxed);
+    if (outcome.moved) counters.movedHits.fetch_add(1, std::memory_order_relaxed);
+    if (outcome.verified) counters.verified.fetch_add(1, std::memory_order_relaxed);
+    if (outcome.replaced) counters.verifyReplaced.fetch_add(1, std::memory_order_relaxed);
     if (profile) {
         counters.proofNs.fetch_add(static_cast<std::uint64_t>(outcome.proofUs * 1000.0), std::memory_order_relaxed);
         counters.recordNs.fetch_add(static_cast<std::uint64_t>(outcome.recordUs * 1000.0), std::memory_order_relaxed);
@@ -3334,9 +3570,32 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
         outcome.cpuReason = 1;
         Graphics::Recorder::CountSync(2);
         recorder.Sync();
-    } else if (labelPending() || std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), [&](const auto& writer) { return writer->WritesOverlap(arguments, 12); })
-               || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), [&](const auto& writer) { return writer->WritesOverlap(arguments, 12); })) {
+    } else if (labelPending() || std::any_of(Graphics::DrawCopiedWriters()->begin(), Graphics::DrawCopiedWriters()->end(), [&](const auto& writer) { return writer->WritesOverlap(arguments, 12); })) {
         outcome.cpuReason = 2;
+    } else if (std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), [&](const auto& writer) { return writer->WritesOverlap(arguments, 12); })) {
+        // The newest dispatch writing the arguments holds them in its copied buffer, or wrote them
+        // in place in the host import (its other writes being the copied ones): the GPU reads them
+        // there, in recorded order.
+        std::optional<std::pair<VkBuffer, VkDeviceSize>> source;
+        bool inPlace = false;
+        if (gpuCopiedArguments()) {
+            for (auto it = state->copiedWriters->rbegin(); it != state->copiedWriters->rend(); ++it) {
+                if (!(*it)->WritesOverlap(arguments, 12)) continue;
+                source = (*it)->CopiedSource(arguments, 12);
+                inPlace = !source.has_value() && (*it)->InPlaceRange(arguments, 12);
+                break;
+            }
+        }
+        if (source.has_value()) {
+            record.argumentSource = source->first;
+            record.argumentSourceOffset = source->second;
+            countCopiedArguments(true);
+        } else if (inPlace && (record.argumentImport = Graphics::HostImportFor(context, arguments, 12)) != nullptr) {
+            countCopiedArguments(true);
+        } else {
+            countCopiedArguments(false);
+            outcome.cpuReason = 2;
+        }
     } else if ((record.argumentImport = Graphics::HostImportFor(context, arguments, 12)) == nullptr) {
         // Valid until the next refreshImports, which only runs under GuestMemory::GpuMutex (held
         // here, by every Dispatch caller) and Keeps a retired VkBuffer while the recorder is busy.
@@ -3455,6 +3714,17 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.EndGpuTiming(timing, 12);
         recorder.NotePendingRead(arguments, 12, Graphics::Recorder::ReadKind::Indirect);
     }
+    std::shared_ptr<Graphics::Buffer> argumentScratch;
+    if (argumentImport == nullptr && record.argumentSource != VK_NULL_HANDLE) {
+        // The producing dispatch's writes reach the copy; the copy reaches the indirect read.
+        argumentScratch = std::make_shared<Graphics::Buffer>(context, 16, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        recorder.Keep(argumentScratch);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const VkBufferCopy region{record.argumentSourceOffset, 0, 12};
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, record.argumentSource, argumentScratch->Handle(), 1, &region);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+        Graphics::Recorder::CountBarriers(CommandClass::IndirectArguments);
+    }
     // Results of earlier recorded work are visible to this dispatch, its own to everything after.
     constexpr VkAccessFlags shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
     if (elided) {
@@ -3475,7 +3745,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::PipelinePushConstantBytes, record.pushBytes->data());
     }
     const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
+    Graphics::GpuCheckpoints::Set(context, commands, argumentImport != nullptr || argumentScratch != nullptr ? "dispatch indirect (program, variant, groups)" : "dispatch (program, variant, groups)", record.programAddress, record.shader->program->variantId, (static_cast<std::uint64_t>(record.x) << 40) | (static_cast<std::uint64_t>(record.y) << 20) | record.z);
     if (argumentImport != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentImport->buffer, arguments - argumentImport->base);
+    else if (argumentScratch != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect")(commands, argumentScratch->Handle(), 0);
     else context.Resolved(&Graphics::DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, record.x, record.y, record.z);
     recorder.EndGpuTiming(gpuTiming);
     if (elided) {

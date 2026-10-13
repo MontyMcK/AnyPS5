@@ -1,7 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuCheckpoints.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/NvPerfRanges.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -44,52 +46,95 @@ PerformanceControls& LivePerformanceControls() {
     return controls;
 }
 
-bool LiveFlag(std::string_view name, bool fallback) {
-    static const char* path = std::getenv("APS5_LIVE_FLAGS");
-    if (path == nullptr) return fallback;
-    struct Flags {
-        std::mutex mutex;
-        std::atomic<std::int64_t> nextPoll{0};
-        std::atomic<std::uint32_t> count{0};
-        std::array<std::array<char, 32>, 32> names{};
-        std::array<std::atomic<int>, 32> values{};
-    };
-    static Flags flags;
-    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
-    if (now >= flags.nextPoll.load(std::memory_order_relaxed)) {
-        std::unique_lock lock(flags.mutex, std::try_to_lock);
-        if (lock.owns_lock() && now >= flags.nextPoll.load(std::memory_order_relaxed)) {
-            flags.nextPoll.store(now + 1'000'000'000ll, std::memory_order_relaxed);
-            std::ifstream input(path, std::ios::binary);
-            std::string line;
-            while (input && std::getline(input, line)) {
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                const auto split = line.find('=');
-                if (split == std::string::npos || split == 0 || split >= 31) continue;
-                const auto key = std::string_view(line).substr(0, split);
-                const int value = line.substr(split + 1) == "1" ? 1 : line.substr(split + 1) == "0" ? 0 : -1;
-                auto count = flags.count.load(std::memory_order_relaxed);
-                std::uint32_t slot = 0;
-                while (slot < count && std::string_view(flags.names[slot].data()) != key) ++slot;
-                if (slot == count) {
-                    if (count == flags.names.size()) continue;
-                    std::memcpy(flags.names[slot].data(), key.data(), key.size());
-                    flags.values[slot].store(-1, std::memory_order_relaxed);
-                    flags.count.store(count + 1, std::memory_order_release);
-                }
-                if (flags.values[slot].exchange(value, std::memory_order_relaxed) != value) {
-                    std::fprintf(stderr, "[live] %s=%d at %lld ms\n", flags.names[slot].data(), value, static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()));
-                }
+namespace {
+
+// The live-flag file is re-read once a second by its own thread; a lookup is a per-thread cache hit
+// on the caller's name (a literal, so its address is the key) and one relaxed load. Hot paths ask
+// several flags per draw, which a clock read and a scan of every name made cost microseconds.
+struct LiveFlags {
+    static constexpr std::size_t Capacity = 64;
+    std::atomic<std::uint32_t> count{0};
+    std::array<std::array<char, 32>, Capacity> names{};
+    std::array<std::atomic<int>, Capacity> values{};
+
+    explicit LiveFlags(const char* path) {
+        poll(path);
+        std::thread([this, path] {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+                poll(path);
+            }
+        }).detach();
+    }
+
+    int slotOf(std::string_view name) const {
+        const auto known = count.load(std::memory_order_acquire);
+        for (std::uint32_t slot = 0; slot < known; ++slot) {
+            if (std::string_view(names[slot].data()) == name) return static_cast<int>(slot);
+        }
+        return -1;
+    }
+
+    void poll(const char* path) {
+        std::ifstream input(path, std::ios::binary);
+        std::string line;
+        while (input && std::getline(input, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            const auto split = line.find('=');
+            if (split == std::string::npos || split == 0 || split >= 31) continue;
+            const auto key = std::string_view(line).substr(0, split);
+            const int value = line.substr(split + 1) == "1" ? 1 : line.substr(split + 1) == "0" ? 0 : -1;
+            auto slot = slotOf(key);
+            if (slot < 0) {
+                const auto known = count.load(std::memory_order_relaxed);
+                if (known == Capacity) continue;
+                slot = static_cast<int>(known);
+                std::memcpy(names[known].data(), key.data(), key.size());
+                values[known].store(-1, std::memory_order_relaxed);
+                count.store(known + 1, std::memory_order_release);
+            }
+            if (values[slot].exchange(value, std::memory_order_relaxed) != value) {
+                std::fprintf(stderr, "[live] %s=%d at %lld ms\n", names[slot].data(), value, static_cast<long long>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch()).count()));
             }
         }
     }
-    const auto count = flags.count.load(std::memory_order_acquire);
-    for (std::uint32_t slot = 0; slot < count; ++slot) {
-        if (std::string_view(flags.names[slot].data()) != name) continue;
-        const auto value = flags.values[slot].load(std::memory_order_relaxed);
+};
+
+}
+
+bool LiveFlag(std::string_view name, bool fallback) {
+    static const char* path = std::getenv("APS5_LIVE_FLAGS");
+    if (path == nullptr) return fallback;
+    static LiveFlags flags(path);
+    struct Cached {
+        const char* key = nullptr;
+        std::size_t size = 0;
+        std::uint32_t known = 0;
+        int slot = -1;
+    };
+    thread_local std::array<Cached, 48> cache{};
+    const auto known = flags.count.load(std::memory_order_acquire);
+    for (auto& entry : cache) {
+        if (entry.key == name.data() && entry.size == name.size()) {
+            // A name absent from the file is looked up again only when the file adds names.
+            if (entry.slot < 0 && entry.known != known) {
+                entry.slot = flags.slotOf(name);
+                entry.known = known;
+            }
+            if (entry.slot < 0) return fallback;
+            const auto value = flags.values[static_cast<std::size_t>(entry.slot)].load(std::memory_order_relaxed);
+            return value < 0 ? fallback : value != 0;
+        }
+        if (entry.key != nullptr) continue;
+        entry = {name.data(), name.size(), known, flags.slotOf(name)};
+        if (entry.slot < 0) return fallback;
+        const auto value = flags.values[static_cast<std::size_t>(entry.slot)].load(std::memory_order_relaxed);
         return value < 0 ? fallback : value != 0;
     }
-    return fallback;
+    const auto slot = flags.slotOf(name);
+    if (slot < 0) return fallback;
+    const auto value = flags.values[static_cast<std::size_t>(slot)].load(std::memory_order_relaxed);
+    return value < 0 ? fallback : value != 0;
 }
 
 bool ForkStatsEnabled() {
@@ -170,6 +215,14 @@ bool VerifyForks() {
         return value != nullptr && std::strcmp(value, "0") != 0;
     }();
     return enabled;
+}
+
+bool ReplayProbeEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_REPLAY_PROBE");
+        return value != nullptr && std::strcmp(value, "0") != 0;
+    }();
+    return LiveFlag("replay_probe", enabled);
 }
 
 namespace {
@@ -260,6 +313,7 @@ bool ForkQuiescing() {
 }
 
 void ForkQuiesce(const char* reason) {
+    GuestMemory::NoteProbeEvent(reason);
     if (activeQuiesce != nullptr) (*activeQuiesce)(reason);
 }
 
@@ -1843,8 +1897,13 @@ void Recorder::endOpenRenderPass() {
     // host sees them at the batch's fence).
     VkAccessFlags covered = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     if (MergeDrawBarriers() && !pass.afterPass) covered |= DrawBarrierAccess;
-    if (open->skipMask != 0) recordFullBarrier();
+    DebugLabelBegin(context, open->commands, "rp-end-barrier");
+    // With draw barriers skipped and the tracker holding the pass's accesses, the pass's end owes
+    // a barrier only to what conflicts with them (live `lease_reads`): the tracker records it then.
+    if (open->skipMask != 0 && (open->skipMask & ClassBit(CommandClass::Draw)) != 0 && !pass.afterPass && !open->tracker.unknown && LiveFlag("lease_reads", false)) open->tracker.pending = true;
+    else if (open->skipMask != 0) recordFullBarrier();
     else recordBarrier(open->commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, covered);
+    DebugLabelEnd(context, open->commands);
     CountBarriers(CommandClass::Draw);
     if (pass.afterPass) {
         pass.afterPass(open->commands);
@@ -2315,6 +2374,7 @@ void Recorder::recordFullBarrier() {
     tracker.writes.clear();
     tracker.images.clear();
     tracker.unknown = false;
+    tracker.readsAnyMemory = false;
     tracker.pending = false;
     tracker.classes = 0;
 }
@@ -2342,6 +2402,7 @@ bool Recorder::NoteAccess(CommandClass which, const Access& access) {
     std::size_t kind = HazardKinds;
     if (access.conservative || (skipping && (tracker.unknown || access.ordered))) kind = 4;
     if (enforced && which == CommandClass::LabelRun && (tracker.classes & ~ClassBit(which)) != 0) kind = 4;
+    if (kind == HazardKinds && access.readsAnyMemory && !tracker.writes.empty()) kind = 0;
     for (const auto& range : access.reads) {
         if (kind != HazardKinds) break;
         if (overlapsAny(tracker.writes, range)) kind = 0;
@@ -2349,7 +2410,7 @@ bool Recorder::NoteAccess(CommandClass which, const Access& access) {
     for (const auto& range : access.writes) {
         if (kind != HazardKinds) break;
         if (overlapsAny(tracker.writes, range)) kind = 1;
-        else if (overlapsAny(tracker.reads, range)) kind = 2;
+        else if (tracker.readsAnyMemory || overlapsAny(tracker.reads, range)) kind = 2;
     }
     for (const auto& [image, written] : access.images) {
         if (kind != HazardKinds) break;
@@ -2380,6 +2441,7 @@ bool Recorder::NoteAccess(CommandClass which, const Access& access) {
             for (const auto& [begin, end] : access.reads) tracker.reads.push_back({begin, end, access.stages});
             for (const auto& [begin, end] : access.writes) tracker.writes.push_back({begin, end, access.stages});
             for (const auto& [image, written] : access.images) tracker.images.push_back({image, written, access.stages});
+            tracker.readsAnyMemory = tracker.readsAnyMemory || access.readsAnyMemory;
             tracker.classes |= ClassBit(which);
         }
         if (tracker.reads.size() + tracker.writes.size() + tracker.images.size() > 4096) {
@@ -2430,10 +2492,82 @@ void Recorder::AddGpuTiming(CommandClass which, double nanoseconds, std::uint64_
     timingClassMs += nanoseconds / 1e6;
 }
 
+namespace {
+
+// APS5_DEBUG_LABELS=1: every GPU timing range (command classes, and draw passes by key) is also a
+// VK_EXT_debug_utils label, so a GPU Trace attributes its metrics per range. Without the recorder
+// thread only: the label calls are not streamed.
+// APS5_DEBUG_LABELS=2: no draw-pass ranges; flat labels around single commands instead (a GPU
+// Trace exports top-level labels only).
+int DebugLabelLevel() {
+    static const int level = [] {
+        const char* value = std::getenv("APS5_DEBUG_LABELS");
+        return value == nullptr ? 0 : value[0] == '2' ? 2 : 1;
+    }();
+    return level;
+}
+
+bool DebugLabels() {
+    return DebugLabelLevel() != 0;
+}
+
+constexpr std::uint32_t LabelBit = 0x40000000u;
+constexpr std::uint32_t LabelOnly = 0x3fffffffu;
+
+}
+
+void Recorder::DebugLabelBegin(const Context& context, VkCommandBuffer commands, const char* name) {
+    if (DebugLabelLevel() != 2) return;
+    static const auto begin = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(context.deviceProc(context.device, "vkCmdBeginDebugUtilsLabelEXT"));
+    if (begin == nullptr) return;
+    VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+    label.pLabelName = name;
+    begin(commands, &label);
+}
+
+bool Recorder::FlatDebugLabels() {
+    return DebugLabelLevel() == 2;
+}
+
+void Recorder::DebugLabelEnd(const Context& context, VkCommandBuffer commands) {
+    if (DebugLabelLevel() != 2) return;
+    static const auto end = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(context.deviceProc(context.device, "vkCmdEndDebugUtilsLabelEXT"));
+    if (end != nullptr) end(commands);
+}
+
+// A range of the in-app profiler (APS5_NVPERF) in place of timing and labels.
+constexpr std::uint32_t NvPerfRange = 0x7ffffffeu;
+
 std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
-    if (!GpuTimingEnabled()) return NoTiming;
+    if (GpuCheckpoints::Active().load(std::memory_order_relaxed) && key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) {
+        OpenBatch();
+        GpuCheckpoints::Set(context, open->commands, CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)], key, 0, 0);
+    }
+    if (NvPerf::Ranging()) {
+        if (key == BatchTimingKey) return NoTiming;
+        OpenBatch();
+        char name[64];
+        if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) std::snprintf(name, sizeof(name), "%s", CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)]);
+        else if ((key & 0x100u) != 0) std::snprintf(name, sizeof(name), "pass %ux%u", static_cast<unsigned>(key >> 48u), static_cast<unsigned>((key >> 32u) & 0xffffu));
+        else std::snprintf(name, sizeof(name), "key %llx", static_cast<unsigned long long>(key));
+        NvPerf::PushRange(open->commands, name);
+        return NvPerfRange;
+    }
+    if (!GpuTimingEnabled() && !DebugLabels()) return NoTiming;
     OpenBatch();
-    return beginTiming(key);
+    const auto index = GpuTimingEnabled() ? beginTiming(key) : NoTiming;
+    if (!DebugLabels()) return index;
+    const bool drawRange = !(key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) || key == ClassKey(CommandClass::Draw);
+    if (DebugLabelLevel() == 2 && drawRange) return index;
+    static const auto begin = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(context.deviceProc(context.device, "vkCmdBeginDebugUtilsLabelEXT"));
+    if (begin == nullptr) return index;
+    char name[64];
+    if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) std::snprintf(name, sizeof(name), "%s", CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)]);
+    else std::snprintf(name, sizeof(name), "pass %llx", static_cast<unsigned long long>(key));
+    VkDebugUtilsLabelEXT label{VK_STRUCTURE_TYPE_DEBUG_UTILS_LABEL_EXT};
+    label.pLabelName = name;
+    begin(open->commands, &label);
+    return (index == NoTiming ? LabelOnly : index) | LabelBit;
 }
 
 std::uint32_t Recorder::beginTiming(std::uint64_t key) {
@@ -2471,6 +2605,16 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
 
 void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
     ForkTrap("gpu timing");
+    if (index == NvPerfRange) {
+        if (open != nullptr) NvPerf::PopRange(open->commands);
+        return;
+    }
+    if (index != NoTiming && (index & LabelBit) != 0) {
+        index &= ~LabelBit;
+        if (index == LabelOnly) index = NoTiming;
+        static const auto end = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(context.deviceProc(context.device, "vkCmdEndDebugUtilsLabelEXT"));
+        if (end != nullptr && open != nullptr) end(open->commands);
+    }
     if (index == NoTiming || open == nullptr || open->queries == VK_NULL_HANDLE) return;
     if (index < open->timedBytes.size()) open->timedBytes[index] += bytes;
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(open->commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2 + 1);
@@ -2604,6 +2748,7 @@ bool Recorder::DumpSamples(VkDeviceAddress target) {
 
 bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress record, VkDeviceAddress arguments, std::span<const std::uint32_t, 7> rules) {
     ForkTrap("mesh arguments");
+    GuestMemory::NoteProbeEvent("mesh arguments");
     constexpr std::uint32_t PushBytes = 48;
     if (meshArgumentState == 0) {
         meshArgumentState = -1;
@@ -2721,6 +2866,33 @@ void Recorder::readGpuTiming(Batch& batch) {
         totals.bytes += batch.timedBytes[i];
         (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count) ? timingClassMs : timingProgramMs) += ns / 1e6;
         intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
+    }
+    // APS5_GPU_TIMELINE=<start s>,<seconds>: every timed range of the window as "<begin ns> <end ns>
+    // <key> <name>" in gpu-timeline.txt (the game directory), to see which work a frame ends on.
+    {
+        static const auto window = []() -> std::pair<std::int64_t, std::int64_t> {
+            const char* text = std::getenv("APS5_GPU_TIMELINE");
+            if (text == nullptr) return {0, 0};
+            double start = 0, seconds = 2;
+            std::sscanf(text, "%lf,%lf", &start, &seconds);
+            const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+            return {now + static_cast<std::int64_t>(start * 1e9), now + static_cast<std::int64_t>((start + seconds) * 1e9)};
+        }();
+        static std::FILE* timeline = nullptr;
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        if (window.second != 0 && now >= window.first && now < window.second) {
+            if (timeline == nullptr) timeline = std::fopen("gpu-timeline.txt", "w");
+            if (timeline != nullptr) {
+                for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
+                    const auto key = batch.timedKeys[i];
+                    const bool isClass = key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count);
+                    std::fprintf(timeline, "%.0f %.0f %llx %s %llu\n", static_cast<double>(stamps[i * 2]) * period, static_cast<double>(stamps[i * 2 + 1]) * period, static_cast<unsigned long long>(key), i == batch.batchTiming ? "batch" : isClass ? CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)] : "program", static_cast<unsigned long long>(i < batch.timedBytes.size() ? batch.timedBytes[i] : 0));
+                }
+            }
+        } else if (timeline != nullptr && now >= window.second) {
+            std::fclose(timeline);
+            timeline = nullptr;
+        }
     }
     std::sort(intervals.begin(), intervals.end());
     std::uint64_t coveredTicks = 0, unionEnd = 0;
@@ -2924,6 +3096,7 @@ Recorder::SnapshotSlice Recorder::AllocateDrawSnapshot(std::size_t bytes) {
         auto& slot = forkArenas[log->slot % forkArenas.size()];
         return allocateSnapshot(slot.arena, slot.cursor, bytes);
     }
+    GuestMemory::NoteProbeEvent("snapshot ring");
     return allocateSnapshot(snapshotArena, snapshotArenaCursor, bytes);
 }
 
@@ -2954,6 +3127,7 @@ void Recorder::OnComplete(std::function<void()> action) {
         return;
     }
     if (auto* witness = ForkWitnessed()) witness->Note(ForkLog::Effect::Complete, 0, 0);
+    GuestMemory::NoteProbeEvent("on complete");
     ensureOpen();
     open->completions.push_back(std::move(action));
     ++open->writeBackCompletionCount;
@@ -3586,6 +3760,14 @@ void Recorder::Submit() {
     if (activeRecorder == this) pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
 }
 
+bool Recorder::SubmitIfStarved(std::uint64_t minWork) {
+    if (open == nullptr || workSinceSubmit.load(std::memory_order_relaxed) < minWork) return false;
+    // A batch whose submit is still queued for the recorder thread reads as unsignaled: busy.
+    if (!inFlight.empty() && fenceStatus(inFlight.back()->fence) != VK_SUCCESS) return false;
+    Submit();
+    return true;
+}
+
 std::uint64_t Recorder::SubmitAndEpoch() {
     Submit();
     return inFlight.empty() ? 0 : submissions;
@@ -4180,6 +4362,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
             InCompletion() { ++completionDepth; }
             ~InCompletion() { --completionDepth; }
         } inCompletion;
+        if (!batch->completions.empty()) GuestMemory::NoteProbeEvent("completions run");
         for (auto& action : batch->completions) {
             try {
                 action();

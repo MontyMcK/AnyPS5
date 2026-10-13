@@ -232,6 +232,21 @@ std::uint32_t MaterialScanLimit() {
     return limit;
 }
 
+// Bound slots per table: the configured count, fewer when every table of the shader would not
+// otherwise fit in ShaderInfo::MaxImages (the static interface and the snapshot agree on it).
+std::uint32_t tableSlotCount(std::size_t directCount, std::size_t tableCount) {
+    const auto slots = ResourceMaterializer::BindlessSlots();
+    if (tableCount == 0u) return slots;
+    if (directCount >= ShaderInfo::MaxImages) return 1u;
+    return static_cast<std::uint32_t>(std::clamp<std::size_t>((ShaderInfo::MaxImages - directCount) / tableCount + 1u, 1u, slots));
+}
+
+// Keys the shader's key-to-slot search can hold. An enumerated table (see
+// resolveEnumeratedTable) may map many keys to one bound descriptor.
+std::uint32_t tableKeyCount(const DescriptorSource::IndirectImage& table, std::uint32_t slots) {
+    return table.enumerated ? std::max(slots, RuntimeAbi::EnumeratedTableKeys) : slots;
+}
+
 bool BindlessTraced() {
     static const bool traced = std::getenv("APS5_TRACE_BINDLESS") != nullptr;
     return traced;
@@ -310,11 +325,10 @@ void traceTable(const IrResourcePlan& plan, const ImageResource& image, const De
     std::fprintf(stderr, "[bindless] table at pc 0x%x of shader %llx: heap V# base 0x%llx entries %u, material V# base 0x%llx entries %u stride 0x%x offset 0x%x, mode %c, %u keys\n", image.firstUsePc, static_cast<unsigned long long>(plan.shaderHash), static_cast<unsigned long long>(heapBase), trace.entries, static_cast<unsigned long long>(materialBase), trace.materialEntries, table.selectorStride, table.selectorOffset, trace.material ? 'M' : 'T', trace.keys);
 }
 
-void resolveChainImage(const IrResourcePlan& plan, std::uint32_t imageIndex, const DescriptorSource::IndirectImage& table, const SrtRuntime& runtime, SrtWalker& walker, DescriptorValue& resolved, TableResolution& resolution) {
+void resolveChainImage(const IrResourcePlan& plan, std::uint32_t imageIndex, const DescriptorSource::IndirectImage& table, const SrtRuntime& runtime, SrtWalker& walker, DescriptorValue& resolved, TableResolution& resolution, std::uint32_t slots) {
     const auto& image = plan.info.images.at(imageIndex);
     if (image.resourceClass != ImageResourceClass::Sampled) rejectTable(BindlessRejection::Storage, "bindless storage image chains are unsupported");
     if (image.packed) throw std::runtime_error("bindless packed image chains are unsupported");
-    const auto slots = ResourceMaterializer::BindlessSlots();
     DescriptorValue recordValue;
     walker.EvaluateDescriptorSource(plan, table.materialSource, runtime, recordValue);
     const ShaderBufferResource records = decodeBufferDescriptor(recordValue);
@@ -366,11 +380,128 @@ void resolveChainImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     bindlessCounters().keys.fetch_add(resolution.mapping.size(), std::memory_order_relaxed);
 }
 
+// An enumerated table: every key the key's known bits and the table size allow (at most
+// MaterialScanLimit) is read. Through a 64-bit pointer, entry `key` starts at
+// `pointer + u32(entryOffset + key * entryStride) + sext(immediate)` and the table has no size;
+// through a V# it starts at `base + entryOffset + key * entryStride` within the buffer. An entry
+// that is unreadable, null, not a valid T# or incompatible with the access stays unmapped
+// (samples zeros, stores are dropped). Distinct descriptors take the bound slots; several keys
+// may share one.
+// The readable, non-null entries of an enumerated table, read once per descriptor source and
+// dispatch: several image resources (a query and a sample of one T#) often share a table.
+struct EnumeratedEntries {
+    std::uint64_t base = 0;
+    std::int64_t immediate = 0;
+    std::uint64_t keys = 0;
+    std::uint32_t unreadable = 0;
+    std::uint32_t nulls = 0;
+    std::vector<std::pair<std::uint32_t, DescriptorValue>> entries;
+};
+
+EnumeratedEntries readEnumeratedTable(const IrResourcePlan& plan, const DescriptorSource::IndirectImage& table, const SrtRuntime& runtime, SrtWalker& walker) {
+    EnumeratedEntries read;
+    DescriptorValue pointer;
+    walker.EvaluateDescriptorSource(plan, table.heapSource, runtime, pointer);
+    auto& base = read.base;
+    auto& immediate = read.immediate;
+    auto& keyLimit = read.keys;
+    keyLimit = std::min<std::uint64_t>(static_cast<std::uint64_t>(table.maxKey) + 1u, MaterialScanLimit());
+    if (table.address) {
+        base = (static_cast<std::uint64_t>(pointer.dwords[1]) << 32u) | pointer.dwords[0];
+        immediate = static_cast<std::int32_t>(table.selectorOffset);
+    } else {
+        const ShaderBufferResource heap = decodeBufferDescriptor(pointer);
+        if (heap.Type() != 0u || table.entryStride == 0u) throw std::runtime_error("bindless heap buffer is invalid");
+        base = heap.Base48();
+        const std::uint64_t size = heap.GetSize();
+        const std::uint64_t entries = size >= static_cast<std::uint64_t>(table.entryOffset) + TableEntryBytes ? (size - table.entryOffset - TableEntryBytes) / table.entryStride + 1u : 0u;
+        keyLimit = std::min(keyLimit, entries);
+    }
+    for (std::uint32_t key = 0; key < keyLimit; ++key) {
+        const std::uint64_t offset = table.address ? static_cast<std::uint64_t>(static_cast<std::uint32_t>(table.entryOffset + key * table.entryStride)) : table.entryOffset + static_cast<std::uint64_t>(key) * table.entryStride;
+        const std::uint64_t address = base + offset + static_cast<std::uint64_t>(immediate);
+        DescriptorValue candidate;
+        candidate.dwordCount = 8u;
+        bool readable = (address & 3u) == 0u;
+        for (std::uint32_t dword = 0; readable && dword < 8u; ++dword) {
+            readable = runtime.readMemory(runtime.userContext, address + dword * sizeof(std::uint32_t), &candidate.dwords[dword]);
+        }
+        if (!readable) {
+            ++read.unreadable;
+            continue;
+        }
+        if (nullImageDescriptor(candidate)) {
+            ++read.nulls;
+            continue;
+        }
+        read.entries.emplace_back(key, candidate);
+    }
+    return read;
+}
+
+void resolveEnumeratedTable(const IrResourcePlan& plan, std::uint32_t imageIndex, const DescriptorSource::IndirectImage& table, const SrtRuntime& runtime, SrtWalker& walker, DescriptorValue& resolved, TableResolution& resolution, std::uint32_t slots, std::map<std::uint32_t, EnumeratedEntries>& reads) {
+    const auto& image = plan.info.images.at(imageIndex);
+    if (runtime.readMemory == nullptr) throw std::runtime_error("bindless image table resolution requires runtime memory access");
+    if (image.packed) throw std::runtime_error("bindless packed image tables are unsupported");
+    const bool storage = image.resourceClass == ImageResourceClass::Storage;
+    if (storage && image.atomic) rejectTable(BindlessRejection::Storage, "bindless storage image tables with atomics are unsupported");
+    auto found = reads.find(image.source);
+    if (found == reads.end()) found = reads.emplace(image.source, readEnumeratedTable(plan, table, runtime, walker)).first;
+    const auto& read = found->second;
+    const auto keyCapacity = tableKeyCount(table, slots);
+    auto& counters = bindlessCounters();
+    std::vector<DescriptorValue> distinct;
+    resolution.mapping.clear();
+    std::uint32_t invalid = read.unreadable;
+    const std::uint32_t nulls = read.nulls;
+    std::uint32_t incompatible = 0;
+    for (const auto& [key, candidate] : read.entries) {
+        if (!validImageDescriptor(candidate, image.r128)) {
+            ++invalid;
+            continue;
+        }
+        try {
+            if (decodeImageDescriptor(candidate, image, plan.srgbDecodeFormats).fmask) throw std::runtime_error("fmask");
+            static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, candidate, plan.info.runtimeImageModes.at(imageIndex)));
+        } catch (const std::exception&) {
+            ++incompatible;
+            continue;
+        }
+        auto slot = std::find_if(distinct.begin(), distinct.end(), [&](const DescriptorValue& value) { return std::equal(value.dwords.begin(), value.dwords.begin() + 8, candidate.dwords.begin()); });
+        if (slot == distinct.end()) {
+            if (distinct.size() == slots) rejectTable(BindlessRejection::Capacity, "bindless image table at pc " + std::to_string(image.firstUsePc) + ": more than " + std::to_string(slots) + " distinct descriptors");
+            distinct.push_back(candidate);
+            slot = std::prev(distinct.end());
+        }
+        if (resolution.mapping.size() == keyCapacity) rejectTable(BindlessRejection::Capacity, "bindless image table at pc " + std::to_string(image.firstUsePc) + ": more than " + std::to_string(keyCapacity) + " keys");
+        resolution.mapping.emplace_back(key, static_cast<std::uint32_t>(slot - distinct.begin()));
+    }
+    if (BindlessTraced()) {
+        std::fprintf(stderr, "[bindless] enumerated %s table at pc 0x%x of shader %llx: base 0x%llx stride %u addend 0x%x immediate %lld, %llu keys read, %zu mapped, %zu distinct, %u null, %u invalid, %u incompatible\n", table.address ? "address" : "buffer", image.firstUsePc, static_cast<unsigned long long>(plan.shaderHash), static_cast<unsigned long long>(read.base), table.entryStride, table.entryOffset, static_cast<long long>(read.immediate), static_cast<unsigned long long>(read.keys), resolution.mapping.size(), distinct.size(), nulls, invalid, incompatible);
+    }
+    DescriptorValue nullDescriptor;
+    nullDescriptor.dwordCount = 8u;
+    resolution.slots = std::move(distinct);
+    resolution.slots.resize(slots, nullDescriptor);
+    resolved = resolution.slots[0];
+    counters.tablesWhole.fetch_add(1, std::memory_order_relaxed);
+    counters.keys.fetch_add(resolution.mapping.size(), std::memory_order_relaxed);
+    counters.paddedNull.fetch_add(nulls + invalid, std::memory_order_relaxed);
+    counters.paddedShape.fetch_add(incompatible, std::memory_order_relaxed);
+}
+
 // The slots of the table image `imageIndex` (see TableResolution). Mode M enumerates the keys the
 // dispatch can reach from the material records; mode T binds the whole table when it fits.
-void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, const DescriptorSource::IndirectImage& table, const SrtRuntime& runtime, SrtWalker& walker, DescriptorValue& resolved, TableResolution& resolution) {
+void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, const DescriptorSource::IndirectImage& table, const SrtRuntime& runtime, SrtWalker& walker, DescriptorValue& resolved, TableResolution& resolution, std::uint32_t slots, std::map<std::uint32_t, EnumeratedEntries>& reads) {
     if (table.chain) {
-        resolveChainImage(plan, imageIndex, table, runtime, walker, resolved, resolution);
+        resolveChainImage(plan, imageIndex, table, runtime, walker, resolved, resolution, slots);
+        return;
+    }
+    if (table.enumerated) {
+        // APS5_NO_ENUMERATED_TABLES=1: refuse enumerated tables (the shader is not run), as before.
+        static const bool disabled = std::getenv("APS5_NO_ENUMERATED_TABLES") != nullptr;
+        if (disabled) throw std::runtime_error("enumerated bindless tables are disabled (APS5_NO_ENUMERATED_TABLES)");
+        resolveEnumeratedTable(plan, imageIndex, table, runtime, walker, resolved, resolution, slots, reads);
         return;
     }
     const auto& image = plan.info.images.at(imageIndex);
@@ -383,7 +514,6 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     if (image.packed) {
         throw std::runtime_error("bindless packed image tables are unsupported");
     }
-    const auto slots = ResourceMaterializer::BindlessSlots();
     DescriptorValue heapValue;
     walker.EvaluateDescriptorSource(plan, table.heapSource, runtime, heapValue);
     const ShaderBufferResource heap = decodeBufferDescriptor(heapValue);
@@ -521,10 +651,11 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         }
         if (plan.descriptorSources[image.source].indirectImage.has_value()) tableCount++;
     }
-    const auto tableSlots = ResourceMaterializer::BindlessSlots();
+    const auto tableSlots = tableSlotCount(plan.info.images.size(), tableCount);
     if (tableCount != 0u && plan.info.images.size() + static_cast<std::size_t>(tableSlots - 1u) * tableCount > ShaderInfo::MaxImages) {
         rejectTable(BindlessRejection::ImageSlots, "bindless image tables need " + std::to_string(plan.info.images.size() + static_cast<std::size_t>(tableSlots - 1u) * tableCount) + " image slots, limit " + std::to_string(ShaderInfo::MaxImages));
     }
+    std::map<std::uint32_t, EnumeratedEntries> enumeratedReads;
     for (std::uint32_t i = 0; i < plan.info.images.size(); i++) {
         const auto& image = plan.info.images[i];
         const auto& source = plan.descriptorSources[image.source];
@@ -534,7 +665,7 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
                 tables[i].slots.assign(tableSlots, snapshot.images[i]);
                 continue;
             }
-            resolveTableImage(plan, i, *source.indirectImage, runtime, walker, snapshot.images[i], tables[i]);
+            resolveTableImage(plan, i, *source.indirectImage, runtime, walker, snapshot.images[i], tables[i], tableSlots, enumeratedReads);
             continue;
         }
         if (cursor >= values.size()) {
@@ -546,7 +677,16 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
             throw std::runtime_error("image descriptor has an invalid width");
         }
         if (!validImageDescriptor(descriptor, image.r128) && !nullImageDescriptor(descriptor)) {
-            throw std::runtime_error("runtime image descriptor is invalid");
+            // Words whose TYPE is not an image type, or whose FORMAT is INVALID, name no image. They
+            // fill the SRT slots of image instructions behind a uniform branch the draw does not take
+            // (a full-screen pass skips its two 1D lookups when an SRT flag is 0 and leaves other data
+            // in their slots). Bind the null descriptor (it reads zeros), as table entries that are not
+            // a T# are; a T# with an image type and a format that fails the other checks still throws.
+            if (rawImageType(descriptor) >= ImageType::Color1D && rawImageFormat(descriptor) != IrBufferFormat::Invalid) {
+                throw std::runtime_error("runtime image descriptor is invalid");
+            }
+            descriptor = DescriptorValue{};
+            descriptor.dwordCount = 8u;
         }
         snapshot.images[i] = descriptor;
     }
@@ -581,6 +721,20 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
             break;
         }
         snapshot.samplers.push_back(chosen);
+    }
+    // A sampler that only samples direct null images never filters a texel. Its words can be other
+    // data for the same reason as those images' (see above), so it binds as the zero sampler.
+    for (std::uint32_t r = 0; r < snapshot.samplers.size(); ++r) {
+        bool paired = false;
+        bool live = false;
+        for (const auto& pair : plan.info.sampledPairs) {
+            if (pair.sampler != r) continue;
+            paired = true;
+            live = live || plan.descriptorSources.at(plan.info.images.at(pair.image).source).indirectImage.has_value() || !nullImageDescriptor(snapshot.images.at(pair.image));
+        }
+        if (!paired || live) continue;
+        snapshot.samplers[r] = DescriptorValue{};
+        snapshot.samplers[r].dwordCount = 4u;
     }
 }
 
@@ -689,6 +843,11 @@ void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, c
         if (plan.stage != IrShaderStage::Compute && decoded.AddTid()) throw std::runtime_error("buffer ADD_TID is only valid for compute shaders");
     }
     if (snapshot.flattenedSrt.size() != plan.srtReads.size()) throw std::runtime_error("runtime SRT size differs from the static interface");
+    std::size_t tableCount = 0u;
+    for (const auto& image : plan.info.images) {
+        if (plan.descriptorSources.at(image.source).indirectImage.has_value()) tableCount++;
+    }
+    const auto slots = tableSlotCount(plan.info.images.size(), tableCount);
     for (std::uint32_t i = 0u; i < plan.info.images.size(); ++i) {
         const auto& image = plan.info.images[i];
         static_cast<void>(ResourceMaterializer::RuntimeImageMode(image, snapshot.images.at(i), plan.info.runtimeImageModes.at(i)));
@@ -697,8 +856,9 @@ void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, c
             if (!table.slots.empty()) throw std::runtime_error("direct image has runtime table slots");
             continue;
         }
-        const auto slots = ResourceMaterializer::BindlessSlots();
+        const auto keys = tableKeyCount(*plan.descriptorSources.at(image.source).indirectImage, slots);
         if (table.slots.size() != slots) throw std::runtime_error("runtime table size differs from the static interface");
+        if (table.mapping.size() > keys) throw std::runtime_error("runtime table maps more keys than its static capacity");
         const auto mappingOffset = snapshot.flattenedSrt.size();
         snapshot.flattenedSrt.push_back(static_cast<std::uint32_t>(table.mapping.size()));
         for (const auto& [key, slot] : table.mapping) {
@@ -706,7 +866,7 @@ void materializeTables(const IrResourcePlan& plan, ResourceSnapshot& snapshot, c
             snapshot.flattenedSrt.push_back(key);
             snapshot.flattenedSrt.push_back(slot == 0u ? i : static_cast<std::uint32_t>(snapshot.images.size()) + slot - 1u);
         }
-        snapshot.flattenedSrt.resize(mappingOffset + 1u + 2u * slots, 0u);
+        snapshot.flattenedSrt.resize(mappingOffset + 1u + 2u * keys, 0u);
         snapshot.images.insert(snapshot.images.end(), table.slots.begin() + 1u, table.slots.end());
     }
 }
@@ -937,7 +1097,8 @@ void ResourceMaterializer::ApplyStaticInterface(IrProgram& program, bool nativeS
     }
     const auto directCount = static_cast<std::uint32_t>(images.size());
     auto mappingOffset = static_cast<std::uint32_t>(resources.srtReads.size());
-    const auto slots = BindlessSlots();
+    const auto tableCount = static_cast<std::size_t>(std::ranges::count_if(images, [&](const ImageResource& image) { return resources.descriptorSources.at(image.source).indirectImage.has_value(); }));
+    const auto slots = tableSlotCount(images.size(), tableCount);
     for (std::uint32_t index = 0u; index < directCount; ++index) {
         auto image = images[index];
         image.srgbDecodeFormats = resources.srgbDecodeFormats;
@@ -954,9 +1115,10 @@ void ResourceMaterializer::ApplyStaticInterface(IrProgram& program, bool nativeS
                 image.indirectResources.push_back(static_cast<std::uint32_t>(images.size()));
                 images.push_back(std::move(entry));
             }
+            const auto keys = tableKeyCount(*resources.descriptorSources.at(image.source).indirectImage, slots);
             image.indirectMappingOffset = mappingOffset;
-            image.indirectSearchIterations = static_cast<std::uint32_t>(std::bit_width(slots));
-            mappingOffset += 1u + 2u * slots;
+            image.indirectSearchIterations = static_cast<std::uint32_t>(std::bit_width(keys));
+            mappingOffset += 1u + 2u * keys;
         }
         images[index] = std::move(image);
     }
@@ -1180,7 +1342,7 @@ std::uint64_t ResourceMaterializer::MaterializeNanoseconds() {
 }
 
 std::uint32_t ResourceMaterializer::BindlessSlots() {
-    return RuntimeAbi::SampledHeapCapacity;
+    return RuntimeAbi::BindlessTableSlots;
 }
 
 void ResourceMaterializer::CountBindlessRejection(BindlessRejection reason) {

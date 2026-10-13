@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GpuCheckpoints.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSpeculation.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
@@ -1042,6 +1043,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (drawHit) {
 
             programResults[i] = matched[i]->compiled.get();
+            if (programResults[i] != nullptr) Graphics::GpuCheckpoints::NoteVariant(programResults[i]->variantId, programs[i].binary.codeAddress);
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
             const auto candidate = std::find_if(dataCandidates[i].begin(), dataCandidates[i].end(), [&](const auto& kept) { return kept.first->pushOffset == pushCursorBytes; });
@@ -1050,12 +1052,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 matchedRegions[i] = std::move(candidate->second);
                 reused[i] = true;
                 programResults[i] = matched[i]->compiled.get();
+                if (programResults[i] != nullptr) Graphics::GpuCheckpoints::NoteVariant(programResults[i]->variantId, programs[i].binary.codeAddress);
                 memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
             } else {
                 if (!dataCandidates[i].empty() && !verifyDrawDataHits()) decodeVertexInfo(i);
                 compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 programResults[i] = compiledStages.back().get();
+                if (programResults[i] != nullptr) Graphics::GpuCheckpoints::NoteVariant(programResults[i]->variantId, programs[i].binary.codeAddress);
                 if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
                 if (verifyRebasedHits() && i < RebasedProbes().size() && RebasedProbes()[i] != nullptr) {
                     const auto& probe = *RebasedProbes()[i];

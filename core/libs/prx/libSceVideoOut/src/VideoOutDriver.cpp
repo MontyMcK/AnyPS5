@@ -18,6 +18,7 @@
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
+#include "prx/libSceVideoOut/include/AutomationCapture.hpp"
 #if APS5_ENABLE_TIMING_LOG
 #include "prx/libSceVideoOut/include/FrameTimingLog.hpp"
 #endif
@@ -534,6 +535,10 @@ void VideoOutDriver::presentLoop(std::stop_token token) {
                 const auto dequeued = AgcDriver::FrameTiming::Clock::now();
                 current->timing->Add(current->timing->Get("VideoOut", "queue"), dequeued - current->queuedAt);
                 processFlip(*current);
+                if (Automation::Enabled()) {
+                    AutomationSnapshotRequest snapshot;
+                    if (Aps5AutomationPresented_nid_postfix(current->width, current->height, &snapshot)) AutomationCaptureWindow(window.Handle(), snapshot);
+                }
                 const auto finished = AgcDriver::FrameTiming::Clock::now();
                 AgcDriver::FrameTiming::Clock::duration interval{};
                 {

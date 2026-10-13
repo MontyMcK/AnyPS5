@@ -91,6 +91,7 @@ void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
     if (OrderedPixelShader(state)) {
         state.module.AddFunction(spv::OpEndInvocationInterlockEXT);
     }
+    EmitBdaClockReport(state);
     EmitKillIfPixelValidMaskInactive(state);
     state.module.AddFunction(spv::OpReturn);
 }

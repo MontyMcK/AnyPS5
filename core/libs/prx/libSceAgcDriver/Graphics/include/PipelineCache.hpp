@@ -33,6 +33,7 @@ private:
     VkPipelineCache cache = VK_NULL_HANDLE;
     std::filesystem::path path;
     std::size_t savedBytes = 0;
+    // Whether this instance saves the file (the first live one for its path).
     std::chrono::steady_clock::time_point savedAt = std::chrono::steady_clock::now();
     std::mutex mutex;
     std::condition_variable wake;

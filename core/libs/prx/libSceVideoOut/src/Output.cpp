@@ -1,7 +1,10 @@
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -10,6 +13,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
+#include "prx/libkernel/Automation/include/Automation.hpp"
 
 static int validateOutputConfig(int handle, uint64_t mode, const VideoOutOutputOptions* options, void* reservedPtr, uint64_t reserved) {
     if (!VideoOutDriver::Get().IsOpen(handle)) {
@@ -144,7 +148,9 @@ int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* statu
     }
     std::unique_lock lock(cfg->mutex);
     cfg->Check();
-    status->resolution = (cfg->width >= 3840 || cfg->height >= 2160) ? 2u : 1u;
+    // APS5_VIDEO_OUT_1080P=1 (experiment): report a 1080p output whatever the buffers are.
+    static const bool force1080 = std::getenv("APS5_VIDEO_OUT_1080P") != nullptr;
+    status->resolution = !force1080 && (cfg->width >= 3840 || cfg->height >= 2160) ? 2u : 1u;
     status->dynamicRange = 1;
     status->refreshRate = (cfg->outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
     status->flags = 0;
@@ -276,15 +282,23 @@ int APS5_VABI sceVideoOutAdjustColor(int handle, const VideoOutColorSettings* se
     LibcAwaitExit_nid_postfix();
 }
 
-int APS5_VABI sceVideoOutVrrUnpegFromFixedRate() try {
-    NotImplemented_nid_no_patch(__func__);
+int APS5_VABI sceVideoOutVrrUnpegFromFixedRate(int handle) try {
+    // The host presents through Vulkan without variable refresh, so pegging to (or releasing) a
+    // fixed rate changes nothing.
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1) < 4) std::fprintf(stderr, "[videoout] %s(handle %d): no variable refresh on the host, accepted\n", __func__, handle);
+    if (Automation::Enabled()) Automation::Fields().Str("op", "unpeg").Num("handle", handle).Emit("vrr");
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 
-int APS5_VABI sceVideoOutVrrPegToFixedRate() try {
-    NotImplemented_nid_no_patch(__func__);
+int APS5_VABI sceVideoOutVrrPegToFixedRate(int handle, uint64_t arg1, uint64_t arg2) try {
+    // The host presents through Vulkan without variable refresh, so pegging to (or releasing) a
+    // fixed rate changes nothing.
+    static std::atomic<int> told{0};
+    if (told.fetch_add(1) < 4) std::fprintf(stderr, "[videoout] %s(handle %d, 0x%llx, 0x%llx): no variable refresh on the host, accepted\n", __func__, handle, static_cast<unsigned long long>(arg1), static_cast<unsigned long long>(arg2));
+    if (Automation::Enabled()) Automation::Fields().Str("op", "peg").Num("handle", handle).Hex("arg1", arg1).Hex("arg2", arg2).Emit("vrr");
     return 0;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();

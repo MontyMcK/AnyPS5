@@ -612,12 +612,7 @@ bool splitOneReturnJoin(ControlFlowGraph& graph) {
             continue;
         }
         const auto returns = [&](std::uint32_t target) { return graph.Dominates(block.id, target) && hasLinearPathToTerminal(graph, target); };
-        const auto joinsEnclosing = [&](std::uint32_t target) {
-            const auto& predecessors = graph.FindBlock(target).predecessors;
-            return !graph.Dominates(block.id, target) && std::all_of(predecessors.begin(), predecessors.end(), [&](std::uint32_t predecessor) {
-                return graph.Dominates(block.id, predecessor) || graph.Dominates(predecessor, block.id);
-            });
-        };
+        const auto joinsEnclosing = [&](std::uint32_t target) { return !graph.Dominates(block.id, target); };
         const auto trueTarget = block.terminator.trueBlock;
         const auto falseTarget = block.terminator.falseBlock;
         const auto join = returns(trueTarget) && joinsEnclosing(falseTarget) ? falseTarget : returns(falseTarget) && joinsEnclosing(trueTarget) ? trueTarget : InvalidControlFlowId;

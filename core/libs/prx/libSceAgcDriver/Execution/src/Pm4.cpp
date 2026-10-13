@@ -1,6 +1,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
+#include <cstdlib>
+#include <mutex>
 #include <algorithm>
 #include <thread>
 #include <chrono>
@@ -133,8 +136,33 @@ void copyMemory(std::uint64_t source, std::uint64_t destination, std::size_t byt
 constexpr std::uint32_t CopyDataGpuClockSource = 18;
 constexpr std::uint32_t CopyDataCachePolicy = (3u << 13u) | (3u << 25u);
 
+// The 100 MHz GPU clock (RELEASE_MEM timestamps, COPY_DATA's clock source). Timestamps are taken
+// when the driver reaches the packet, not when the GPU retires the work before it. Experiment:
+// APS5_GPU_CLOCK_SCALE=<x> (or live flag clock_scale=1 with it) runs the clock x times faster from
+// then on, so a title's frame-time measurement sees longer frames; it stays monotonic.
 std::uint64_t gpuClockCount() {
-    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10);
+    const auto real = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10);
+    static const double scale = [] {
+        const char* value = std::getenv("APS5_GPU_CLOCK_SCALE");
+        const double parsed = value != nullptr ? std::atof(value) : 1.0;
+        return parsed > 0 ? parsed : 1.0;
+    }();
+    if (scale == 1.0) return real;
+    static std::mutex mutex;
+    static std::uint64_t lastReal = 0, lastVirtual = 0;
+    static std::uint64_t reported = 0;
+    std::lock_guard lock(mutex);
+    if (lastReal == 0) {
+        lastReal = real;
+        lastVirtual = real;
+    }
+    const double factor = Graphics::LiveFlag("clock_scale", true) ? scale : 1.0;
+    if (real > lastReal) {
+        lastVirtual += static_cast<std::uint64_t>(static_cast<double>(real - lastReal) * factor);
+        lastReal = real;
+    }
+    if (++reported == 1) std::fprintf(stderr, "[gpu-clock] scaled x%.2f\n", scale);
+    return lastVirtual;
 }
 
 std::vector<std::byte> copyDataSource(std::span<const std::uint32_t> packet, std::size_t bytes) {
@@ -538,7 +566,7 @@ std::optional<LabelWrite> DecodeLabelWrite(std::span<const std::uint32_t> packet
         if (dataSelect == 0 || dataSelect > 3) return std::nullopt;
         if (destination == 0) return std::nullopt;
         std::uint64_t value = address(packet[5], packet[6]);
-        if (dataSelect == 3) value = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10);
+        if (dataSelect == 3) value = gpuClockCount();
         LabelWrite label{destination, {}};
         label.inlineSize = dataSelect == 1 ? 4 : 8;
         std::memcpy(label.inlineBytes.data(), &value, label.inlineSize);
@@ -852,7 +880,7 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
             if (dataSelect == 0 || destination == 0) return;
             std::uint64_t value = address(packet[5], packet[6]);
             if (dataSelect == 3) {
-                value = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10);
+                value = gpuClockCount();
             }
             GuestMemory::Write(destination, std::as_bytes(std::span(&value, 1)).first(dataSelect == 1 ? 4 : 8), dataSelect == 1 ? 4 : 8);
             return;

@@ -55,6 +55,20 @@ std::uint32_t DescriptorElementPointer(SpirvEmitterState& state, std::uint32_t r
     return pointer;
 }
 
+namespace {
+
+std::uint32_t tableMetadataWord(SpirvEmitterState& state, std::uint32_t member) {
+    if (state.runtimeImageMetadata == 0u) FailEmit("bindless image has no runtime metadata index");
+    const auto offset = Binary(state, spv::OpIAdd, TypeU32(state), ConstantU32(state, state.program.Metadata().bindings.ImageMetadataDword() + member), Binary(state, spv::OpIMul, TypeU32(state), state.runtimeImageMetadata, ConstantU32(state, sizeof(RuntimeAbi::ResourceMetadata) / sizeof(std::uint32_t))));
+    const auto metadata = state.module.AllocateId();
+    state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), metadata, state.shaderDataStorageVariable, ConstantU32(state, 0u), offset);
+    const auto value = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, TypeU32(state), value, metadata);
+    return value;
+}
+
+}
+
 std::uint32_t TableImageIndex(SpirvEmitterState& state, DescriptorBindingKind kind, std::uint32_t resource) {
     const bool storage = ImageBindingResourceClass(kind) == ImageResourceClass::Storage;
     const auto supported = [&](std::uint32_t capability) {
@@ -65,12 +79,7 @@ std::uint32_t TableImageIndex(SpirvEmitterState& state, DescriptorBindingKind ki
         ExitDescriptorBindingFailure(state, kind, resource, "bindless image table needs image array dynamic indexing, which the device lacks");
     }
     state.module.EmitCapability(dynamic);
-    if (state.runtimeImageMetadata == 0u) FailEmit("bindless image has no runtime metadata index");
-    const auto offset = Binary(state, spv::OpIAdd, TypeU32(state), ConstantU32(state, state.program.Metadata().bindings.ImageMetadataDword() + offsetof(RuntimeAbi::ResourceMetadata, firstElement) / sizeof(std::uint32_t)), Binary(state, spv::OpIMul, TypeU32(state), state.runtimeImageMetadata, ConstantU32(state, sizeof(RuntimeAbi::ResourceMetadata) / sizeof(std::uint32_t))));
-    const auto metadata = state.module.AllocateId();
-    state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), metadata, state.shaderDataStorageVariable, ConstantU32(state, 0u), offset);
-    const auto index = state.module.AllocateId();
-    state.module.AddFunction(spv::OpLoad, TypeU32(state), index, metadata);
+    const auto index = tableMetadataWord(state, offsetof(RuntimeAbi::ResourceMetadata, firstElement) / sizeof(std::uint32_t));
     if (!state.tableIndexNonUniform) {
         return index;
     }
@@ -209,7 +218,7 @@ std::uint32_t StorageImageDescriptorPointer(SpirvEmitterState& state, std::uint3
     return DescriptorElementPointer(state, pointerType, variable, arrayIndex, kind, resource, "storage image descriptor array was not emitted");
 }
 
-void EmitStorageImageWrite(SpirvEmitterState& state, std::uint32_t resource, std::uint32_t mipLod, std::uint32_t coord, std::uint32_t texel, std::uint32_t sample) {
+void EmitStorageImageWrite(SpirvEmitterState& state, std::uint32_t resource, std::uint32_t mipLod, std::uint32_t coord, std::uint32_t texel, std::uint32_t sample, std::uint32_t slotId) {
     const auto& image = state.runtimeImage != nullptr ? *state.runtimeImage : state.program.Info().images.at(resource);
     if (image.resourceClass != ImageResourceClass::Storage) {
         FailEmit("storage image write requested for a non-storage image");
@@ -223,9 +232,21 @@ void EmitStorageImageWrite(SpirvEmitterState& state, std::uint32_t resource, std
     const auto pointerType = state.module.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, imageType);
     const auto variable = state.imageVariables.at(ImageBindingIndex(kind));
     const auto loadAt = [&](std::uint32_t index) {
-        const auto pointer = DescriptorElementPointer(state, pointerType, variable, index, kind, resource, "storage image descriptor array was not emitted");
+        auto pointer = 0u;
+        if (slotId == 0u) {
+            pointer = DescriptorElementPointer(state, pointerType, variable, index, kind, resource, "storage image descriptor array was not emitted");
+        } else {
+            // A table slot: the heap element of the selected entry (its runtime metadata), plus
+            // the mip offset within it.
+            const auto heapIndex = Binary(state, spv::OpIAdd, TypeU32(state), TableImageIndex(state, kind, resource), ConstantU32(state, index - arrayIndex));
+            DecorateTableNonUniform(state, slotId, heapIndex);
+            pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAccessChain, pointerType, pointer, variable, heapIndex);
+            DecorateTableNonUniform(state, slotId, pointer);
+        }
         const auto descriptor = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, imageType, descriptor, pointer);
+        DecorateTableNonUniform(state, slotId, descriptor);
         return descriptor;
     };
     if (RdnaImageDimensionInfoFor(image.dimension).multisampled != 0u) {
@@ -252,7 +273,7 @@ void EmitStorageImageWrite(SpirvEmitterState& state, std::uint32_t resource, std
     state.module.AddFunction(std::span<const std::uint32_t>(words));
     for (std::uint32_t mip = 0; mip < image.mipCount; mip++) {
         EmitLabel(state, labels[mip]);
-        const auto count = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::MipCountBase + resource, image.mipCount);
+        const auto count = slotId == 0u ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::MipCountBase + resource, image.mipCount) : tableMetadataWord(state, offsetof(RuntimeAbi::ResourceMetadata, elementCount) / sizeof(std::uint32_t));
         const auto active = Binary(state, spv::OpULessThan, TypeBool(state), ConstantU32(state, mip), count);
         const auto writeLabel = state.module.AllocateId();
         const auto nextLabel = state.module.AllocateId();

@@ -5,7 +5,10 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include <vulkan/vulkan.h>
+#include "prx/libSceAgcDriver/Graphics/include/DeferredVulkan.hpp"
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -82,6 +85,44 @@ inline std::uint64_t& DeviceProcLookups() {
     return count;
 }
 
+// vkGetDeviceProcAddr is a string lookup in the loader and the driver, and the record path asks it for
+// an entry point on every Vulkan call. Entry points are remembered here per (resolver, device, name), keyed by
+// the name's address: callers pass string literals. APS5_NO_PROC_CACHE=1 asks every time.
+inline PFN_vkVoidFunction CachedDeviceProc(PFN_vkGetDeviceProcAddr deviceProc, VkDevice device, const char* name) {
+    struct Entry {
+        std::atomic<const char*> name{nullptr};
+        std::atomic<VkDevice> device{VK_NULL_HANDLE};
+        std::atomic<PFN_vkGetDeviceProcAddr> resolver{nullptr};
+        std::atomic<PFN_vkVoidFunction> function{nullptr};
+    };
+    constexpr std::size_t Slots = 2048;
+    constexpr std::size_t Probes = 16;
+    static Entry table[Slots];
+    static const bool disabled = std::getenv("APS5_NO_PROC_CACHE") != nullptr;
+    if (disabled) return DeferredVulkanEntry(name, deviceProc(device, name));
+    const auto hash = static_cast<std::size_t>((reinterpret_cast<std::uintptr_t>(name) * 0x9e3779b97f4a7c15ull) >> 53);
+    for (std::size_t probe = 0; probe < Probes; ++probe) {
+        auto& entry = table[(hash + probe) & (Slots - 1)];
+        const char* key = entry.name.load(std::memory_order_acquire);
+        if (key == name) {
+            const auto function = entry.function.load(std::memory_order_acquire);
+            if (function != nullptr && entry.device.load(std::memory_order_relaxed) == device && entry.resolver.load(std::memory_order_relaxed) == deviceProc) return function;
+            continue;
+        }
+        if (key != nullptr) continue;
+        const auto function = DeferredVulkanEntry(name, deviceProc(device, name));
+        if (function == nullptr) return nullptr;
+        const char* empty = nullptr;
+        if (entry.name.compare_exchange_strong(empty, name, std::memory_order_acq_rel)) {
+            entry.device.store(device, std::memory_order_relaxed);
+            entry.resolver.store(deviceProc, std::memory_order_relaxed);
+            entry.function.store(function, std::memory_order_release);
+        }
+        return function;
+    }
+    return DeferredVulkanEntry(name, deviceProc(device, name));
+}
+
 inline constexpr std::size_t EmptyBufferBytes = 16;
 
 struct Context {
@@ -152,13 +193,15 @@ struct Context {
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
+    // VK_KHR_push_descriptor is enabled (APS5_NO_PUSH_DESCRIPTORS=1 leaves it off).
+    bool pushDescriptors = false;
     std::uint32_t srgbDecodeFormats = 0;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {
         Require(deviceProc != nullptr, "missing Vulkan device function resolver");
         ++DeviceProcLookups();
-        const auto function = reinterpret_cast<TFunction>(deviceProc(device, name));
+        const auto function = reinterpret_cast<TFunction>(CachedDeviceProc(deviceProc, device, name));
         if (function == nullptr) throw std::runtime_error(std::string("AGC graphics: missing Vulkan function: ") + name);
         return function;
     }

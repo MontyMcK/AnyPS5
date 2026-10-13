@@ -11,6 +11,8 @@
 #include "SpirvBackend/SpirvSpecialization.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "ShaderDiskCache.hpp"
+#include "ShaderWarmList.hpp"
+#include "ShaderCacheDirectory.hpp"
 #include <list>
 #include <map>
 #include <set>
@@ -36,6 +38,7 @@
 #include "Optimization/include/Optimization/ShaderInfoCollector.hpp"
 #include "Optimization/include/Optimization/SrtWalker.hpp"
 #include "Optimization/include/Optimization/SsaBuilder.hpp"
+#include "Optimization/include/Optimization/TessellationLowering.hpp"
 #include "SpirvBackend/include/SpirvBackend/SpirvEmitter.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
@@ -89,6 +92,21 @@ std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
         if (list.find(address) != std::string::npos) return 64u;
     }
     return request.target.subgroupSize;
+}
+
+// The warm-list identity of the variant a request prepares under `layout`: its cache key without
+// the leading runtime ABI version (a record is replayed under the current one), the host subgroup
+// width and the binding layout; independent of guest addresses and of the recompiler version.
+WarmList::Identity WarmIdentity(const RecompileRequest& request, const BindingLayout& layout) {
+    struct WarmKeyStorage {};
+    auto& key = HostThreadLocal<std::vector<std::uint64_t>, WarmKeyStorage>();
+    RecompileCacheKey::Build(request, key);
+    key.front() = 0;
+    key.push_back(HostSubgroupSize(request));
+    key.push_back((static_cast<std::uint64_t>(layout.descriptorSet) << 32u) | layout.firstBinding);
+    key.push_back((static_cast<std::uint64_t>(layout.pushConstantOffsetBytes) << 32u) | layout.pushConstantSizeBytes);
+    const auto bytes = std::as_bytes(std::span<const std::uint64_t>(key));
+    return {HashBytes(bytes, 0x5eed0009ull), HashBytes(bytes, 0x5eed000aull)};
 }
 
 ShaderStageInputInfo RequestInputInfo(const RecompileRequest& request) {
@@ -189,6 +207,14 @@ IrProgram PrepareResourceProgram(const RecompileRequest& request) {
     constexpr MaskedSelectEliminator maskedSelectEliminator;
     if (maskedSelectEliminator.Eliminate(program).removedSelects != 0u) {
         deadCodeEliminator.Eliminate(program);
+    }
+
+    // Local, hull and domain programs: their LDS and ring accesses become tessellation interfaces.
+    if (inputInfo.vertex != nullptr) {
+        constexpr TessellationLowering tessellationLowering;
+        tessellationLowering.Lower(program, inputInfo.vertex->tess);
+        const auto stage = request.shader.stage;
+        if (stage == ShaderStage::Local || stage == ShaderStage::TessellationControl || stage == ShaderStage::TessellationEvaluation) dumpIr("tessellation");
     }
 
     constexpr SrtWalker srtWalker;
@@ -542,6 +568,9 @@ struct SpecializedModuleEntry {
     std::once_flag ready;
     std::exception_ptr failure;
     std::shared_ptr<const SpecializedModule> module;
+    // Shader warm list: 1 while a module a replay built awaits its first use, 2 once claimed.
+    std::atomic<std::uint8_t> warm{0};
+    WarmList::Identity warmIdentity;
 };
 
 struct PreparedModuleEntry {
@@ -609,7 +638,9 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     return plan;
 }
 
-std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+// `request` names the variant for the warm list (its layout may differ from the variant's).
+std::shared_ptr<const SpecializedModule> specializeModule(const CompiledVariant& variant, const RecompileRequest& request, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+    const auto& artifact = variant.artifact;
     struct ModuleKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, ModuleKeyStorage>();
     key.clear();
@@ -632,9 +663,25 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
             entry->module = loadOrBuildSpecializedModule(artifact, classes, constants, target);
         } catch (...) {
             entry->failure = std::current_exception();
+            return;
+        }
+        if (WarmList::Detail::Replaying()) {
+            entry->warmIdentity = WarmList::Detail::ModuleIdentity(WarmIdentity(request, variant.layout), classes, constants);
+            entry->warm.store(1, std::memory_order_release);
+            WarmList::Detail::NoteWarmed(true);
+        } else if (WarmList::Detail::FirstUse()) {
+            const auto identity = WarmIdentity(request, variant.layout);
+            WarmList::Detail::NoteLate(WarmList::Detail::ModuleIdentity(identity, classes, constants), true);
+            auto recorded = request;
+            recorded.layout = variant.layout;
+            WarmList::Detail::RecordModule(recorded, identity, classes, constants);
         }
     });
     if (entry->failure) std::rethrow_exception(entry->failure);
+    if (entry->warm.load(std::memory_order_acquire) == 1 && WarmList::Detail::FirstUse()) {
+        std::uint8_t expected = 1;
+        if (entry->warm.compare_exchange_strong(expected, 2, std::memory_order_acq_rel)) WarmList::Detail::NoteClaimed(entry->warmIdentity, true);
+    }
     return entry->module;
 }
 
@@ -724,7 +771,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                     constants.push_back({first + 5u, kind});
                 }
             }
-            const auto module = specializeModule(variant.artifact, vertexClasses, constants, request.target);
+            const auto module = specializeModule(variant, request, vertexClasses, constants, request.target);
             if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
             auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
             entry->bindings = std::move(selected);
@@ -756,10 +803,19 @@ bool sameLayout(const BindingLayout& left, const BindingLayout& right) {
     return left.descriptorSet == right.descriptorSet && left.firstBinding == right.firstBinding && left.pushConstantOffsetBytes == right.pushConstantOffsetBytes && left.pushConstantSizeBytes == right.pushConstantSizeBytes;
 }
 
+// A first use served by a variant the warm-list replay prepared.
+void claimWarmVariant(const CompiledVariant& variant) {
+    std::atomic_ref<std::uint8_t> state(variant.warmState);
+    if (state.load(std::memory_order_acquire) != 1 || !WarmList::Detail::FirstUse()) return;
+    std::uint8_t expected = 1;
+    if (state.compare_exchange_strong(expected, 2, std::memory_order_acq_rel)) WarmList::Detail::NoteClaimed({variant.warmIdentityLow, variant.warmIdentityHigh}, false);
+}
+
 std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source, const RecompileRequest& request, bool& cacheHit) {
     for (const auto& candidate : source.variants) {
         if (sameLayout(candidate->layout, request.layout)) {
             cacheHit = true;
+            claimWarmVariant(*candidate);
             return candidate;
         }
     }
@@ -790,6 +846,17 @@ std::shared_ptr<const CompiledVariant> findOrCompileVariant(SourceEntry& source,
             throw;
         }
         if (disk) ShaderDiskCache::Store(std::move(diskKey), variant);
+    }
+    if (WarmList::Detail::Replaying()) {
+        const auto identity = WarmIdentity(request, request.layout);
+        variant->warmIdentityLow = identity.low;
+        variant->warmIdentityHigh = identity.high;
+        std::atomic_ref<std::uint8_t>(variant->warmState).store(1, std::memory_order_release);
+        WarmList::Detail::NoteWarmed(false);
+    } else if (WarmList::Detail::FirstUse()) {
+        const auto identity = WarmIdentity(request, request.layout);
+        WarmList::Detail::NoteLate(identity, false);
+        WarmList::Detail::RecordVariant(request, identity);
     }
     source.program.reset();
     source.variants.push_back(variant);
@@ -1175,6 +1242,11 @@ RecompileResult Recompile(const RecompileRequest& request) {
 std::shared_ptr<const RecompileResult> Recompile(const RecompileRequest& request, const ResourceCapture& capture, bool* memoHit) {
     if (memoHit != nullptr) *memoHit = false;
     return recompileReporting(request, [&] { return RecompileImpl(request, capture, memoHit); });
+}
+
+void WarmList::PrewarmSpecializedModule(const RecompileRequest& request, const SourceHandle& handle, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants) {
+    if (handle.artifact == nullptr) throw std::runtime_error("ShaderRecompiler: prepared artifact is missing");
+    static_cast<void>(specializeModule(*handle.artifact, request, classes, constants, request.target));
 }
 
 }

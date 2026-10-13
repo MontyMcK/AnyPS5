@@ -5,6 +5,7 @@
 #include "prx/libkernel/File/include/File.hpp"
 #include "prx/libkernel/File/include/DirectoryDescriptor.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
+#include "prx/libkernel/Automation/include/Automation.hpp"
 #include "SceTypes.hpp"
 
 #include <atomic>
@@ -116,6 +117,11 @@ int APS5_VABI sceKernelOpen(const char* path, int flags, std::uint16_t mode) {
         if (std::filesystem::is_directory(native, error)) fd = File::OpenDirectoryDescriptor(native);
     }
 #endif
+    if (Automation::Enabled()) {
+        const int openError = errno;
+        Automation::Fields().Str("path", path).Num("fd", fd < 0 ? -openError : fd).Hex("flags", static_cast<unsigned>(flags)).Emit("open");
+        errno = openError;
+    }
     if (fd < 0) {
         static const bool traceFailures = std::getenv("APS5_TRACE_OPEN_FAILURES") != nullptr;
         if (traceFailures) {

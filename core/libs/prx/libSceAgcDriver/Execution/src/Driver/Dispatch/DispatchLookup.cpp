@@ -145,6 +145,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 keepVariant = variant;
                 cached = true;
                 ++dispatchCacheHits;
+                ++dispatchCacheClock;
                 if (untouched) {
                     if (restamped != 0) variant->generation.store(restamped, std::memory_order_release);
 
@@ -160,9 +161,9 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                         again->second = std::move(rotated);
                     }
 
-                    if (dispatchCacheHits - again->second->touched > dispatchCacheEntries() / 8) {
+                    if (dispatchCacheClock - again->second->touched > dispatchCacheEntries() / 8) {
                         dispatchOrder.splice(dispatchOrder.begin(), dispatchOrder, again->second->order);
-                        again->second->touched = dispatchCacheHits;
+                        again->second->touched = dispatchCacheClock;
                         ++counters.touches;
                     }
                 }

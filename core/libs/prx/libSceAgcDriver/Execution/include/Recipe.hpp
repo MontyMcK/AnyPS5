@@ -76,7 +76,20 @@ struct DrawRecipe {
     std::weak_ptr<Graphics::Pipeline> pipeline;
     std::weak_ptr<Graphics::Framebuffer> framebuffer;
     std::vector<std::weak_ptr<Graphics::StorageTexture>> targets;
+    // The color attachment views, then the depth attachment view when `depth` is set.
     std::vector<VkImageView> targetViews;
+    // A depth recipe (APS5_NO_DEPTH_RECIPE unset): the draw had a depth target, whose attachment
+    // view (DepthSurfaceView's answer at the build) a hit must get again from DepthSurfaceView,
+    // which applies the surface's pending fast clear and takes back storage-image writes exactly as
+    // the ordinary path does per draw. The view names the depth surface object: surfaces live until
+    // their device's teardown (ClearDepthSurfaces, together with ClearCachedPipelines, which drops
+    // the recipe's pipeline).
+    bool depth = false;
+    VkImageView depthView = VK_NULL_HANDLE;
+    // A moved-buffer recipe (APS5_NO_MOVED_RECIPE unset): the template's read-only buffers did not
+    // match the draw's descriptors at the build (ShaderResources::MovedReadOnlyBuffers was not
+    // empty); a hit recomputes them as the ordinary template hit does and misses when that refuses.
+    bool movedBuffers = false;
     std::uint64_t passKey = 0;
     Graphics::VertexInputLayout vertexInput;
     std::array<std::byte, Graphics::PipelinePushConstantBytes> pushBytes{};

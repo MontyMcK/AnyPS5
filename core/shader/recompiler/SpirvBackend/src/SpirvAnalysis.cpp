@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvAnalysis.hpp"
+#include "SpirvBackend/SpirvBda.hpp"
 #include <algorithm>
 #include <optional>
 #include <stdexcept>
@@ -423,6 +424,11 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
         if (info.terminator.kind == TerminatorKind::ConditionalBranch && IsWaveMaskBranch(info.terminator.condition)) {
             requirements.subgroupBallot = true;
         }
+    }
+    // Scalar reads through the BDA table probe in one elected lane (SpirvBdaRead.cpp).
+    if (ElectScalarBdaReads() && program.Info().usesDma) {
+        const auto& memory = program.Resources().memoryInfo;
+        if (std::any_of(memory.begin(), memory.end(), [](const MemoryInfo& info) { return info.kind == ResourceKind::ScalarAddress || info.kind == ResourceKind::ScalarBuffer; })) requirements.subgroupBallot = true;
     }
     if (requirements.functionLds) {
         requirements.functionLdsDwords = FunctionLdsDwords(program);

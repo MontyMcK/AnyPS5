@@ -265,6 +265,73 @@ void NoteHandledFault(const CONTEXT& context, std::uint64_t address) {
     entry.address.store(address, std::memory_order_relaxed);
 }
 
+void DescribeGuest(const char* name, std::uint64_t address) {
+    char text[1536];
+    MEMORY_BASIC_INFORMATION memory{};
+    VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory));
+    GuestArena::GuestArenaDescribe_nid_postfix(address, text, sizeof(text));
+    Report("  [guest %s 0x%llx] type 0x%lx protect 0x%lx region 0x%llx+0x%llx: %s\n", name, static_cast<unsigned long long>(address), memory.Type, memory.Protect, reinterpret_cast<unsigned long long>(memory.BaseAddress), static_cast<unsigned long long>(memory.RegionSize), text);
+}
+
+// Local diagnostic for the guest mesh-adjacency loop (app.exe+0x169a720): the adjacency item being
+// processed and the index triplets it names, read twice to catch a concurrent writer.
+void DumpMesh(const CONTEXT* context, const char* when) {
+    const auto rsp = context->Rsp;
+    if (!IsReadable(rsp + 0x40)) return;
+    // The adjacency list pointer is the first word of a by-value argument at [rsp+0x40].
+    const auto adjacency = *reinterpret_cast<const std::uint64_t*>(rsp + 0x40);
+    const auto index = context->R8;
+    const auto stride = static_cast<std::uint32_t>(context->R9);
+    for (std::int64_t delta = -1; delta <= 1; ++delta) {
+        const auto item = adjacency + context->R14 + delta * 16;
+        if (!IsReadable(item) || !IsReadable(item + 15)) {
+            Report("  [mesh %s] adjacency 0x%llx item 0x%llx unreadable\n", when, static_cast<unsigned long long>(adjacency), static_cast<unsigned long long>(item));
+            continue;
+        }
+        const auto* words = reinterpret_cast<const std::uint32_t*>(item);
+        char line[512];
+        int used = std::snprintf(line, sizeof(line), "  [mesh %s] adjacency 0x%llx item %+lld at 0x%llx: %08x %08x %08x %08x |", when, static_cast<unsigned long long>(adjacency), static_cast<long long>(delta), static_cast<unsigned long long>(item), words[0], words[1], words[2], words[3]);
+        for (int k = 0; k < 4; ++k) {
+            if (words[k] == 0xffffffffu) {
+                used += std::snprintf(line + used, sizeof(line) - used, " -");
+                continue;
+            }
+            const auto at = index + static_cast<std::uint32_t>(words[k] * stride);
+            if (!IsReadable(at) || !IsReadable(at + 5)) {
+                used += std::snprintf(line + used, sizeof(line) - used, " ?");
+                continue;
+            }
+            const auto* triangle = reinterpret_cast<const std::uint16_t*>(at);
+            used += std::snprintf(line + used, sizeof(line) - used, " %u:%u/%u/%u", words[k], triangle[0], triangle[1], triangle[2]);
+        }
+        Report("%s\n", line);
+    }
+    // How much of the adjacency list up to this item looks unwritten.
+    std::uint64_t zero = 0, firstZero = ~0ull, scanned = 0;
+    for (std::uint64_t at = 0; at <= context->R14 + 0x400 && IsReadable(adjacency + at + 15); at += 16, ++scanned) {
+        const auto* words = reinterpret_cast<const std::uint32_t*>(adjacency + at);
+        if ((words[0] | words[1] | words[2] | words[3]) == 0) {
+            ++zero;
+            if (firstZero == ~0ull) firstZero = at / 16;
+        }
+    }
+    Report("  [mesh %s] %llu of %llu items up to here+64 are all zero (first %lld)\n", when, static_cast<unsigned long long>(zero), static_cast<unsigned long long>(scanned), firstZero == ~0ull ? -1ll : static_cast<long long>(firstZero));
+    if (std::strcmp(when, "now") == 0) {
+        DescribeGuest("adjacency", adjacency + context->R14);
+        DescribeGuest("index r8", context->R8);
+        DescribeGuest("vertex r11", context->R11);
+    }
+}
+
+void ReportMeshCrash(const CONTEXT* context) {
+    const auto image = reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
+    const auto offset = context->Rip - image;
+    if (offset < 0x169a720 || offset >= 0x169b200) return;
+    DumpMesh(context, "now");
+    Sleep(300);
+    DumpMesh(context, "later");
+}
+
 void ReportHandledFaults(unsigned long thread, std::uint64_t rsp) {
     const auto total = g_handledFaultCount.load(std::memory_order_relaxed);
     Report("  handled faults: %llu in total (%llu SSE4a emulations, shown with write of 0x0); the latest on this thread (newest first):\n", total, g_sse4aEmulated.load());
@@ -284,6 +351,10 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     const auto* fault = info->ExceptionRecord;
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) {
+        NoteHandledFault(*info->ContextRecord, fault->ExceptionInformation[1]);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 0 && GuestArena::GuestArenaHandleRead_nid_postfix(fault->ExceptionInformation[1])) {
         NoteHandledFault(*info->ContextRecord, fault->ExceptionInformation[1]);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
@@ -331,6 +402,7 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
             Report("  [%s] %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n", name, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
         }
     }
+    ReportMeshCrash(context);
     Report("  frame pointer chain:\n");
     std::uint64_t frame = context->Rbp;
     for (int depth = 0; depth < 32 && frame != 0 && (frame & 7) == 0 && IsReadable(frame) && IsReadable(frame + 8); ++depth) {

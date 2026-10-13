@@ -26,6 +26,7 @@ bool GuestArenaWriteWatched_nid_postfix();
 #ifdef _WIN32
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection);
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address);
+bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address);
 void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes);
 void GuestArenaUnpinWritable_nid_postfix(const void* pointer, std::size_t bytes);
 bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* protection);
@@ -38,6 +39,8 @@ void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection);
 void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestArenaUnmapAlias_nid_postfix(void* alias);
+// Local diagnostic: the backing of the guest page at address and recent conversions near it.
+void GuestArenaDescribe_nid_postfix(std::uintptr_t address, char* out, std::size_t size);
 #else
 void GuestArenaSetSharedBacking_nid_postfix(SharedBackingResolver resolver);
 bool GuestArenaSharedBacking_nid_postfix(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset);

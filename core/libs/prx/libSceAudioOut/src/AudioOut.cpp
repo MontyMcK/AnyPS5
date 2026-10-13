@@ -14,6 +14,7 @@
 #include "SDL.h"
 #include "SceTypes.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
+#include "prx/libkernel/Automation/include/Automation.hpp"
 
 static constexpr int PORT_TYPE_MAIN = 0;
 static constexpr int PORT_TYPE_BGM = 1;
@@ -354,6 +355,7 @@ int APS5_VABI sceAudioOutOpen(int userId, int type, int index, std::uint32_t len
             }
             static const bool trace = std::getenv("APS5_TRACE_AUDIOOUT") != nullptr;
             if (trace) std::fprintf(stderr, "[audioout] port %d: type %d, %u samples at %u Hz, format %d, device %u\n", i + 1, type, len, freq, static_cast<int>(format), static_cast<unsigned>(port.device));
+            if (Automation::Enabled()) Automation::Fields().Str("op", "open").Num("port", i + 1).Num("port_type", type).Unsigned("samples", len).Unsigned("freq", freq).Emit("audio");
             return i + 1;
         }
     }

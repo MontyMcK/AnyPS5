@@ -12,6 +12,7 @@
 #include "SceTypes.hpp"
 #include "HitLog.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libkernel/Automation/include/Automation.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -50,6 +51,8 @@ int g_mode = kModeUserMsg;
 int g_buttonId = kButtonIdOk;
 int g_pollsLeft = 0;
 std::chrono::steady_clock::time_point g_openedAt;
+char g_text[161] = {};
+int g_buttonType = -1;
 
 bool Readable(const void* p, std::size_t n) {
 #ifdef _WIN32
@@ -70,6 +73,8 @@ void Inspect(const void* param) {
     const std::uint8_t* bytes = static_cast<const std::uint8_t*>(param);
     g_mode = kModeUserMsg;
     g_buttonId = kButtonIdOk;
+    g_text[0] = '\0';
+    g_buttonType = -1;
     if (!Readable(bytes, 0x60)) return;
     std::int32_t mode = 0;
     std::memcpy(&mode, bytes + 0x38, 4);
@@ -83,9 +88,11 @@ void Inspect(const void* param) {
     const char* msg = nullptr;
     std::memcpy(&msg, userMsg + 8, 8);
     if (buttonType == kButtonTypeYesNoFocusNo) g_buttonId = kButtonIdNo;
+    g_buttonType = buttonType;
     if (Readable(msg, 4)) {
         char text[161] = {};
         for (int i = 0; i < 160 && Readable(msg + i, 1) && msg[i] != '\0'; ++i) text[i] = (msg[i] >= 0x20 || msg[i] == '\n') ? msg[i] : '?';
+        std::memcpy(g_text, text, sizeof(g_text));
         APS5_HIT("MSGDIALOG", "open: buttons=%d text=\"%s\" -> auto answer", buttonType, text);
     }
 }
@@ -100,7 +107,10 @@ int Poll() {
         } else {
             done = --g_pollsLeft <= 0;
         }
-        if (done) g_status = kStatusFinished;
+        if (done) {
+            g_status = kStatusFinished;
+            if (Automation::Enabled()) Automation::Fields().Str("dialog", "msg").Str("op", "finished").Num("button_id", g_buttonId).Emit("dialog");
+        }
     }
     return g_status;
 }
@@ -118,6 +128,7 @@ int APS5_VABI sceMsgDialogTerminate(void) {
  std::lock_guard g(g_lock);
  const bool was = g_status != kStatusNone;
  g_status = kStatusNone;
+ if (Automation::Enabled()) Automation::Fields().Str("dialog", "msg").Str("op", "terminate").Emit("dialog");
  return was ? kErrOk : kErrNotInitialized;
 }
 int APS5_VABI sceMsgDialogOpen(const void* param) {
@@ -129,6 +140,7 @@ int APS5_VABI sceMsgDialogOpen(const void* param) {
  g_pollsLeft = 2;
  g_openedAt = std::chrono::steady_clock::now();
  g_status = kStatusRunning;
+ if (Automation::Enabled()) Automation::Fields().Str("dialog", "msg").Str("op", "open").Num("mode", g_mode).Num("buttons", g_buttonType).Str("text", g_text).Emit("dialog");
  return kErrOk;
 }
 int APS5_VABI sceMsgDialogGetStatus(void) {
@@ -150,6 +162,7 @@ int APS5_VABI sceMsgDialogClose(void) {
  std::lock_guard g(g_lock);
  if (g_status != kStatusRunning) return kErrNotRunning;
  g_status = kStatusFinished;
+ if (Automation::Enabled()) Automation::Fields().Str("dialog", "msg").Str("op", "close").Emit("dialog");
  return kErrOk;
 }
 int APS5_VABI sceMsgDialogProgressBarInc(int target, std::uint32_t delta) {

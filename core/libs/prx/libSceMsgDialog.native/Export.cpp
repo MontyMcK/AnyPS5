@@ -4,6 +4,7 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libkernel/Automation/include/Automation.hpp"
 
 namespace {
 std::atomic<int> g_status{0};
@@ -25,6 +26,7 @@ int SceMsgDialogNativeModuleLoaded_nid_no_patch = 1;
 int APS5_VABI sceMsgDialogClose(void) {
  int expected = COMMON_DIALOG_STATUS_RUNNING;
  if (!g_status.compare_exchange_strong(expected, COMMON_DIALOG_STATUS_FINISHED)) return COMMON_DIALOG_ERROR_NOT_RUNNING;
+ if (Automation::Enabled()) Automation::Fields().Str("dialog", "msg").Str("variant", "native").Str("op", "close").Emit("dialog");
  return 0;
 }
 
@@ -50,10 +52,12 @@ int APS5_VABI sceMsgDialogOpen(const void* param) {
  if (status == 0) return COMMON_DIALOG_ERROR_NOT_INITIALIZED;
  if (param == nullptr) return COMMON_DIALOG_ERROR_ARG_NULL;
  g_status = COMMON_DIALOG_STATUS_FINISHED;
+ if (Automation::Enabled()) Automation::Fields().Str("dialog", "msg").Str("variant", "native").Str("op", "open").Emit("dialog");
  return 0;
 }
 
 int APS5_VABI sceMsgDialogTerminate(void) {
+    if (Automation::Enabled()) Automation::Fields().Str("dialog", "msg").Str("variant", "native").Str("op", "terminate").Emit("dialog");
     int expected = 1;
     if (g_status.compare_exchange_strong(expected, 0)) return 0;
     expected = COMMON_DIALOG_STATUS_FINISHED;

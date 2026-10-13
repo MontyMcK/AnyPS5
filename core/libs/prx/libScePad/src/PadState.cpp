@@ -1,9 +1,11 @@
 #include "prx/libScePad/include/PadState.hpp"
 #include "prx/libScePad/include/Pad.hpp"
 #include "prx/libkernel/Time/include/Time.hpp"
+#include "prx/libkernel/Automation/include/Automation.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <iterator>
 #include <mutex>
 #include <stdexcept>
 
@@ -23,6 +25,12 @@ namespace {
     std::uint8_t nextTouchId = 0;
     bool prevTouchActive[2] = {false, false};
     std::uint8_t touchIds[2] = {0, 0};
+    AutomationPadOverlay lastOverlay;
+
+    bool SameOverlay(const AutomationPadOverlay& a, const AutomationPadOverlay& b) {
+        return a.buttons == b.buttons && a.leftStick == b.leftStick && a.rightStick == b.rightStick && a.l2 == b.l2 && a.r2 == b.r2 &&
+            std::equal(std::begin(a.sticks), std::end(a.sticks), std::begin(b.sticks));
+    }
 
     void normalize(Quat& q) {
         const float n = std::sqrt(q.w * q.w + q.x * q.x + q.y * q.y + q.z * q.z);
@@ -110,6 +118,32 @@ PadData Pad::ReadState() {
     data.right_stick_y = state.sticks[3];
     data.analog_buttons_l2 = std::max<std::uint8_t>(state.analogButtonsL2, (state.buttons & 0x100) != 0 ? 255 : 0);
     data.analog_buttons_r2 = std::max<std::uint8_t>(state.analogButtonsR2, (state.buttons & 0x200) != 0 ? 255 : 0);
+    // APS5_AUTOMATION: injected inputs are merged over the host's; this read advances them.
+    bool automationTouch = false;
+    if (Automation::Enabled()) {
+        AutomationPadOverlay overlay;
+        Aps5AutomationPadPoll_nid_postfix(&overlay);
+        if (!SameOverlay(overlay, lastOverlay)) {
+            lastOverlay = overlay;
+            timestamp = now;
+        }
+        data.buttons |= overlay.buttons;
+        if (overlay.leftStick) {
+            data.left_stick_x = overlay.sticks[0];
+            data.left_stick_y = overlay.sticks[1];
+        }
+        if (overlay.rightStick) {
+            data.right_stick_x = overlay.sticks[2];
+            data.right_stick_y = overlay.sticks[3];
+        }
+        if ((overlay.buttons & 0x100) != 0) data.analog_buttons_l2 = 255;
+        if ((overlay.buttons & 0x200) != 0) data.analog_buttons_r2 = 255;
+        data.analog_buttons_l2 = std::max(data.analog_buttons_l2, overlay.l2);
+        data.analog_buttons_r2 = std::max(data.analog_buttons_r2, overlay.r2);
+        if (overlay.l2 != 0) data.buttons |= 0x100;
+        if (overlay.r2 != 0) data.buttons |= 0x200;
+        automationTouch = (overlay.buttons & 0x100000) != 0;
+    }
 
     const bool live = state.hasMotion && output.motionEnabled;
     const std::array<float, 3> rest{0.0f, 9.80665f, 0.0f};
@@ -153,10 +187,10 @@ PadData Pad::ReadState() {
         }
         ++touchNum;
     }
-    if (touchNum == 0 && (state.touchLeft || state.touchRight)) {
+    if (touchNum == 0 && (state.touchLeft || state.touchRight || automationTouch)) {
         data.buttons |= 0x100000;
         touchNum = 1;
-        data.touch_data_touch0_x = state.touchRight ? 1440 : 480;
+        data.touch_data_touch0_x = state.touchRight ? 1440 : state.touchLeft ? 480 : 960;
         data.touch_data_touch0_y = 471;
         data.touch_data_touch0_id = 0;
     }

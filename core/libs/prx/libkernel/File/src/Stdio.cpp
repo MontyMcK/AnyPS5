@@ -1,3 +1,5 @@
+#include <cstdio>
+#include <atomic>
 #include <algorithm>
 #include <cstdint>
 #include <cstddef>
@@ -123,7 +125,10 @@ static std::int64_t NativePositioned(int descriptor, void* buf, std::size_t nbyt
     }
     if (!ok) {
         if (!write && error == ERROR_HANDLE_EOF) return 0;
-        errno = EIO;
+        // The POSIX errno of the Windows error; logged once per error code.
+        errno = error == ERROR_ACCESS_DENIED ? EBADF : error == ERROR_INVALID_PARAMETER ? EINVAL : error == ERROR_LOCK_VIOLATION ? EAGAIN : error == ERROR_DISK_FULL ? ENOSPC : EIO;
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1) < 16) std::fprintf(stderr, "[file] positioned %s of fd %d (%zu bytes at %lld) failed: Windows error %lu, errno %d\n", write ? "write" : "read", descriptor, nbytes, static_cast<long long>(offset), static_cast<unsigned long>(error), errno);
         return -1;
     }
     return done;
@@ -355,9 +360,7 @@ int64_t APS5_VABI pread_nid_postfix(int d, void* buf, size_t nbytes, int64_t off
     const GuestArena::HostWrite destination(buf, nbytes);
     if (!destination.Open()) errno = EFAULT;
     auto n = destination.Open() ? NativePread(d, buf, nbytes, offset) : -1;
-    if (n < 0) {
-        throw std::runtime_error(std::string(__func__) + ": pread failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
-    }
+    // POSIX: a failed pread returns -1 with errno set; the caller handles it.
     return n;
 }
 

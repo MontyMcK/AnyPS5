@@ -257,7 +257,7 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.bufferWritten);
     writer.Flags(binding.samplerUnnormalized);
     writer.Flags(binding.imageUnnormalized);
-    writer.Values(std::span<const std::uint32_t>(binding.imageSamplers));
+    writer.Values(std::span<const std::uint64_t>(binding.imageSamplers));
 }
 
 void decodeBinding(Reader& reader, DescriptorBinding& binding) {
@@ -915,7 +915,10 @@ DiskStore& store() {
 }
 
 std::uint64_t SourceVersion() {
-    return Generated::SourceVersion;
+    // Switches that change the generated code take part in the version, so each setting keeps its
+    // own entries (APS5_BDA_HINT_FAST, see SpirvBdaRead.cpp).
+    static const std::uint64_t version = (std::getenv("APS5_BDA_HINT_FAST") != nullptr ? Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull : Generated::SourceVersion) ^ (std::getenv("APS5_ELECT_SCALAR_BDA") != nullptr ? 0xc2b2ae3d27d4eb4full : 0ull) ^ (std::getenv("APS5_BDA_INLINE_HIT") != nullptr ? 0x165667b19e3779f9ull : 0ull) ^ (std::getenv("APS5_BDA_VICTIM") != nullptr ? 0x27d4eb2f165667c5ull : 0ull) ^ (std::getenv("APS5_PS_FULL_EXEC") != nullptr ? 0x94d049bb133111ebull : 0ull) ^ (std::getenv("APS5_LANE_BIT_FOLD") != nullptr ? 0xbf58476d1ce4e5b9ull : 0ull) ^ (std::getenv("APS5_BDA_INLINE_ALL") != nullptr ? 0x2545f4914f6cdd1dull : 0ull) ^ (std::getenv("APS5_BDA_CLOCK") != nullptr ? 0x9fb21c651e98df25ull : 0ull) ^ (std::getenv("APS5_SAMPLEID_ZERO") != nullptr ? 0xd6e8feb86659fd93ull : 0ull);
+    return version;
 }
 
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key) {

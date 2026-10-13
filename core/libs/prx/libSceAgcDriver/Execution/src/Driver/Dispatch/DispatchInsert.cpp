@@ -77,7 +77,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
             const auto found = dispatchCache.find(key);
             if (found == dispatchCache.end()) {
                 auto created = std::make_shared<DispatchEntry>();
-                created->touched = dispatchCacheHits;
+                created->touched = ++dispatchCacheClock;
                 accountVariant(*fresh, true);
                 created->variants.push_back(std::move(fresh));
                 dispatchOrder.push_front(key);
@@ -102,7 +102,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                     }
                 }
                 ++entryCounters.variantsInserted;
-                replacement->touched = dispatchCacheHits;
+                replacement->touched = ++dispatchCacheClock;
                 replacement->order = old->order;
                 dispatchOrder.splice(dispatchOrder.begin(), dispatchOrder, replacement->order);
                 found->second = std::move(replacement);

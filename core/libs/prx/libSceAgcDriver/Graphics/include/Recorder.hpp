@@ -277,6 +277,10 @@ public:
     std::optional<PendingWriteInfo> DescribePendingWrite(std::uint64_t address, std::size_t bytes) const;
     // Ends and submits the open batch without waiting.
     void Submit();
+    // Submits the open batch when it holds at least `minWork` commands and the newest submitted
+    // batch has completed, so the GPU does not idle while the committer records (APS5_STARVE_SUBMIT).
+    // Returns whether it submitted. Requires the GPU mutex.
+    bool SubmitIfStarved(std::uint64_t minWork);
     // Submits the open batch and returns the serial of the newest submitted batch (0 when nothing was
     // ever submitted); WaitSerial(serial) then covers all recorded work.
     std::uint64_t SubmitAndEpoch();
@@ -539,6 +543,11 @@ public:
     static bool GpuTimingEnabled();
     static bool BatchStampsEnabled();
     std::uint32_t BeginGpuTiming(std::uint64_t key);
+    // APS5_DEBUG_LABELS: a named debug label around one command (a GPU Trace attributes it alone).
+    static void DebugLabelBegin(const Context& context, VkCommandBuffer commands, const char* name);
+    static void DebugLabelEnd(const Context& context, VkCommandBuffer commands);
+    // APS5_DEBUG_LABELS=2 (flat per-command labels).
+    static bool FlatDebugLabels();
     // `bytes`: what the range moved (a fill's, a copy's), summed per key on the [gputime] line.
     void EndGpuTiming(std::uint32_t index, std::uint64_t bytes = 0);
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
@@ -579,6 +588,9 @@ public:
         bool conservative = false;
         bool ordered = false;
         bool keepBarriers = false;
+        // Reads guest memory it cannot name (an address-based shader): conflicts with every earlier
+        // write to memory and every later one, but not with images (live `lease_reads`).
+        bool readsAnyMemory = false;
     };
     static bool BarrierValidate();
     static bool BarrierTracking();
@@ -716,6 +728,8 @@ private:
             };
             std::vector<Image> images;
             bool unknown = true;
+            // An access since the barrier read memory it could not name (Access::readsAnyMemory).
+            bool readsAnyMemory = false;
             bool pending = false;
             bool elided = false;
             std::uint32_t classes = 0;

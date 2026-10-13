@@ -9,7 +9,7 @@
 
 namespace ShaderRecompiler::RuntimeAbi {
 
-inline constexpr std::uint32_t Version = 11u;
+inline constexpr std::uint32_t Version = 12u;
 inline constexpr std::uint32_t DescriptorSet = 0u;
 inline constexpr std::uint32_t StageCount = 4u;
 inline constexpr std::uint32_t PushConstantDwords = 32u;
@@ -35,10 +35,14 @@ inline constexpr std::uint32_t UserDataCapacity = 128u;
 inline constexpr std::uint32_t BufferCapacity = 128u;
 inline constexpr std::uint32_t ImageCapacity = 256u;
 inline constexpr std::uint32_t SampledHeapCapacity = 64u;
+inline constexpr std::uint32_t BindlessTableSlots = 16u;
+// Keys an enumerated image table (one read through a 64-bit pointer, or a stored-to or
+// data-shared buffer table) can map to its slots.
+inline constexpr std::uint32_t EnumeratedTableKeys = 255u;
 inline constexpr std::uint32_t StorageHeapCapacity = 128u;
 // Mip fields are four bits; heap capacity covers multiple images.
 inline constexpr std::uint32_t StorageMipCapacity = 16u;
-inline constexpr std::uint32_t SamplerHeapCapacity = 32u;
+inline constexpr std::uint32_t SamplerHeapCapacity = 64u;
 
 struct ResourceMetadata {
     std::uint32_t binding;
@@ -76,9 +80,9 @@ inline std::uint32_t HeapCapacity(Binding binding) {
 }
 
 static_assert(std::is_standard_layout_v<ResourceMetadata> && std::is_trivially_copyable_v<ResourceMetadata> && sizeof(ResourceMetadata) == 48u);
-static_assert(std::is_standard_layout_v<ShaderData> && std::is_trivially_copyable_v<ShaderData> && sizeof(ShaderData) == 14528u);
+static_assert(std::is_standard_layout_v<ShaderData> && std::is_trivially_copyable_v<ShaderData> && sizeof(ShaderData) == 16064u);
 static_assert(UserDataDword == 4u && BufferOffsetsDword == 132u && DispatchThreadLimitDword == 164u);
-static_assert(ExportMappingsDword == 3624u);
+static_assert(ExportMappingsDword == 4008u);
 static_assert(offsetof(ResourceMetadata, descriptor) == 16u && offsetof(ShaderData, images) == 672u && offsetof(ShaderData, samplers) == 12960u);
 
 inline void RequireVersion(std::uint32_t version) {

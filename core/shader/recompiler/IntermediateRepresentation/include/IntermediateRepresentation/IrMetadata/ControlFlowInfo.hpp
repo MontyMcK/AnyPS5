@@ -32,8 +32,15 @@ struct DescriptorSource {
         std::uint32_t keyArg = 0;
         std::uint32_t entryOffset = 0;
         std::uint32_t entryStride = 32;
+        // With `address` the table is read by s_load through a 64-bit pointer: `heapSource` is
+        // that 2-dword address and `maxKey` the largest key the key's known bits allow.
+        std::uint32_t maxKey = 0xffffffffu;
         bool hasMaterial = false;
         bool chain = false;
+        bool address = false;
+        // Resolved by reading every reachable key and binding the distinct descriptors (several
+        // keys may share a slot) instead of binding the whole table by key.
+        bool enumerated = false;
 
         bool operator==(const IndirectImage& other) const = default;
     };

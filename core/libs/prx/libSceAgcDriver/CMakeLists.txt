@@ -72,10 +72,26 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcFloat11RepackShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/Float11Repack.comp)
+set(agcFloat11RepackShaderSpv ${agcTextureDetileGeneratedDir}/Float11Repack.spv)
+set(agcFloat11RepackShaderHeader ${agcTextureDetileGeneratedDir}/Float11Repack_spv.h)
+add_custom_command(
+        OUTPUT "${agcFloat11RepackShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcFloat11RepackShaderSpv}" "${agcFloat11RepackShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcFloat11RepackShaderSpv} -DOUTPUT=${agcFloat11RepackShaderHeader}
+        -DSYMBOL=FLOAT11_REPACK_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcFloat11RepackShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastEmutls.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Sampler.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastHeap.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/DeviceAccess.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Diagnostics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DataHitVerification.cpp
@@ -94,6 +110,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawDecode.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawLookup.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPipeline.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/ReplayProbe.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPrecheck.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRegisterKey.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawTiming.cpp
@@ -143,6 +160,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/NvPerfRanges.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderAddressResources.cpp
@@ -157,12 +175,14 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DccMetadata.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureTiling.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/TextureDetiler.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeferredVulkan.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Texture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${agcTextureDetileShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         ${agcSampleCounterShaderHeader}
+        ${agcFloat11RepackShaderHeader}
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Query.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Resource/src/Lifecycle.cpp
@@ -177,6 +197,9 @@ set(agcDriverSources
 add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL
         ${agcDriverSources}
 )
+# FastEmutls.cpp defines __emutls_get_address for this module only; exporting it would make every
+# module linked against this one import it from here (and fail to load: the prx export table drops it).
+target_link_options(libSceAgcDriver PRIVATE -Wl,--exclude-symbols,__emutls_get_address)
 
 target_include_directories(libSceAgcDriver PRIVATE
         ${LIBS_INCLUDE_DIR}
@@ -184,6 +207,17 @@ target_include_directories(libSceAgcDriver PRIVATE
         ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include
         ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Headers/include
 )
+# Local profiling aid: -DAPS5_NVPERF_SDK=<Nsight Perf SDK dir> builds the in-app range profiler
+# (Graphics/src/NvPerfRanges.cpp); without it the profiler calls do nothing.
+set(APS5_NVPERF_SDK "" CACHE PATH "Nsight Perf SDK directory for the local range profiler")
+if(APS5_NVPERF_SDK)
+    target_include_directories(libSceAgcDriver PRIVATE
+            ${APS5_NVPERF_SDK}/redist/include
+            ${APS5_NVPERF_SDK}/redist/include/windows-desktop-x64
+            ${APS5_NVPERF_SDK}/redist/NvPerfUtility/include
+    )
+    target_compile_definitions(libSceAgcDriver PRIVATE APS5_HAVE_NVPERF=1)
+endif()
 
 file(GLOB_RECURSE agcShaderCacheGuardSources CONFIGURE_DEPENDS RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}"
         "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp"
@@ -556,14 +590,17 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/DccMetadata.cpp
         Graphics/src/TextureTiling.cpp
         Graphics/src/TextureDetiler.cpp
+        Graphics/src/DeferredVulkan.cpp
         Graphics/src/Texture.cpp
         Graphics/src/UnitShadow.cpp
         Graphics/src/Sampler.cpp
         Graphics/src/Recorder.cpp
+        Graphics/src/NvPerfRanges.cpp
         Graphics/src/ShaderInputState.cpp
         ${agcTextureDetileShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         ${agcSampleCounterShaderHeader}
+        ${agcFloat11RepackShaderHeader}
         Execution/src/GuestMemory.cpp
         Execution/src/Pm4.cpp
 )
@@ -781,6 +818,7 @@ if(AGC_BUILD_VISUAL_TEST)
             Graphics/src/DccMetadata.cpp
             Graphics/src/TextureTiling.cpp
             Graphics/src/TextureDetiler.cpp
+            Graphics/src/DeferredVulkan.cpp
             Graphics/src/Texture.cpp
             Graphics/src/UnitShadow.cpp
             Graphics/src/Sampler.cpp

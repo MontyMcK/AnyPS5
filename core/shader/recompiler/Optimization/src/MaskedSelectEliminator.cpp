@@ -5,6 +5,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <cstdlib>
 #include <vector>
 
 namespace ShaderRecompiler {
@@ -257,16 +258,72 @@ std::optional<ThreadBit> threadBit(const IrValue* value, std::uint32_t waveSize)
     return ThreadBit{word->Argument(1)->Resolve(), word->Argument(2)->Resolve()};
 }
 
-bool alwaysTrue(const IrValue* value, std::uint32_t waveSize, std::uint32_t depth = 0) {
+bool alwaysTrue(const IrValue* value, std::uint32_t waveSize, std::uint32_t depth = 0);
+
+// Whether the reading lane's own bit is set in `word`, half `half` of a mask: an all-ones word, a
+// word of a ballot of a condition true in every lane that runs (the lane's own vote), or an and/or
+// of such words.
+bool ownBitAlwaysSet(const IrValue* word, std::uint32_t half, std::uint32_t waveSize, std::uint32_t depth) {
+    word = word->Resolve();
+    if (isImmediate(word, 0xffffffffu)) return true;
+    if (depth > DepthLimit) return false;
+    if (word->Opcode() == IrOpcode::CompositeExtractU32x4 && isImmediate(word->Argument(1)->Resolve(), half)) {
+        const IrValue* ballot = word->Argument(0)->Resolve();
+        return ballot->Opcode() == IrOpcode::Ballot && alwaysTrue(ballot->Argument(0), waveSize, depth + 1u);
+    }
+    if (word->Opcode() == IrOpcode::BitwiseAnd32) return ownBitAlwaysSet(word->Argument(0), half, waveSize, depth + 1u) && ownBitAlwaysSet(word->Argument(1), half, waveSize, depth + 1u);
+    if (word->Opcode() == IrOpcode::BitwiseOr32) return ownBitAlwaysSet(word->Argument(0), half, waveSize, depth + 1u) || ownBitAlwaysSet(word->Argument(1), half, waveSize, depth + 1u);
+    return false;
+}
+
+bool alwaysTrue(const IrValue* value, std::uint32_t waveSize, std::uint32_t depth) {
     value = value->Resolve();
     if (value->HasImmediate()) return value->Type() == IrType::Bool && value->ImmediateBool();
     if (depth > DepthLimit) return false;
     if (value->Opcode() == IrOpcode::LogicalAnd) return alwaysTrue(value->Argument(0), waveSize, depth + 1u) && alwaysTrue(value->Argument(1), waveSize, depth + 1u);
     const auto bit = threadBit(value, waveSize);
-    return bit && isImmediate(bit->low, 0xffffffffu) && isImmediate(bit->high, 0xffffffffu);
+    if (!bit) return false;
+    if (isImmediate(bit->low, 0xffffffffu) && isImmediate(bit->high, 0xffffffffu)) return true;
+    return ownBitAlwaysSet(bit->low, 0u, waveSize, depth + 1u) && (waveSize == 32u || ownBitAlwaysSet(bit->high, 1u, waveSize, depth + 1u));
 }
 
 bool implies(const IrValue* condition, const IrValue* mask, std::uint32_t waveSize, std::uint32_t depth = 0);
+
+// The lane's own bit of a mask whose halves are and-trees of ballots (half 0 of each ballot in the
+// low word, half 1 in the high one) and all-ones words: the one ballot condition that is not true in
+// every running lane, or null when there are several or another kind of word. A lane's own vote in
+// a ballot is the condition it voted with.
+bool collectBallots(const IrValue* word, std::uint32_t half, std::uint32_t waveSize, std::vector<const IrValue*>& ballots, std::uint32_t depth) {
+    word = word->Resolve();
+    if (isImmediate(word, 0xffffffffu)) return true;
+    if (depth > DepthLimit) return false;
+    if (word->Opcode() == IrOpcode::CompositeExtractU32x4 && isImmediate(word->Argument(1)->Resolve(), half)) {
+        const IrValue* ballot = word->Argument(0)->Resolve();
+        if (ballot->Opcode() != IrOpcode::Ballot) return false;
+        if (!alwaysTrue(ballot->Argument(0), waveSize, depth + 1u)) ballots.push_back(ballot);
+        return true;
+    }
+    if (word->Opcode() == IrOpcode::BitwiseAnd32) return collectBallots(word->Argument(0), half, waveSize, ballots, depth + 1u) && collectBallots(word->Argument(1), half, waveSize, ballots, depth + 1u);
+    return false;
+}
+
+IrValue* ownBitCondition(const IrValue* value, std::uint32_t waveSize) {
+    // A wave64 program on 32-lane hosts runs its two halves split, where a ballot word is not the
+    // reading lane's own vote: only native wave32 programs fold (rendering broke otherwise).
+    if (waveSize != 32u) return nullptr;
+    const auto bit = threadBit(value, waveSize);
+    if (!bit) return nullptr;
+    std::vector<const IrValue*> low, high;
+    if (!collectBallots(bit->low, 0u, waveSize, low, 0u)) return nullptr;
+    if (waveSize == 64u && !collectBallots(bit->high, 1u, waveSize, high, 0u)) return nullptr;
+    if (low.size() != 1u || (waveSize == 64u && (high.size() != 1u || high.front() != low.front()))) return nullptr;
+    return low.front()->Argument(0)->Resolve();
+}
+
+bool LaneBitFold() {
+    static const bool enabled = std::getenv("APS5_LANE_BIT_FOLD") != nullptr;
+    return enabled;
+}
 
 bool wordsImply(const IrValue* low, const IrValue* high, const IrValue* mask, std::uint32_t waveSize, std::uint32_t depth) {
     if (depth > DepthLimit) return false;
@@ -375,6 +432,15 @@ MaskedSelectEliminationStats MaskedSelectEliminator::Eliminate(IrProgram& progra
             while (it != instructions.begin()) {
                 --it;
                 IrValue* inst = *it;
+                // APS5_LANE_BIT_FOLD: a lane's bit of a ballot-built mask is the condition it voted.
+                if (LaneBitFold() && inst->Opcode() == IrOpcode::INotEqual32 && inst->HasUses()) {
+                    if (IrValue* condition = ownBitCondition(inst, program.WaveSize()); condition != nullptr && condition->Type() == inst->Type()) {
+                        inst->ReplaceAllUsesWith(condition);
+                        ++stats.foldedLaneBits;
+                        changed = true;
+                        continue;
+                    }
+                }
                 if (!isSelect(inst->Opcode()) || inst->ArgumentCount() != 3u || !inst->HasUses()) continue;
                 const IrValue* mask = inst->Argument(0)->Resolve();
                 if (!alwaysTrue(mask, program.WaveSize()) && (!single || !unobservedWhereMasked(program, once, *inst, mask))) continue;

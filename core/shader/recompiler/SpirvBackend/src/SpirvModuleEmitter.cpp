@@ -330,9 +330,32 @@ void EmitAuxPositionExport(SpirvValueEmitContext& ctx, std::uint32_t data, const
         if (output.layer || output.viewport) {
             const auto raw = ExportRawComponent(ctx, data, component);
             if (output.layer) {
-                const auto layer = state.module.AllocateId();
+                auto layer = state.module.AllocateId();
                 state.module.AddFunction(spv::OpBitwiseAnd, TypeU32(state), layer, raw, ConstantU32(state, 0x7ffu));
-                const auto pointer = state.program.Resources().stage == IrShaderStage::Mesh ? MeshOutputPointer(state, StageOutputKind::Layer) : state.layerVariable;
+                const bool mesh = state.program.Resources().stage == IrShaderStage::Mesh;
+                if (!mesh && state.pushConstantVariable != 0) {
+                    // The hardware clamps the layer to the view's last slice (LayerLimitPushDword).
+                    const auto limitPointer = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), limitPointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, LayerLimitPushDword));
+                    const auto limit = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpLoad, TypeU32(state), limit, limitPointer);
+                    const auto clamped = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpExtInst, TypeU32(state), clamped, GlslStd450(state), GLSLstd450UMin, layer, limit);
+                    layer = clamped;
+                }
+                if (mesh) {
+                    // The hardware clamps the layer to the view's last slice (MeshLayerLimitDword).
+                    const auto limitPointer = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), limitPointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, MeshDrawPushOffsetBytes / 4u + MeshLayerLimitDword));
+                    const auto limit = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpLoad, TypeU32(state), limit, limitPointer);
+                    const auto above = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpUGreaterThan, TypeBool(state), above, layer, limit);
+                    const auto clamped = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpSelect, TypeU32(state), clamped, above, limit, layer);
+                    layer = clamped;
+                }
+                const auto pointer = mesh ? MeshOutputPointer(state, StageOutputKind::Layer) : state.layerVariable;
                 state.module.AddFunction(spv::OpStore, pointer, layer);
             }
             if (output.viewport) {
@@ -439,12 +462,17 @@ std::uint32_t TessellationPointer(SpirvValueEmitContext& ctx, const IrValue& ins
         if (!inst.Argument(1)->HasImmediate()) {
             throw std::runtime_error("tessellation factor index must be immediate");
         }
+        // The factor ring holds the outer factors then the inner ones: four and two for quads,
+        // three and one for triangles, two for isolines (in the reverse of the Vulkan order).
         const auto index = inst.Argument(1)->ImmediateU32() / 4u;
-        const bool outer = index < 3u;
-        if (index >= 4u) {
+        const auto outerCount = tess.domain == 2u ? 4u : tess.domain == 1u ? 3u : 2u;
+        const auto innerCount = tess.domain == 2u ? 2u : tess.domain == 1u ? 1u : 0u;
+        const bool outer = index < outerCount;
+        if (index >= outerCount + innerCount) {
             throw std::runtime_error("tessellation factor index out of range");
         }
-        state.module.AddFunction(spv::OpAccessChain, TypePointer(state, storage, TypeF32(state)), pointer, outer ? variable : state.tessInnerVariable, ConstantU32(state, outer ? index : index - 3u));
+        const auto element = outer ? (tess.domain == 0u ? 1u - index : index) : index - outerCount;
+        state.module.AddFunction(spv::OpAccessChain, TypePointer(state, storage, TypeF32(state)), pointer, outer ? variable : state.tessInnerVariable, ConstantU32(state, element));
         return pointer;
     }
     auto address = ctx.Arg(inst, 1);
@@ -452,15 +480,37 @@ std::uint32_t TessellationPointer(SpirvValueEmitContext& ctx, const IrValue& ins
         address = EmitBinaryU32(state, spv::OpISub, address, ConstantU32(state, state.tessPatchBase));
     }
     const bool local = kind == TessellationAttribute::LocalOutput || kind == TessellationAttribute::ControlInput;
-    const auto stride = local ? tess.lsStride : tess.hsStride;
+    const auto stride = local ? state.program.Metadata().tessellationLocalStride : state.program.Metadata().tessellationControlStride;
+    const auto type = TypePointer(state, storage, TypeU32(state));
+    // A hull's input control-point index can be computed from data (TessellationLowering): it is kept
+    // inside the patch.
+    const auto inPatch = [&](std::uint32_t vertex) {
+        if (kind != TessellationAttribute::ControlInput) return vertex;
+        const auto clamped = state.module.AllocateId();
+        state.module.AddFunction(spv::OpExtInst, TypeU32(state), clamped, GlslStd450(state), GLSLstd450UMin, vertex, ConstantU32(state, tess.inputControlPoints - 1u));
+        return clamped;
+    };
+    const auto* sum = inst.Argument(1);
+    const auto* scaled = sum->Opcode() == IrOpcode::IAdd32 ? sum->Argument(0) : nullptr;
+    if (kind == TessellationAttribute::ControlInput && scaled != nullptr && sum->Argument(1)->HasImmediate() && scaled->Opcode() == IrOpcode::IMul32 && scaled->Argument(1)->HasImmediate() && scaled->Argument(1)->ImmediateU32() == stride) {
+        // The constant can reach past the invocation's own slot (gl_in[inv + 1]): the attribute and
+        // component come from its offset in the slot it lands in, as in the general path below.
+        const auto constant = sum->Argument(1)->ImmediateU32();
+        const auto inSlot = constant % stride;
+        const auto vertex = inPatch(EmitBinaryU32(state, spv::OpIAdd, ctx.Arg(*scaled, 0), ConstantU32(state, constant / stride)));
+        state.module.AddFunction(spv::OpAccessChain, type, pointer, variable, vertex, ConstantU32(state, inSlot / 16u), ConstantU32(state, inSlot % 16u / 4u));
+        return pointer;
+    }
     const auto offset = kind == TessellationAttribute::PatchOutput ? address : EmitBinaryU32(state, spv::OpUMod, address, ConstantU32(state, stride));
     const auto attribute = EmitBinaryU32(state, spv::OpShiftRightLogical, offset, ConstantU32(state, 4u));
     const auto component = EmitBinaryU32(state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, offset, ConstantU32(state, 2u)), ConstantU32(state, 3u));
-    const auto type = TypePointer(state, storage, TypeU32(state));
     if (kind == TessellationAttribute::LocalOutput || kind == TessellationAttribute::PatchOutput) {
         state.module.AddFunction(spv::OpAccessChain, type, pointer, variable, attribute, component);
     } else {
-        const auto vertex = kind == TessellationAttribute::ControlOutput ? EmitLaneId(state) : EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
+        // An invocation writes its own control point; reads (hull inputs, the hull reading back its
+        // patch's control points, domain inputs) index the patch's control points by address.
+        const bool own = kind == TessellationAttribute::ControlOutput && inst.Opcode() == IrOpcode::SetTessellationAttribute;
+        const auto vertex = own ? EmitLaneId(state) : inPatch(EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride)));
         state.module.AddFunction(spv::OpAccessChain, type, pointer, variable, vertex, attribute, component);
     }
     return pointer;
@@ -510,7 +560,7 @@ void DefineTessellationInterfaces(SpirvEmitterState& state) {
             type = array(TypeU32Vector(state, 4u), (patchEnd - patchBegin + 15u) / 16u);
         } else {
             const bool local = kind == TessellationAttribute::LocalOutput || kind == TessellationAttribute::ControlInput;
-            const auto stride = local ? tess.lsStride : tess.hsStride;
+            const auto stride = local ? state.program.Metadata().tessellationLocalStride : state.program.Metadata().tessellationControlStride;
             type = array(TypeU32Vector(state, 4u), (stride + 15u) / 16u);
             if (kind != TessellationAttribute::LocalOutput) {
                 type = array(type, local ? tess.inputControlPoints : tess.outputControlPoints);
@@ -524,7 +574,7 @@ void DefineTessellationInterfaces(SpirvEmitterState& state) {
             state.module.AddAnnotation(spv::OpDecorate, state.tessInnerVariable, spv::DecorationBuiltIn, spv::BuiltInTessLevelInner);
             state.module.AddAnnotation(spv::OpDecorate, state.tessInnerVariable, spv::DecorationPatch);
         } else {
-            state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationLocation, kind == TessellationAttribute::PatchOutput ? (tess.hsStride + 15u) / 16u : 0u);
+            state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationLocation, kind == TessellationAttribute::PatchOutput ? (state.program.Metadata().tessellationControlStride + 15u) / 16u : 0u);
         }
         if (kind == TessellationAttribute::Factor || kind == TessellationAttribute::PatchOutput) {
             state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationPatch);
@@ -534,16 +584,20 @@ void DefineTessellationInterfaces(SpirvEmitterState& state) {
 
 void DefineTessellationExecutionModes(SpirvEmitterState& state) {
     const auto& tess = state.inputInfo.vertex->tess;
-    if (tess.domain != 1u || tess.partitioning != 2u || tess.outputTopology != 2u) {
+    // VGT_TF_PARAM: domain 0 isoline, 1 triangle, 2 quad; partitioning 0 integer, 1 power of two
+    // (spaced as integer), 2 fractional odd, 3 fractional even; topology 0 point, 1 line, 2
+    // clockwise triangle, 3 counter-clockwise triangle.
+    if (tess.domain > 2u || tess.partitioning > 3u || tess.outputTopology > 3u || (tess.outputTopology == 1u) != (tess.domain == 0u && tess.outputTopology != 0u)) {
         throw std::runtime_error("unsupported tessellation domain, partitioning, or output topology");
     }
     state.module.EmitCapability(spv::CapabilityTessellation);
     if (state.program.Resources().stage == IrShaderStage::TessellationControl) {
         state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeOutputVertices, tess.outputControlPoints);
     } else {
-        state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeTriangles);
-        state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeSpacingFractionalOdd);
-        state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeVertexOrderCw);
+        state.module.AddExecutionMode(state.mainFunc, tess.domain == 2u ? spv::ExecutionModeQuads : tess.domain == 1u ? spv::ExecutionModeTriangles : spv::ExecutionModeIsolines);
+        state.module.AddExecutionMode(state.mainFunc, tess.partitioning == 2u ? spv::ExecutionModeSpacingFractionalOdd : tess.partitioning == 3u ? spv::ExecutionModeSpacingFractionalEven : spv::ExecutionModeSpacingEqual);
+        if (tess.outputTopology == 0u) state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModePointMode);
+        else if (tess.domain != 0u) state.module.AddExecutionMode(state.mainFunc, tess.outputTopology == 3u ? spv::ExecutionModeVertexOrderCcw : spv::ExecutionModeVertexOrderCw);
     }
 }
 
@@ -652,7 +706,15 @@ void EmitMeshEntryPoint(SpirvEmitterState& state) {
                 if (output.kind != StageOutputKind::Layer) {
                     continue;
                 }
-                const auto layer = MeshLoad(state, output.meshDataVariable, spv::StorageClassWorkgroup, TypeU32(state), vertex.at(state.inputInfo.vertex->mesh.provokingVertex));
+                const auto loaded = MeshLoad(state, output.meshDataVariable, spv::StorageClassWorkgroup, TypeU32(state), vertex.at(state.inputInfo.vertex->mesh.provokingVertex));
+                // Clamped to the framebuffer's last layer as the hardware clamps to SLICE_MAX: the
+                // shared slot may also never have been written (workgroup memory starts undefined).
+                const auto limitPointer = state.module.AllocateId();
+                state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), limitPointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, MeshDrawPushOffsetBytes / 4u + MeshLayerLimitDword));
+                const auto limit = state.module.AllocateId();
+                state.module.AddFunction(spv::OpLoad, TypeU32(state), limit, limitPointer);
+                const auto layer = state.module.AllocateId();
+                state.module.AddFunction(spv::OpExtInst, TypeU32(state), layer, GlslStd450(state), GLSLstd450UMin, loaded, limit);
                 const auto pointer = MeshElement(state, output.variableId, spv::StorageClassOutput, TypeU32(state), index);
                 state.module.AddFunction(spv::OpStore, pointer, layer);
             }
@@ -961,6 +1023,7 @@ void EmitProgram(SpirvEmitterState& state) {
     if (state.pixelValidMaskVariable != 0u) {
         state.module.AddFunction(spv::OpStore, state.pixelValidMaskVariable, ConstantU32(state, 1u));
     }
+    EmitBdaClockEntry(state);
     if (OrderedPixelShader(state)) {
         state.module.AddFunction(spv::OpBeginInvocationInterlockEXT);
     }
@@ -1078,9 +1141,21 @@ void EmitSetTessellationAttribute(SpirvValueEmitContext& ctx, const IrValue& ins
     EmitIfCondition(ctx.state, ctx.Arg(inst, 3), [&]() {
         auto value = ctx.Arg(inst, 2);
         if (inst.Argument(0)->ImmediateU32() == static_cast<std::uint32_t>(TessellationAttribute::Factor)) {
-            const auto floating = ctx.state.module.AllocateId();
-            ctx.state.module.AddFunction(spv::OpBitcast, TypeF32(ctx.state), floating, value);
-            value = floating;
+            // Fractional-odd levels: an outer factor above 0 and an inner one above 1 clamp to 63; an
+            // outer factor not above 0 culls the patch and an inner one not above 1 (or NaN) is 1.
+            auto& state = ctx.state;
+            const auto& tess = state.inputInfo.vertex->tess;
+            const auto outerCount = tess.domain == 2u ? 4u : tess.domain == 1u ? 3u : 2u;
+            const bool outer = inst.Argument(1)->HasImmediate() && inst.Argument(1)->ImmediateU32() / 4u < outerCount;
+            const auto floating = state.module.AllocateId();
+            state.module.AddFunction(spv::OpBitcast, TypeF32(state), floating, value);
+            const auto lower = ConstantF32Value(state, outer ? 0.0f : 1.0f);
+            const auto inside = state.module.AllocateId();
+            state.module.AddFunction(spv::OpFOrdGreaterThan, TypeBool(state), inside, floating, lower);
+            const auto clamped = state.module.AllocateId();
+            state.module.AddFunction(spv::OpExtInst, TypeF32(state), clamped, GlslStd450(state), GLSLstd450FMin, floating, ConstantF32Value(state, 63.0f));
+            value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpSelect, TypeF32(state), value, inside, clamped, outer ? floating : lower);
         }
         ctx.state.module.AddFunction(spv::OpStore, TessellationPointer(ctx, inst), value);
     });

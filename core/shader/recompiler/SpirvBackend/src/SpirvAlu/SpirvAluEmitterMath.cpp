@@ -736,8 +736,18 @@ std::uint32_t EmitWqmU64(SpirvEmitterState& state, std::uint32_t value) {
     return result;
 }
 
+// A hull's lane index is its control point (gl_InvocationID), which its lane guard against the
+// output control-point count and its own control-point store expect. On the console patches can
+// share a wave, so a hull that uses v_mbcnt as data (a compaction index) sees another value there.
 std::uint32_t EmitLaneId(SpirvEmitterState& state) {
-    return state.program.Resources().stage == IrShaderStage::TessellationControl ? EmitInputComponentU32(state, StageInputKind::InvocationId, 0) : EmitSubgroupLocalInvocationId(state);
+    if (state.program.Resources().stage != IrShaderStage::TessellationControl) return EmitSubgroupLocalInvocationId(state);
+    const auto variable = InputVariableForKind(state, StageInputKind::InvocationId);
+    if (variable == 0) FailEmit("stage input InvocationId was not declared");
+    const auto value = state.module.AllocateId();
+    const auto bits = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, TypeI32(state), value, variable);
+    state.module.AddFunction(spv::OpBitcast, TypeU32(state), bits, value);
+    return bits;
 }
 
 std::uint32_t EmitBallot(SpirvValueEmitContext& ctx, const IrValue* predicate) {

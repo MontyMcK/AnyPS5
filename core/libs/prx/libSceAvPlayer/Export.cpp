@@ -6,6 +6,7 @@
 #include <string_view>
 #include "SceTypes.hpp"
 #include "prx/libSceAvPlayer/include/AvPlayer.hpp"
+#include "prx/libkernel/Automation/include/Automation.hpp"
 
 using namespace AvPlayer;
 
@@ -26,11 +27,13 @@ extern "C" {
 
 int APS5_VABI sceAvPlayerAddSource(AvPlayerInternal* h, const char* filename) {
     if (!h || !filename) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
+    if (Automation::Enabled()) Automation::Fields().Str("path", filename).Emit("movie");
     return ToPlayer(h)->AddSource(filename, SourceTypeUnknown);
 }
 
 int APS5_VABI sceAvPlayerAddSourceEx(AvPlayerInternal* h, uint32_t uri_type, const AvPlayerSourceDetails* source_details) {
     if (!h || uri_type != 0 || !source_details || !source_details->uri.name) return SCE_AVPLAYER_ERROR_INVALID_PARAMS;
+    if (Automation::Enabled()) Automation::Fields().Str("path", std::string_view(source_details->uri.name, source_details->uri.length)).Emit("movie");
     return ToPlayer(h)->AddSource(std::string_view(source_details->uri.name, source_details->uri.length), source_details->source_type);
 }
 

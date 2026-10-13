@@ -150,8 +150,54 @@ bool BdaByteReadsForced() {
 }
 
 bool BdaHintFastPath() {
-    static const bool enabled = std::getenv("APS5_NO_BDA_HINT_FAST") == nullptr;
+    static const bool enabled = std::getenv("APS5_BDA_HINT_FAST") != nullptr;
     return enabled;
+}
+
+// APS5_ELECT_SCALAR_BDA=1: a read a scalar memory instruction made (s_load, s_buffer_load: its address
+// comes from scalar registers, one value for the whole wave) probes the table in one elected lane of
+// the subgroup, and the device address it found is broadcast to the others, instead of every lane
+// repeating the same lookup. Part of the shader disk cache version (ShaderDiskCache.cpp).
+bool ElectScalarBdaReads() {
+    static const bool enabled = std::getenv("APS5_ELECT_SCALAR_BDA") != nullptr;
+    return enabled;
+}
+
+bool ScalarBdaAccess(const IrProgram& program, const IrValue& inst) {
+    const auto index = inst.Flags<MemoryFlags>().index;
+    const auto& memory = program.Resources().memoryInfo;
+    return index < memory.size() && (memory[index].kind == ResourceKind::ScalarAddress || memory[index].kind == ResourceKind::ScalarBuffer);
+}
+
+namespace {
+
+// `probe` run by the subgroup's elected lane; every lane receives its 64-bit result.
+std::uint32_t EmitElectedU64(SpirvEmitterState& state, const std::function<std::uint32_t()>& probe) {
+    const auto u64 = TypeScalarU64(state);
+    const auto pair = TypeU32Vector(state, 2);
+    const auto elected = state.module.AllocateId();
+    state.module.AddFunction(spv::OpGroupNonUniformElect, TypeBool(state), elected, ConstantU32(state, spv::ScopeSubgroup));
+    const auto before = state.currentLabel;
+    const auto electedLabel = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, elected, electedLabel, merge);
+    EmitLabel(state, electedLabel);
+    const auto probed = probe();
+    const auto electedExit = state.currentLabel;
+    state.module.AddFunction(spv::OpBranch, merge);
+    EmitLabel(state, merge);
+    const auto value = state.module.AllocateId();
+    state.module.AddFunction(spv::OpPhi, u64, value, probed, electedExit, BdaConstant(state, 0u), before);
+    const auto halves = state.module.AllocateId();
+    state.module.AddFunction(spv::OpBitcast, pair, halves, value);
+    const auto shared = state.module.AllocateId();
+    state.module.AddFunction(spv::OpGroupNonUniformBroadcastFirst, pair, shared, ConstantU32(state, spv::ScopeSubgroup), halves);
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpBitcast, u64, result, shared);
+    return result;
+}
+
 }
 
 std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, bool subtract) {
@@ -329,8 +375,13 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
         readBytes(values);
         return values;
     }
-    const auto physical = state.module.AllocateId();
-    state.module.AddFunction(spv::OpFunctionCall, u64, physical, state.bdaProbeFunction, addresses[first], ConstantU32(state, (last - first + 1u) * 4u), instruction);
+    const auto probeSpan = [&] {
+        return EmitBdaLookupCall(state, state.bdaProbeFunction, addresses[first], ConstantU32(state, (last - first + 1u) * 4u), instruction, BdaAbi::Read);
+    };
+    // The probe records no fault, so the elected lane's answer is every lane's: a span it refuses
+    // takes the byte path below in each lane, which records the faults as before.
+    const bool elect = ElectScalarBdaReads() && state.requirements.subgroupBallot && ScalarBdaAccess(state.program, inst);
+    const auto physical = elect ? EmitElectedU64(state, probeSpan) : probeSpan();
     const auto mapped = Binary(state, spv::OpINotEqual, TypeBool(state), physical, BdaConstant(state, 0u));
     const auto aligned = Binary(state, spv::OpIEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, u64, physical, BdaConstant(state, 3u)), BdaConstant(state, 0u));
     const auto wide = Binary(state, spv::OpLogicalAnd, TypeBool(state), mapped, aligned);

@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
@@ -234,6 +235,25 @@ BdaResources::BdaResources(const Context& context) : device(context.device) {
 }
 
 BdaResources::~BdaResources() {
+    // APS5_BDA_CLOCK=1: the shaders' lookup and invocation cycles (BdaAbi::ClockLookupWord), summed
+    // as the buffers are released (after the work that used them) and reported every 5 s.
+    static const bool clock = std::getenv("APS5_BDA_CLOCK") != nullptr;
+    if (clock && fault != nullptr) {
+        namespace Abi = ShaderRecompiler::BdaAbi;
+        static std::atomic<std::uint64_t> lookup{0}, total{0}, calls{0};
+        static std::atomic<std::int64_t> reportAt{0};
+        auto* words = reinterpret_cast<std::uint32_t*>(fault->Bytes().data());
+        lookup.fetch_add(words[Abi::ClockLookupWord], std::memory_order_relaxed);
+        total.fetch_add(words[Abi::ClockTotalWord], std::memory_order_relaxed);
+        calls.fetch_add(words[Abi::ClockCallsWord], std::memory_order_relaxed);
+        words[Abi::ClockLookupWord] = words[Abi::ClockTotalWord] = words[Abi::ClockCallsWord] = 0;
+        const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto due = reportAt.load(std::memory_order_relaxed);
+        if (now >= due && reportAt.compare_exchange_strong(due, now + 5'000'000'000ll)) {
+            const auto l = lookup.exchange(0), t = total.exchange(0), c = calls.exchange(0);
+            std::fprintf(stderr, "[bda-clock] lookup %.1f%% of subgroup cycles (%llu of %llu x64), %llu lookups\n", t != 0 ? 100.0 * static_cast<double>(l) / static_cast<double>(t) : 0.0, static_cast<unsigned long long>(l), static_cast<unsigned long long>(t), static_cast<unsigned long long>(c));
+        }
+    }
     if (fault == nullptr || !FaultBufferPoolEnabled() || (mayWrite && !checked)) return;
     const auto* words = reinterpret_cast<const std::uint32_t*>(fault->Bytes().data());
     if (words[0] != 0 || words[ShaderRecompiler::BdaAbi::WrittenOverflowWord] != 0) return;
@@ -254,9 +274,28 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     if (!cached.has_value()) built = memory.AddressRanges();
     const auto& ranges = cached.has_value() ? *cached->ranges : built;
     const auto serial = cached.has_value() ? cached->serial : 0;
+    // The GPU table joins neighbours that continue each other on the device as well (same delta,
+    // permissions and flags): one entry then covers what the shader's one-range lookup cache would
+    // otherwise miss on at each boundary. The table caches still compare the unjoined ranges.
+    std::vector<ShaderRecompiler::BdaAbi::Range> joined;
+    static const bool joining = std::getenv("APS5_NO_BDA_MERGE") == nullptr;
+    if (joining) {
+        joined.reserve(ranges.size());
+        for (const auto& range : ranges) {
+            if (!joined.empty()) {
+                auto& last = joined.back();
+                if (last.end == range.begin && last.permissions == range.permissions && last.reserved == range.reserved && range.deviceAddress - last.deviceAddress == range.begin - last.begin) {
+                    last.end = range.end;
+                    continue;
+                }
+            }
+            joined.push_back(range);
+        }
+    }
+    const auto& tableRanges = joining ? joined : ranges;
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
-    tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range) + bucketBytes(ranges);
+    tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + tableRanges.size() * sizeof(ShaderRecompiler::BdaAbi::Range) + bucketBytes(tableRanges);
     Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
     auto& cache = Tables();
     std::uint64_t hash = 0;
@@ -313,7 +352,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             ++it;
         }
     }
-    const auto buckets = buildBuckets(ranges);
+    const auto buckets = buildBuckets(tableRanges);
     static std::atomic<int> tablesLogged{0};
     if (std::getenv("APS5_TRACE_BDA_TABLES") != nullptr && tablesLogged.fetch_add(1, std::memory_order_relaxed) < 40) {
         std::uint64_t largest = 0, total = 0;
@@ -321,14 +360,22 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             largest = std::max(largest, range.end - range.begin);
             total += range.end - range.begin;
         }
-        std::fprintf(stderr, "[bda-table] built %zu ranges, %llu MiB in total, largest %llu MiB\n", ranges.size(), static_cast<unsigned long long>(total >> 20u), static_cast<unsigned long long>(largest >> 20u));
+        std::size_t contiguous = 0, sameDeltaGaps = 0;
+        for (std::size_t i = 1; i < ranges.size(); ++i) {
+            const auto& a = ranges[i - 1];
+            const auto& b = ranges[i];
+            const bool consistent = b.deviceAddress - a.deviceAddress == b.begin - a.begin && a.permissions == b.permissions && a.reserved == b.reserved;
+            if (consistent && a.end == b.begin) ++contiguous;
+            else if (consistent && a.end < b.begin) ++sameDeltaGaps;
+        }
+        std::fprintf(stderr, "[bda-table] %zu joined entries from %zu ranges, %llu MiB in total, largest %llu MiB; %zu adjacent pairs contiguous on the device, %zu more with a gap but the same delta\n", tableRanges.size(), ranges.size(), static_cast<unsigned long long>(total >> 20u), static_cast<unsigned long long>(largest >> 20u), contiguous, sameDeltaGaps);
     }
     table = makeTableBuffer(context, tableBytes, deviceLocal);
-    const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), static_cast<std::uint32_t>(buckets.bounds.size() / 2u)};
+    const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(tableRanges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), static_cast<std::uint32_t>(buckets.bounds.size() / 2u)};
     std::memcpy(table->Bytes().data(), &header, sizeof(header));
-    if (!ranges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));
+    if (!tableRanges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), tableRanges.data(), tableRanges.size() * sizeof(tableRanges.front()));
     if (!buckets.bounds.empty()) {
-        auto* index = table->Bytes().data() + sizeof(header) + ranges.size() * sizeof(ranges.front());
+        auto* index = table->Bytes().data() + sizeof(header) + tableRanges.size() * sizeof(tableRanges.front());
         std::memcpy(index, &buckets.header, sizeof(buckets.header));
         std::memcpy(index + sizeof(buckets.header), buckets.bounds.data(), buckets.bounds.size() * sizeof(std::uint32_t));
     }

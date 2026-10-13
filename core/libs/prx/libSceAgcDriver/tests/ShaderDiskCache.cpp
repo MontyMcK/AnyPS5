@@ -6,6 +6,8 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/DescriptorBindingBuilder.hpp"
 #include "ShaderCacheDirectory.hpp"
+#include "ShaderWarmList.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -1018,6 +1020,86 @@ void verifySpecializationLiveness() {
     require(SpecializeSpirv(specialized) == specialized, "dead computation removal is not stable");
 }
 
+// The shader warm list: a first use outside registration is recorded (a registration-time
+// preparation is not); a later process whose disk cache lost the entries (a recompiler change)
+// replays the records ahead of use, so the same first use is served from memory, while a first
+// use under another layout still prepares its own variant.
+ComputeRequest warmRequest(std::uint32_t pushBytes) {
+    ComputeRequest request(true);
+    request.request.context.waveSize = 32u;
+    request.request.context.compute->numThreads = {32u, 1u, 1u};
+    request.userData[3] = 0x31027facu;
+    request.request.layout.pushConstantSizeBytes = pushBytes;
+    return request;
+}
+
+std::vector<std::filesystem::path> warmRecords(char kind) {
+    std::vector<std::filesystem::path> records;
+    std::error_code error;
+    for (std::filesystem::directory_iterator it(WarmList::Directory(), error), end; !error && it != end; it.increment(error)) {
+        const auto name = it->path().filename().string();
+        if (name.size() > 2 && name[0] == kind && name[1] == '-' && name.ends_with(".wl")) records.push_back(it->path());
+    }
+    return records;
+}
+
+int runWarmReplayProcess() {
+    WarmList::Start({2u, {}, std::nullopt, true});
+    WarmList::WaitForReplay();
+    const auto replayed = WarmList::Totals();
+    require(replayed.loadedVariants == 2 && replayed.loadedModules == 1, "the replay did not list the records (" + std::to_string(replayed.loadedVariants) + " variants, " + std::to_string(replayed.loadedModules) + " modules)");
+    require(replayed.replayedVariants == 1 && replayed.replayedModules == 1 && replayed.replayFailures == 1, "the replay did not prepare the records and drop the damaged one");
+    require(replayed.warmedVariants == 1 && replayed.warmedModules == 1, "the replay did not prepare the variant and module ahead of use");
+    require(warmRecords('v').size() == 1, "the damaged record was not removed");
+    const auto disk = ShaderDiskCache::Totals();
+    auto request = warmRequest(96u);
+    const auto served = Recompile(request.request);
+    const auto after = ShaderDiskCache::Totals();
+    require(after.misses == disk.misses && after.moduleMisses == disk.moduleMisses && after.moduleHits == disk.moduleHits, "the first use looked up the disk cache although the replay had prepared it");
+    const auto used = WarmList::Totals();
+    require(used.claimedVariants == 1 && used.claimedModules == 1 && used.lateVariants == 0 && used.lateModules == 0, "the first use was not served by the replayed variant and module");
+    ComputeRequest fresh = warmRequest(96u);
+    fresh.request.useCache = false;
+    requireSameResult(Recompile(fresh.request), served, "replayed against fresh compilation");
+    auto other = warmRequest(64u);
+    const auto handle = PrepareShader(other.request);
+    require(GetPreparedArtifact(*handle).spirv.size() != 0 && handle->artifact->layout.pushConstantSizeBytes == 64u, "a first use under another layout did not prepare its own variant");
+    require(WarmList::Totals().lateVariants == 1, "a first use under another layout was not counted as late");
+    WarmList::Flush();
+    ShaderDiskCache::Flush();
+    std::cout << "warm list replay served the first use from memory\n";
+    return 0;
+}
+
+void verifyWarmList(const char* self) {
+    WarmList::Start({1u, {}, std::nullopt, false});
+    require(WarmList::Active(), "the warm list did not start with a cache directory");
+    WarmList::WaitForReplay();
+    {
+        WarmList::RegistrationScope registration;
+        auto registered = warmRequest(80u);
+        static_cast<void>(PrepareShader(registered.request));
+    }
+    auto request = warmRequest(96u);
+    static_cast<void>(Recompile(request.request));
+    WarmList::Flush();
+    const auto totals = WarmList::Totals();
+    require(totals.recordedVariants == 1 && totals.lateVariants == 1, "the first use was not recorded once (" + std::to_string(totals.recordedVariants) + " records, " + std::to_string(totals.lateVariants) + " first uses)");
+    require(totals.recordedModules == 1 && totals.lateModules == 1, "the specialized module of the first use was not recorded once");
+    require(warmRecords('v').size() == 1 && warmRecords('m').size() == 1, "unexpected warm records on disk");
+    static_cast<void>(Recompile(request.request));
+    WarmList::Flush();
+    require(WarmList::Totals().recordedVariants == 1 && WarmList::Totals().recordedModules == 1, "a repeated use was recorded again");
+    const auto damaged = WarmList::Directory() / "v-0123456789abcdef0123456789abcdef-00000000.wl";
+    require(WriteFileAtomically(damaged, std::as_bytes(std::span("not a record", 12))), "cannot write the damaged record");
+    // A recompiler change: the entries of this version are gone, the records stay.
+    ShaderDiskCache::Flush();
+    std::error_code error;
+    std::filesystem::remove_all(ShaderDiskCache::EntryDirectory(), error);
+    const std::string command = "\"" + std::string(self) + "\" --warm-replay";
+    require(std::system(command.c_str()) == 0, "the replaying process failed");
+}
+
 void verifyDefaultDirectory(const char* self) {
     setEnvironment("ANYPS5_SHADER_CACHE_DIR", "");
     setEnvironment("ANYPS5_NO_SHADER_CACHE", "1");
@@ -1046,6 +1128,7 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();
+        if (argc == 2 && std::string_view(argv[1]) == "--warm-replay") return runWarmReplayProcess();
         const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-disk-cache-test-" + std::to_string(std::random_device{}()));
         std::filesystem::remove_all(directory);
         verifyDefaultDirectory(argv[0]);
@@ -1066,6 +1149,7 @@ int main(int argc, char** argv) {
         verifyVertexTypeSpecialization();
         verifyBuiltinSpecialization();
         verifySpecializationLiveness();
+        verifyWarmList(argv[0]);
         ShaderDiskCache::Flush();
         std::error_code error;
         std::filesystem::remove_all(directory, error);

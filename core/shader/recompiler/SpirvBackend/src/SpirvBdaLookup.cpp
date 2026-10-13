@@ -2,6 +2,7 @@
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include <bit>
+#include <cstdlib>
 
 namespace ShaderRecompiler {
 
@@ -19,6 +20,7 @@ void ReturnBdaZeroIf(SpirvEmitterState& state, std::uint32_t condition) {
 
 // (u64 address, u32 bytes, u32 instruction) -> u64 device address of the range holding all the bytes,
 std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool recordFaults, std::uint32_t permission = BdaAbi::Read) {
+    const bool cached = state.bdaCacheBegin != 0;
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
     const auto boolean = TypeBool(state);
@@ -31,7 +33,10 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     };
     const auto function = state.module.AllocateId();
     state.module.AddName(function, name);
-    state.module.AddFunction(spv::OpFunction, u64, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, u64, u64, u32, u32));
+    // APS5_BDA_INLINE_ALL=1 (experiment, in the cache version): the driver may inline the lookups,
+    // so a call's register saves and restores go away at the cost of code size.
+    static const bool inlineAll = std::getenv("APS5_BDA_INLINE_ALL") != nullptr;
+    state.module.AddFunction(spv::OpFunction, u64, function, inlineAll ? spv::FunctionControlMaskNone : spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, u64, u64, u32, u32));
     const auto address = state.module.AllocateId();
     const auto bytes = state.module.AllocateId();
     const auto instruction = state.module.AllocateId();
@@ -45,6 +50,56 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     state.module.AddFunction(spv::OpVariable, pointer, low, spv::StorageClassFunction);
     state.module.AddFunction(spv::OpVariable, pointer, high, spv::StorageClassFunction);
     if (state.bdaHintVariable == 0) state.bdaHintVariable = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, u32), spv::StorageClassPrivate, constant(0));
+    if (cached) {
+        const auto load64 = [&](std::uint32_t pointer) {
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, u64, value, pointer);
+            return value;
+        };
+        const auto cachedBegin = load64(state.bdaCacheBegin);
+        const auto accessEnd = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
+        auto hit = binary(spv::OpUGreaterThanEqual, boolean, address, cachedBegin);
+        hit = binary(spv::OpLogicalAnd, boolean, hit, binary(spv::OpULessThanEqual, boolean, accessEnd, load64(state.bdaCacheEnd)));
+        hit = binary(spv::OpLogicalAnd, boolean, hit, binary(spv::OpUGreaterThan, boolean, accessEnd, address));
+        hit = binary(spv::OpLogicalAnd, boolean, hit, binary(spv::OpIEqual, boolean, binary(spv::OpBitwiseAnd, u32, load(state.bdaCachePermissions), constant(permission)), constant(permission)));
+        const auto found = state.module.AllocateId();
+        const auto search = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, search, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, hit, found, search);
+        EmitLabel(state, found);
+        state.module.AddFunction(spv::OpReturnValue, binary(spv::OpIAdd, u64, load64(state.bdaCacheBase), binary(spv::OpISub, u64, address, cachedBegin)));
+        EmitLabel(state, search);
+        if (state.bdaVictimBegin != 0) {
+            // The range before the current one: a shader alternating between two ranges finds the
+            // other here and swaps the two, without searching the table.
+            const auto victimBegin = load64(state.bdaVictimBegin);
+            const auto victimEnd = load64(state.bdaVictimEnd);
+            const auto victimPermissions = load(state.bdaVictimPermissions);
+            auto victimHit = binary(spv::OpUGreaterThanEqual, boolean, address, victimBegin);
+            victimHit = binary(spv::OpLogicalAnd, boolean, victimHit, binary(spv::OpULessThanEqual, boolean, accessEnd, victimEnd));
+            victimHit = binary(spv::OpLogicalAnd, boolean, victimHit, binary(spv::OpUGreaterThan, boolean, accessEnd, address));
+            victimHit = binary(spv::OpLogicalAnd, boolean, victimHit, binary(spv::OpIEqual, boolean, binary(spv::OpBitwiseAnd, u32, victimPermissions, constant(permission)), constant(permission)));
+            const auto swapped = state.module.AllocateId();
+            const auto victimMiss = state.module.AllocateId();
+            state.module.AddFunction(spv::OpSelectionMerge, victimMiss, spv::SelectionControlMaskNone);
+            state.module.AddFunction(spv::OpBranchConditional, victimHit, swapped, victimMiss);
+            EmitLabel(state, swapped);
+            const auto victimBase = load64(state.bdaVictimBase);
+            const auto mainEnd = load64(state.bdaCacheEnd);
+            const auto mainBase = load64(state.bdaCacheBase);
+            const auto mainPermissions = load(state.bdaCachePermissions);
+            state.module.AddFunction(spv::OpStore, state.bdaVictimBegin, cachedBegin);
+            state.module.AddFunction(spv::OpStore, state.bdaVictimEnd, mainEnd);
+            state.module.AddFunction(spv::OpStore, state.bdaVictimBase, mainBase);
+            state.module.AddFunction(spv::OpStore, state.bdaVictimPermissions, mainPermissions);
+            state.module.AddFunction(spv::OpStore, state.bdaCacheBegin, victimBegin);
+            state.module.AddFunction(spv::OpStore, state.bdaCacheEnd, victimEnd);
+            state.module.AddFunction(spv::OpStore, state.bdaCacheBase, victimBase);
+            state.module.AddFunction(spv::OpStore, state.bdaCachePermissions, victimPermissions);
+            state.module.AddFunction(spv::OpReturnValue, binary(spv::OpIAdd, u64, victimBase, binary(spv::OpISub, u64, address, victimBegin)));
+            EmitLabel(state, victimMiss);
+        }
+    }
     if (BdaHintFastPath()) {
         const auto tableWords = state.module.AllocateId();
         state.module.AddFunction(spv::OpArrayLength, u32, tableWords, state.bdaPagetableVariable, 0u);
@@ -189,6 +244,23 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto deviceEnd = binary(spv::OpIAdd, u64, result, Unary(state, spv::OpUConvert, u64, bytes));
     fail(binary(spv::OpULessThanEqual, boolean, deviceEnd, result), BdaAbi::FaultReason::Overflow);
     state.module.AddFunction(spv::OpStore, state.bdaHintVariable, index);
+    if (cached) {
+        if (state.bdaVictimBegin != 0) {
+            const auto demote = [&](std::uint32_t from, std::uint32_t to, std::uint32_t type) {
+                const auto value = state.module.AllocateId();
+                state.module.AddFunction(spv::OpLoad, type, value, from);
+                state.module.AddFunction(spv::OpStore, to, value);
+            };
+            demote(state.bdaCacheBegin, state.bdaVictimBegin, u64);
+            demote(state.bdaCacheEnd, state.bdaVictimEnd, u64);
+            demote(state.bdaCacheBase, state.bdaVictimBase, u64);
+            demote(state.bdaCachePermissions, state.bdaVictimPermissions, u32);
+        }
+        state.module.AddFunction(spv::OpStore, state.bdaCacheBegin, begin);
+        state.module.AddFunction(spv::OpStore, state.bdaCacheEnd, finish);
+        state.module.AddFunction(spv::OpStore, state.bdaCacheBase, base);
+        state.module.AddFunction(spv::OpStore, state.bdaCachePermissions, permissions);
+    }
     state.module.AddFunction(spv::OpReturnValue, result);
     state.module.AddFunction(spv::OpFunctionEnd);
     return function;
@@ -236,8 +308,150 @@ static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
     return function;
 }
 
+static bool BdaLookupCached() {
+    static const bool disabled = std::getenv("APS5_NO_BDA_LOOKUP_CACHE") != nullptr;
+    return !disabled;
+}
+
+static bool BdaVictimCache() {
+    static const bool enabled = std::getenv("APS5_BDA_VICTIM") != nullptr;
+    return enabled;
+}
+
+bool BdaInlineCacheHit() {
+    static const bool enabled = std::getenv("APS5_BDA_INLINE_HIT") != nullptr;
+    return enabled;
+}
+
+static std::uint32_t EmitBdaLookupCallInner(SpirvEmitterState& state, std::uint32_t function, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, std::uint32_t permission);
+
+bool BdaClockEnabled() {
+    static const bool enabled = std::getenv("APS5_BDA_CLOCK") != nullptr;
+    return enabled;
+}
+
+std::uint32_t EmitBdaClock(SpirvEmitterState& state) {
+    state.module.EmitCapability(spv::CapabilityShaderClockKHR);
+    state.module.EmitExtension("SPV_KHR_shader_clock");
+    const auto value = state.module.AllocateId();
+    state.module.AddFunction(spv::OpReadClockKHR, TypeScalarU64(state), value, ConstantU32(state, static_cast<std::uint32_t>(spv::ScopeSubgroup)));
+    return value;
+}
+
+std::uint32_t EmitBdaLookupCall(SpirvEmitterState& state, std::uint32_t function, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, std::uint32_t permission) {
+    if (state.bdaClockLookup == 0) return EmitBdaLookupCallInner(state, function, address, bytes, instruction, permission);
+    const auto u64 = TypeScalarU64(state);
+    const auto u32 = TypeU32(state);
+    const auto before = EmitBdaClock(state);
+    const auto result = EmitBdaLookupCallInner(state, function, address, bytes, instruction, permission);
+    const auto after = EmitBdaClock(state);
+    const auto spent = Binary(state, spv::OpISub, u64, after, before);
+    const auto sum = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, u64, sum, state.bdaClockLookup);
+    state.module.AddFunction(spv::OpStore, state.bdaClockLookup, Binary(state, spv::OpIAdd, u64, sum, spent));
+    const auto calls = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, u32, calls, state.bdaClockCalls);
+    state.module.AddFunction(spv::OpStore, state.bdaClockCalls, Binary(state, spv::OpIAdd, u32, calls, ConstantU32(state, 1u)));
+    return result;
+}
+
+static std::uint32_t EmitBdaLookupCallInner(SpirvEmitterState& state, std::uint32_t function, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, std::uint32_t permission) {
+    const auto u64 = TypeScalarU64(state);
+    const auto call = [&] {
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, u64, result, function, address, bytes, instruction);
+        return result;
+    };
+    if (!BdaInlineCacheHit() || state.bdaCacheBegin == 0) return call();
+    // The lookup's own cache test (DefineBdaLookup), made here so a hit costs no call: NVIDIA keeps
+    // DontInline functions as calls. A miss calls the lookup, which searches and refills the cache.
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto load = [&](std::uint32_t type, std::uint32_t pointer) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, type, value, pointer);
+        return value;
+    };
+    const auto begin = load(u64, state.bdaCacheBegin);
+    const auto accessEnd = Binary(state, spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
+    auto hit = Binary(state, spv::OpUGreaterThanEqual, boolean, address, begin);
+    hit = Binary(state, spv::OpLogicalAnd, boolean, hit, Binary(state, spv::OpULessThanEqual, boolean, accessEnd, load(u64, state.bdaCacheEnd)));
+    hit = Binary(state, spv::OpLogicalAnd, boolean, hit, Binary(state, spv::OpUGreaterThan, boolean, accessEnd, address));
+    hit = Binary(state, spv::OpLogicalAnd, boolean, hit, Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, load(u32, state.bdaCachePermissions), ConstantU32(state, permission)), ConstantU32(state, permission)));
+    const auto hitLabel = state.module.AllocateId();
+    const auto missLabel = state.module.AllocateId();
+    const auto merge = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, hit, hitLabel, missLabel);
+    EmitLabel(state, hitLabel);
+    const auto translated = Binary(state, spv::OpIAdd, u64, load(u64, state.bdaCacheBase), Binary(state, spv::OpISub, u64, address, begin));
+    state.module.AddFunction(spv::OpBranch, merge);
+    EmitLabel(state, missLabel);
+    const auto searched = call();
+    const auto missExit = state.currentLabel;
+    state.module.AddFunction(spv::OpBranch, merge);
+    EmitLabel(state, merge);
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpPhi, u64, result, translated, hitLabel, searched, missExit);
+    return result;
+}
+
+static void DefineBdaLookupCache(SpirvEmitterState& state) {
+    const auto address = TypePointer(state, spv::StorageClassPrivate, TypeScalarU64(state));
+    const auto zero = BdaConstant(state, 0u);
+    state.bdaCacheBegin = state.module.DefineInitializedGlobalVariable(address, spv::StorageClassPrivate, zero);
+    state.bdaCacheEnd = state.module.DefineInitializedGlobalVariable(address, spv::StorageClassPrivate, zero);
+    state.bdaCacheBase = state.module.DefineInitializedGlobalVariable(address, spv::StorageClassPrivate, zero);
+    state.bdaCachePermissions = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeU32(state)), spv::StorageClassPrivate, ConstantU32(state, 0u));
+    if (BdaVictimCache()) {
+        state.bdaVictimBegin = state.module.DefineInitializedGlobalVariable(address, spv::StorageClassPrivate, zero);
+        state.bdaVictimEnd = state.module.DefineInitializedGlobalVariable(address, spv::StorageClassPrivate, zero);
+        state.bdaVictimBase = state.module.DefineInitializedGlobalVariable(address, spv::StorageClassPrivate, zero);
+        state.bdaVictimPermissions = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeU32(state)), spv::StorageClassPrivate, ConstantU32(state, 0u));
+    }
+}
+
+void EmitBdaClockEntry(SpirvEmitterState& state) {
+    if (state.bdaClockEntry == 0) return;
+    state.module.AddFunction(spv::OpStore, state.bdaClockEntry, EmitBdaClock(state));
+}
+
+void EmitBdaClockReport(SpirvEmitterState& state) {
+    if (state.bdaClockEntry == 0 || state.faultBufferVariable == 0) return;
+    const auto u64 = TypeScalarU64(state);
+    const auto u32 = TypeU32(state);
+    const auto load = [&](std::uint32_t type, std::uint32_t pointer) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, type, value, pointer);
+        return value;
+    };
+    const auto total = Binary(state, spv::OpISub, u64, EmitBdaClock(state), load(u64, state.bdaClockEntry));
+    const auto lookup = load(u64, state.bdaClockLookup);
+    const auto calls = load(u32, state.bdaClockCalls);
+    state.module.EmitCapability(spv::CapabilityGroupNonUniform);
+    const auto elected = state.module.AllocateId();
+    state.module.AddFunction(spv::OpGroupNonUniformElect, TypeBool(state), elected, ConstantU32(state, spv::ScopeSubgroup));
+    EmitIfCondition(state, elected, [&] {
+        const auto add = [&](std::uint32_t word, std::uint32_t value) {
+            const auto previous = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAtomicIAdd, u32, previous, BdaWord(state, state.faultBufferVariable, ConstantU32(state, word)), ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), value);
+        };
+        const auto units = [&](std::uint32_t cycles) { return Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpShiftRightLogical, u64, cycles, BdaConstant(state, 6u))); };
+        add(BdaAbi::ClockLookupWord, units(lookup));
+        add(BdaAbi::ClockTotalWord, units(total));
+        add(BdaAbi::ClockCallsWord, calls);
+    });
+}
+
 void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (!state.program.Info().usesDma) return;
+    if (BdaClockEnabled()) {
+        const auto u64Pointer = TypePointer(state, spv::StorageClassPrivate, TypeScalarU64(state));
+        state.bdaClockEntry = state.module.DefineInitializedGlobalVariable(u64Pointer, spv::StorageClassPrivate, BdaConstant(state, 0u));
+        state.bdaClockLookup = state.module.DefineInitializedGlobalVariable(u64Pointer, spv::StorageClassPrivate, BdaConstant(state, 0u));
+        state.bdaClockCalls = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeU32(state)), spv::StorageClassPrivate, ConstantU32(state, 0u));
+    }
+    if (BdaLookupCached()) DefineBdaLookupCache(state);
     DefineBdaFaultFunction(state);
     state.bdaPointerFunction = DefineBdaLookup(state, "get_bda_pointer", true);
     if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false);

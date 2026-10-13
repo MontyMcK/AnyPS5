@@ -278,10 +278,24 @@ CapturedCallProgram ResolveUserDataCalls(const RecompileRequest& request, SrtMem
     return result;
 }
 
+namespace {
+
+// A local program is the front half of the merged local-hull wave: it ends at its jump into the
+// hull half (s_setpc_b64 s[6:7], or s_swappc_b64 null, s[6:7]), which ends the host vertex shader;
+// the words after the jump are padding or data.
+RdnaProgram DecodeLocalProgram(std::span<const std::uint32_t> code) {
+    auto program = DecodeRdnaFrontProgram(code);
+    static constexpr std::array<std::uint32_t, 1> EndProgram{0xbf810000u};
+    program.instructions.back() = DecodeRdnaInstruction(program.instructions.back().programCounter, EndProgram, 0u);
+    return program;
+}
+
+}
+
 RdnaProgram DecodeShaderProgram(const ShaderBinary& shader) {
     if (shader.capturedCalls.size() > MaxCapturedShaderCalls) throw std::invalid_argument("too many captured scalar calls");
     if (!shader.capturedCalls.empty() && shader.code.size() > MaxCombinedWords) throw std::invalid_argument("captured shader exceeds the combined program size limit");
-    auto program = RdnaInstructionDecoder{}.Decode(shader.code);
+    auto program = shader.stage == ShaderStage::Local ? DecodeLocalProgram(shader.code) : RdnaInstructionDecoder{}.Decode(shader.code);
     const auto callerEnd = program.instructions.back().programCounter + program.instructions.back().wordCount * 4u;
     auto end = callerEnd;
     for (const auto& call : shader.capturedCalls) {

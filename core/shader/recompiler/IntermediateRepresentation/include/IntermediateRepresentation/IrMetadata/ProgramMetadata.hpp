@@ -23,6 +23,10 @@ struct IrProgramMetadata {
     bool shaderInfoComplete = false;
     IrBindingLayout bindings;
     bool bindingLayoutComplete = false;
+    // Per-vertex strides TessellationLowering derives from the code: a vertex's local (LDS) output
+    // and the hull's off-chip record of one control point.
+    std::uint32_t tessellationLocalStride = 0;
+    std::uint32_t tessellationControlStride = 0;
 };
 
 }

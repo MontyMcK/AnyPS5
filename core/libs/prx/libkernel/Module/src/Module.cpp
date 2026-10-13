@@ -8,6 +8,7 @@
 #include "prx/libc/include/specifics/linux/ElfTypes.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
+#include "prx/libkernel/Automation/include/Automation.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
@@ -195,6 +196,7 @@ KernelModule APS5_VABI sceKernelLoadStartModule(const char* module_file_name, si
  if (res) *res = 0;
  if (!module_file_name) return static_cast<KernelModule>(SCE_KERNEL_ERROR_EFAULT);
  void* handle = dlopen_nid_postfix(module_file_name, kRtldNow);
+ if (Automation::Enabled()) Automation::Fields().Str("path", module_file_name).Bool("ok", handle != nullptr).Emit("module");
  if (!handle) return static_cast<KernelModule>(SCE_KERNEL_ERROR_ENOENT);
  return static_cast<KernelModule>(reinterpret_cast<intptr_t>(handle));
 }

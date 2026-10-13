@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include <cstdlib>
@@ -20,6 +21,12 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
     if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawVerdict::Nothing;
     if (const auto pass = Graphics::DecodeColorMetadataPass(queue)) {
         require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");
+        // A resolve copies what the draws before it rendered into CB_COLOR0: the ones still in the
+        // draw pipeline (draw packets keep it running) are committed first.
+        if (pass->mode == Graphics::ColorMetadataPass::Mode::Resolve && DrawPipeline::Active()) {
+            require(!DrawPipeline::Queue0().OnPrepThread(), "a CB resolve cannot be ordered behind queued draws from a draw preparation worker");
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
+        }
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
         if (device == nullptr) device = std::make_shared<VulkanDevice>();

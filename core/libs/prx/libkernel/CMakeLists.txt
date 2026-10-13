@@ -52,6 +52,7 @@ add_library(libkernel SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Time/TimedWait.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/AppMetadata/src/AppMetadata.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/AppMetadata/src/ParamJsonParser.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Automation/src/Automation.cpp
 )
 
 target_include_directories(libkernel PRIVATE ${LIBS_INCLUDE_DIR})
@@ -65,6 +66,16 @@ endif()
 configure_windows_unwind(libkernel)
 
 if(BUILD_TESTING)
+    add_test_executable(automation_engine_tests ${LIBS_INCLUDE_DIR}/tests/AutomationEngine.cpp)
+    target_include_directories(automation_engine_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    # libc provides the DWARF exception personality these libraries are built with.
+    target_link_libraries(automation_engine_tests PRIVATE libc)
+    configure_windows_unwind(automation_engine_tests)
+    add_test(NAME automation_engine COMMAND automation_engine_tests)
+    if(WIN32)
+        set_tests_properties(automation_engine PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test_executable(param_json_parser_tests ${LIBS_INCLUDE_DIR}/tests/ParamJsonParser.cpp)
     target_include_directories(param_json_parser_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(param_json_parser_tests PRIVATE libkernel libc)

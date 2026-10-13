@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <map>
 #include <span>
 #include <string>
 #include <vector>
@@ -23,6 +25,12 @@ struct FileHeader {
     std::uint64_t dataHash;
 };
 static_assert(sizeof(FileHeader) == 24);
+
+// Bytes of driver data in each cache file, as loaded or last written by this process. Every device
+// of the process loads the same file; one only writes it when its data is larger, so a device with
+// a few pipelines never replaces the rendering device's whole cache.
+std::mutex filesMutex;
+std::map<std::string, std::size_t> fileBytes;
 
 bool profiling() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -45,7 +53,16 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
         path = directory / name;
     }
     std::vector<std::byte> initialData;
-    if (!path.empty()) load(initialData);
+    if (!path.empty()) {
+        std::error_code error;
+        const auto prefix = path.filename().string() + ".tmp.";
+        for (const auto& entry : std::filesystem::directory_iterator(path.parent_path(), error)) {
+            if (entry.path().filename().string().rfind(prefix, 0) != 0) continue;
+            std::error_code removeError;
+            std::filesystem::remove(entry.path(), removeError);
+        }
+        load(initialData);
+    }
     VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
     info.initialDataSize = initialData.size();
     info.pInitialData = initialData.empty() ? nullptr : initialData.data();
@@ -59,7 +76,14 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
         result = create(context.device, &info, nullptr, &cache);
     }
     Check(result, "vkCreatePipelineCache");
-    if (!path.empty()) saver = std::thread([this] { run(); });
+    if (!path.empty()) {
+        {
+            std::lock_guard lock(filesMutex);
+            auto& bytes = fileBytes[path.string()];
+            bytes = std::max(bytes, savedBytes);
+        }
+        saver = std::thread([this] { run(); });
+    }
 }
 
 PipelineCache::~PipelineCache() {
@@ -112,6 +136,8 @@ void PipelineCache::save(bool final) {
     // least 16 MiB) or ten minutes since the last save pays for another copy, hash and write.
     const auto now = std::chrono::steady_clock::now();
     if (!final && size - std::min(size, savedBytes) < std::max<std::size_t>(savedBytes / 4u, std::size_t{16} << 20u) && now - savedAt < std::chrono::minutes(10)) return;
+    std::lock_guard fileLock(filesMutex);
+    if (size <= fileBytes[path.string()]) return;
     std::vector<std::byte> file(sizeof(FileHeader) + size);
     const auto result = getData(context.device, cache, &size, file.data() + sizeof(FileHeader));
     if (result != VK_SUCCESS && result != VK_INCOMPLETE) return;
@@ -124,6 +150,7 @@ void PipelineCache::save(bool final) {
         return;
     }
     savedBytes = size;
+    fileBytes[path.string()] = size;
     savedAt = std::chrono::steady_clock::now();
     if (final || profiling()) std::fprintf(stderr, "[pipeline-cache] saved %.1f KiB to %s in %.1f ms%s\n", static_cast<double>(size) / 1024.0, path.string().c_str(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), final ? " (teardown)" : "");
 }

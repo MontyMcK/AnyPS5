@@ -1,4 +1,5 @@
 #version 450
+#extension GL_EXT_shader_image_load_formatted : require
 
 layout(constant_id = 0) const uint ELEMENT_BYTES = 4u;
 layout(constant_id = 1) const uint BLOCK_BYTES = 256u;
@@ -26,11 +27,15 @@ layout(constant_id = 19) const uint EQ15 = 0u;
 // Nonzero: block extent in elements (thick 3D blocks are not the thin 2D shape derived below).
 layout(constant_id = 20) const uint BLOCK_WIDTH = 0u;
 layout(constant_id = 21) const uint BLOCK_HEIGHT = 0u;
+// Nonzero: the linear side is the image itself (binding 2, a same-size unsigned view of one mip,
+// layer `slice`): retile reads its texels, detile stores them, with no linear buffer in between.
+layout(constant_id = 22) const uint IMAGE_IO = 0u;
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer Input { uint data[]; } inputBuffer;
 layout(set = 0, binding = 1, std430) buffer Output { uint data[]; } outputBuffer;
+layout(set = 0, binding = 2) uniform uimage2DArray linearImage;
 
 layout(push_constant) uniform Push {
     uint srcBase;
@@ -192,6 +197,43 @@ void main() {
     }
     tiledOffset -= params.tiledBase;
     linearOffset -= params.linearBase;
+
+    if (IMAGE_IO != 0u) {
+        ivec3 texel = ivec3(p, int(params.slice));
+        if (RETILE != 0u) {
+            uvec4 value = imageLoad(linearImage, texel);
+            uint dst = params.dstBase + tiledOffset;
+            if (ELEMENT_BYTES >= 4u) {
+                outputBuffer.data[dst >> 2] = value.x;
+                if (ELEMENT_BYTES >= 8u) outputBuffer.data[(dst >> 2) + 1u] = value.y;
+                if (ELEMENT_BYTES >= 16u) {
+                    outputBuffer.data[(dst >> 2) + 2u] = value.z;
+                    outputBuffer.data[(dst >> 2) + 3u] = value.w;
+                }
+            } else {
+                uint mask = ELEMENT_BYTES == 1u ? 0xffu : 0xffffu;
+                uint shift = (dst & 3u) * 8u;
+                atomicAnd(outputBuffer.data[dst >> 2], ~(mask << shift));
+                atomicOr(outputBuffer.data[dst >> 2], (value.x & mask) << shift);
+            }
+        } else {
+            uint src = params.srcBase + tiledOffset;
+            uvec4 value = uvec4(0u);
+            if (ELEMENT_BYTES >= 4u) {
+                value.x = inputBuffer.data[src >> 2];
+                if (ELEMENT_BYTES >= 8u) value.y = inputBuffer.data[(src >> 2) + 1u];
+                if (ELEMENT_BYTES >= 16u) {
+                    value.z = inputBuffer.data[(src >> 2) + 2u];
+                    value.w = inputBuffer.data[(src >> 2) + 3u];
+                }
+            } else {
+                uint mask = ELEMENT_BYTES == 1u ? 0xffu : 0xffffu;
+                value.x = (inputBuffer.data[src >> 2] >> ((src & 3u) * 8u)) & mask;
+            }
+            imageStore(linearImage, texel, value);
+        }
+        return;
+    }
 
     if (RETILE != 0u) {
         copyElement(params.srcBase + linearOffset, params.dstBase + tiledOffset);

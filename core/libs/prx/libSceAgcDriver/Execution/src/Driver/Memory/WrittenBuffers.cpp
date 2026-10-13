@@ -76,8 +76,10 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> ComputeWrite
             const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
             if (!written) continue;
             if (binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) return std::nullopt;
-            const auto resource = Graphics::DecodeTextureResource(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8));
-            if (resource.baseAddress == 0) continue;
+            const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8);
+            // A null descriptor (base address 0) writes nothing; the decode refuses it.
+            if (words[0] == 0u && (words[1] & 0xffu) == 0u && std::getenv("APS5_NULL_WRITE_REFUSE") == nullptr) continue;
+            const auto resource = Graphics::DecodeTextureResource(words);
             const auto surfaceBytes = Graphics::DescribeSurface(resource).guestBytes;
             if (surfaceBytes == 0) return std::nullopt;
             ranges.emplace_back(resource.baseAddress, resource.baseAddress + surfaceBytes);
@@ -102,8 +104,10 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> DrawWriteRanges(const Graph
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
                 if (!written || binding.guestDescriptor.size() < (static_cast<std::size_t>(element) + 1) * 8) continue;
-                const auto resource = Graphics::DecodeTextureResource(std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8));
-                if (resource.baseAddress == 0) continue;
+                const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8, 8);
+                // A null descriptor (base address 0) writes nothing; the decode refuses it.
+                if (words[0] == 0u && (words[1] & 0xffu) == 0u && std::getenv("APS5_NULL_WRITE_REFUSE") == nullptr) continue;
+                const auto resource = Graphics::DecodeTextureResource(words);
                 const auto surfaceBytes = Graphics::DescribeSurface(resource).guestBytes;
                 add(resource.baseAddress, surfaceBytes != 0 ? surfaceBytes : UnknownBytes);
                 add(resource.dccAddress, surfaceBytes != 0 ? surfaceBytes / 256 + 1 : UnknownBytes);

@@ -5,15 +5,22 @@
 #include "Optimization/BindingAllocator.hpp"
 #include "Recompiler.hpp"
 #include <cstdint>
+#include <string>
 
 namespace ShaderRecompiler {
 
-std::uint32_t PointFilteredSamplerWord(std::uint32_t word0, std::uint32_t filter);
+// depthReduction: every image the sampler reads is a depth-bits view (sampled through the float depth
+// view), so a min or max reduction keeps its filtering there. integerOnly: every image it reads is a
+// signed-integer image, which the texture unit never filters, so a reduction sampler point-samples.
+std::uint32_t PointFilteredSamplerWord(std::uint32_t word0, std::uint32_t filter, bool depthReduction = false, bool integerOnly = false);
 struct PreparedDescriptorBinding {
     DescriptorBinding descriptor;
     std::vector<std::uint32_t> resources;
     std::vector<bool> identityImageSwizzle;
     std::vector<std::uint32_t> samplerFilterElements;
+    std::vector<bool> samplerDepthReduction;
+    std::vector<bool> samplerIntegerOnly;
+    std::vector<std::string> samplerPointWhy;
     std::size_t writtenBuffers = 0;
     std::size_t readOnlyBuffers = 0;
 };

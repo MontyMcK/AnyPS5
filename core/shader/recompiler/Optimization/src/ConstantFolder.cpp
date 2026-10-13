@@ -1,6 +1,7 @@
 #include "Optimization/ConstantFolder.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
 
+#include <cstdlib>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -299,7 +300,18 @@ bool ConstantFolder::tryFoldValue(IrProgram& program, IrValue& value) const {
     IrBuilder builder(program);
     switch (value.Opcode()) {
         case IrOpcode::Phi: return foldPhi(value);
-        case IrOpcode::GetBuiltin: return lowerPackedAncillary(program, builder, value);
+        case IrOpcode::GetBuiltin: {
+            // APS5_SAMPLEID_ZERO=1 (in the cache version): the driver rasterizes every pipeline with
+            // one sample, so the sample index is 0; reading gl_SampleID would put the pipeline into
+            // per-sample shading for nothing.
+            static const bool sampleIdZero = std::getenv("APS5_SAMPLEID_ZERO") != nullptr;
+            auto& kind = resolveArg(value, 0);
+            if (sampleIdZero && isImmediate(kind, IrType::U32) && static_cast<StageInputKind>(kind.ImmediateU32()) == StageInputKind::SampleId) {
+                replaceWith(value, builder.Constant(0u));
+                return true;
+            }
+            return lowerPackedAncillary(program, builder, value);
+        }
         case IrOpcode::SelectU1:
         case IrOpcode::SelectF32:
         case IrOpcode::SelectU32: return foldSelect(value);

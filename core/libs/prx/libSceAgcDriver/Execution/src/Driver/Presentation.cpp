@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/NvPerfRanges.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -54,11 +55,15 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             std::lock_guard lock(GuestMemory::GpuMutex());
             timing.Mark("gpu_mutex_wait");
             if (device == nullptr || device->Window() == nullptr) {
-                if (device) {
-                    device->PrepareForReplacement();
-                    replacedDevices.push_back(device);
+                // The headless device that served the draws before the first flip takes the window
+                // when it can (one device, its caches kept); otherwise a windowed device replaces it.
+                if (device == nullptr || !device->AttachWindow(window)) {
+                    if (device) {
+                        device->PrepareForReplacement();
+                        replacedDevices.push_back(device);
+                    }
+                    device = std::make_shared<VulkanDevice>(&window);
                 }
-                device = std::make_shared<VulkanDevice>(&window);
             }
             require(device->Window() == window.context, "presentation window does not match device surface");
             presenting = device;
@@ -85,6 +90,8 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
             std::lock_guard lock(GuestMemory::GpuMutex());
             timing.Mark("gpu_mutex_wait");
+            Graphics::StorageTexture::StoreSmallPending();
+            timing.Mark("small_results_store");
             if (buffer != nullptr) {
                 if (syncFlip) {
                     presenting->WaitIdle();
@@ -96,6 +103,8 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 submitted = presenting->PresentClear(window.width, window.height, opaque);
                 timing.Mark("present_clear");
             }
+            // The range profiler's frame ends with the flip's submit (APS5_NVPERF).
+            if (submitted) Graphics::NvPerf::FrameBoundary();
             if (submitted && syncFlip) {
                 waitedMs = presenting->FinishPresent();
                 timing.Mark("render_fence_wait");

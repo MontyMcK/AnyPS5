@@ -1,6 +1,7 @@
 #ifndef CORE_SHADER_RECOMPILER_SHADERCACHEDIRECTORY_HPP
 #define CORE_SHADER_RECOMPILER_SHADERCACHEDIRECTORY_HPP
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstddef>
@@ -30,7 +31,13 @@ inline bool WriteFileAtomically(const std::filesystem::path& path, std::span<con
     {
         std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
         if (!file) return false;
-        file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        // Bounded writes: one multi-GiB ofstream::write through libstdc++/UCRT never finished (the
+        // pipeline cache saver spun in _write on a 2.3 GB temporary and hung process exit).
+        constexpr std::size_t chunk = std::size_t{64} << 20u;
+        for (std::size_t offset = 0; offset < bytes.size() && file; offset += chunk) {
+            const auto count = std::min(chunk, bytes.size() - offset);
+            file.write(reinterpret_cast<const char*>(bytes.data() + offset), static_cast<std::streamsize>(count));
+        }
         file.close();
         written = !file.fail();
     }

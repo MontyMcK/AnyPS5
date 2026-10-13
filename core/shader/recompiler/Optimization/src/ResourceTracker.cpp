@@ -81,6 +81,9 @@ std::uint32_t possibleU32Bits(const IrValue* value) {
             const IrValue* shift = value->Argument(1)->Resolve();
             return shift->HasImmediate() && shift->Type() == IrType::U32 ? possibleU32Bits(value->Argument(0)) << (shift->ImmediateU32() & 31u) : std::numeric_limits<std::uint32_t>::max();
         }
+        case IrOpcode::ReadFirstLane:
+        case IrOpcode::ReadLane:
+            return possibleU32Bits(value->Argument(0));
         default:
             return std::numeric_limits<std::uint32_t>::max();
     }
@@ -278,6 +281,22 @@ private:
         return memory.kind == ResourceKind::ScalarBuffer && memory.dataBits == 32u && memory.dataDwords == 1u ? &memory : nullptr;
     }
 
+    // An s_load dword through a 64-bit pointer (always executed, no high offset).
+    const MemoryInfo* ScalarAddressMemory(const IrValue& read, std::uint32_t& index) const {
+        if (read.Opcode() != IrOpcode::LoadAddressU32 || read.ArgumentCount() != 4u) {
+            return nullptr;
+        }
+        index = read.Flags<MemoryFlags>().index;
+        if (index >= m_program.Resources().memoryInfo.size()) {
+            return nullptr;
+        }
+        const auto& memory = m_program.Resources().memoryInfo[index];
+        std::uint32_t high = 0;
+        const IrValue* active = read.Argument(3)->Resolve();
+        const bool always = active->HasImmediate() && active->Type() == IrType::U1 && active->ImmediateBool();
+        return memory.kind == ResourceKind::ScalarAddress && !memory.addressIsFull && memory.dataBits == 32u && memory.dataDwords == 1u && immediateU32(read.Argument(2), high) && high == 0u && always ? &memory : nullptr;
+    }
+
     bool MemoryIndexBelongsTo(std::uint32_t index, const IrValue& owner) const {
         for (const auto& block : m_program.Blocks()) {
             for (const IrValue* inst : block->Instructions()) {
@@ -294,10 +313,14 @@ private:
     }
 
     bool MakeRuntimeBufferSource(const IrValue& handle, std::uint32_t& source, DescriptorSource& descriptor) {
-        if (handle.Opcode() != IrOpcode::GetBufferResource) {
+        return MakeRuntimeSource(handle, IrOpcode::GetBufferResource, 4u, source, descriptor);
+    }
+
+    bool MakeRuntimeSource(const IrValue& handle, IrOpcode expected, std::uint32_t width, std::uint32_t& source, DescriptorSource& descriptor) {
+        if (handle.Opcode() != expected) {
             return false;
         }
-        MakeSource(handle, 4u, false, false, descriptor);
+        MakeSource(handle, width, false, false, descriptor);
         std::uint32_t badDword = 0;
         if (!ValidateSource(descriptor, badDword)) {
             return false;
@@ -380,7 +403,7 @@ private:
     // A T# whose eight dwords are scalar reads of one V# (the table) at `entryOffset + key * 32`
     // with a wave-uniform runtime key: a bindless image table. The key stays an ordinary value
     // (the SPIR-V selects the bound slot from it); the eight reads become planning-only.
-    bool TryMakeTableImage(IrValue& handle, IndirectImagePlan& plan) {
+    bool TryMakeTableImage(IrValue& handle, IndirectImagePlan& plan, bool storage) {
         static const bool traceTable = std::getenv("APS5_TRACE_CHAIN_IMAGES") != nullptr;
         const auto tableReject = [&](int reason) { if (traceTable) std::fprintf(stderr, "[table-image] rejected at check %d\n", reason); return false; };
         if (handle.Opcode() != IrOpcode::GetImageResource || handle.ArgumentCount() != 8u) {
@@ -391,16 +414,19 @@ private:
         IrValue* heapHandle = nullptr;
         IrValue* heapOffset = nullptr;
         std::uint32_t immediateOffset = 0;
+        bool address = false;
         for (std::uint32_t dword = 0; dword < heapReads.size(); dword++) {
             heapReads[dword] = handle.Argument(dword)->Resolve();
             std::uint32_t memoryIndex = 0;
             const MemoryInfo* memory = ScalarReadMemory(*heapReads[dword], memoryIndex);
+            const bool addressRead = memory == nullptr && (memory = ScalarAddressMemory(*heapReads[dword], memoryIndex)) != nullptr;
             if (memory == nullptr || !MemoryIndexBelongsTo(memoryIndex, *heapReads[dword])) {
                 return tableReject(2);
             }
             if (dword == 0u) {
                 immediateOffset = memory->offset;
-            } else if (memory->offset != immediateOffset + dword * sizeof(std::uint32_t)) {
+                address = addressRead;
+            } else if (addressRead != address || memory->offset != immediateOffset + dword * sizeof(std::uint32_t)) {
                 return tableReject(3);
             }
             IrValue* currentHandle = heapReads[dword]->Argument(0)->Resolve();
@@ -424,13 +450,49 @@ private:
             if (traceTable) std::fprintf(stderr, "[table-image] offset %s stride %u key type %u\n", std::string(IrOpcodeName(heapOffset->Resolve()->Opcode())).c_str(), entryStride, key != nullptr ? static_cast<unsigned>(key->Type()) : 999u);
             return tableReject(6);
         }
-        entryOffset += immediateOffset;
+        if (!address) {
+            entryOffset += immediateOffset;
+        }
 
         const std::array<const IrValue*, 1> imageUsers {&handle};
         for (const auto* read : heapReads) {
             if (!usesOnly(*read, imageUsers)) {
-                return tableReject(7);
+                // A descriptor dword the program also uses as data (or builds another handle
+                // from) stays an executed read; only this handle is replaced. Buffer tables keep
+                // the record chain fallback below unless they are stored to.
+                if (!address && !storage) return tableReject(7);
+                plan.planningReads = false;
             }
+        }
+
+        if (address) {
+            // The 2-dword pointer must be resolvable at registration (user data or a flat SRT
+            // read); the key stays a shader value. Offsets wrap at 32 bits like the s_load's
+            // register offset, and the signed immediate is added to the 64-bit address.
+            DescriptorSource pointerSource;
+            std::uint32_t pointerIndex = 0;
+            if (!MakeRuntimeSource(*heapHandle, IrOpcode::GetAddressResource, 2u, pointerIndex, pointerSource)) {
+                return tableReject(9);
+            }
+            DescriptorSource::IndirectImage table;
+            table.address = true;
+            table.enumerated = true;
+            table.heapSource = pointerIndex;
+            table.materialSource = pointerIndex;
+            table.entryOffset = entryOffset;
+            table.entryStride = entryStride;
+            table.selectorOffset = immediateOffset;
+            table.maxKey = possibleU32Bits(key);
+            DescriptorSource imageSource;
+            imageSource.dwordCount = 8u;
+            for (std::uint32_t dword = 0; dword < 8u; dword++) imageSource.dwords[dword] = pointerSource.dwords[dword & 1u];
+            imageSource.indirectImage = table;
+            plan.handle = &handle;
+            plan.source = InternSource(imageSource);
+            plan.key = key;
+            plan.roots = imageSource.dwords;
+            if (traceTable) std::fprintf(stderr, "[table-image] address table planned: stride %u addend 0x%x immediate 0x%x max key 0x%x\n", entryStride, entryOffset, immediateOffset, table.maxKey);
+            return true;
         }
 
         DescriptorSource heapSource;
@@ -444,10 +506,14 @@ private:
         table.materialSource = heapSourceIndex;
         table.entryOffset = entryOffset;
         table.entryStride = entryStride;
+        table.maxKey = possibleU32Bits(key);
+        // Storage tables and tables whose descriptor dwords are also data are enumerated: such
+        // tables are records of a larger structure, so their entries rarely fit the slots by key.
+        table.enumerated = storage || !plan.planningReads;
         DescriptorSource materialSource = heapSource;
         std::uint32_t materialMemoryIndex = 0;
         const MemoryInfo* materialMemory = ScalarReadMemory(*key, materialMemoryIndex);
-        if (materialMemory != nullptr && MemoryIndexBelongsTo(materialMemoryIndex, *key)) {
+        if (!table.enumerated && materialMemory != nullptr && MemoryIndexBelongsTo(materialMemoryIndex, *key)) {
             IrValue* selector = nullptr;
             std::uint32_t selectorStride = 0;
             std::uint32_t selectorOffset = 0;
@@ -626,6 +692,9 @@ private:
 
     bool IsIndirectPlanningMemory(std::uint32_t index) const {
         return std::ranges::any_of(m_indirectImages, [&](const IndirectImagePlan& plan) {
+            // Executed reads of an enumerated table are collected like any other read.
+            const auto& table = m_sources.at(plan.source).indirectImage;
+            if (!plan.planningReads && table.has_value() && table->enumerated) return false;
             return std::ranges::find(plan.memory, index) != plan.memory.end();
         });
     }
@@ -909,13 +978,16 @@ private:
                 IrValue* handle = inst->Argument(0)->Resolve();
                 const IndirectImagePlan* planned = FindIndirectImage(*handle);
                 IndirectImagePlan plan;
-                if (planned == nullptr && !TryMakeTableImage(*handle, plan) && !TryMakeChainImage(*handle, plan)) {
+                const bool storage = imageInfo.resourceClass == ImageResourceClass::Storage;
+                if (planned == nullptr && !TryMakeTableImage(*handle, plan, storage) && !TryMakeChainImage(*handle, plan)) {
                     continue;
                 }
-                // A store through a table would mark every bound slot pending write-back.
-                if (imageInfo.resourceClass == ImageResourceClass::Storage) {
+                // Stores select one bound slot per access (every slot is written back); atomics
+                // and stores through record chains are not implemented.
+                const auto& table = m_sources.at(planned != nullptr ? planned->source : plan.source).indirectImage;
+                if (imageInfo.access == ImageAccess::Atomic || (storage && (!table.has_value() || !table->enumerated))) {
                     ResourceMaterializer::CountBindlessRejection(BindlessRejection::Storage);
-                    fail("bindless storage image tables are unsupported");
+                    fail(imageInfo.access == ImageAccess::Atomic ? "bindless atomic image tables are unsupported" : "bindless storage image tables are unsupported");
                 }
                 if (planned == nullptr) {
                     m_indirectImages.push_back(std::move(plan));

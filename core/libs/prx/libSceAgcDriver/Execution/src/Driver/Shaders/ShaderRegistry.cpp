@@ -10,6 +10,7 @@
 #include "ControlFlow/GraphBuilder.hpp"
 #include "ControlFlow/UserDataCalls.hpp"
 #include "ControlFlow/Structurizer.hpp"
+#include "ControlFlow/RequestSerializer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -20,6 +21,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
 #include "CompiledVariant.hpp"
+#include "ShaderWarmList.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <chrono>
@@ -29,6 +31,7 @@
 #include <deque>
 #include <functional>
 #include <list>
+#include <optional>
 #include <pthread.h>
 #include <thread>
 #include <filesystem>
@@ -447,16 +450,22 @@ void BuildRegisteredAbiKey(const QueueState& state, const VulkanDevice& device, 
     }
 }
 
-void ReportCompileProgress(bool failed) {
+// Registration outcomes for the console line: prepared, deferred (nothing to prepare at
+// registration: a type no draw or dispatch binds, or a call target only the dispatch's user data
+// names; prepared at first use if ever used) and failed.
+enum class CompileOutcome { Compiled, Deferred, Failed };
+
+void ReportCompileProgress(CompileOutcome outcome) {
     static std::atomic<std::uint32_t> compiled{0};
+    static std::atomic<std::uint32_t> deferred{0};
     static std::atomic<std::uint32_t> failures{0};
     static std::atomic<std::uint64_t> lastMs{0};
-    (failed ? failures : compiled).fetch_add(1, std::memory_order_relaxed);
+    (outcome == CompileOutcome::Compiled ? compiled : outcome == CompileOutcome::Deferred ? deferred : failures).fetch_add(1, std::memory_order_relaxed);
     const auto nowMs = static_cast<std::uint64_t>(GetTickCount64());
     auto last = lastMs.load(std::memory_order_relaxed);
     if (nowMs - last < 250 || !lastMs.compare_exchange_strong(last, nowMs)) return;
-    char text[96];
-    const int length = std::snprintf(text, sizeof(text), "Compiling shaders: %u compiled, %u failed", compiled.load(), failures.load());
+    char text[128];
+    const int length = std::snprintf(text, sizeof(text), "Compiling shaders: %u compiled, %u deferred to first use, %u failed", compiled.load(), deferred.load(), failures.load());
     SetConsoleTitleA(text);
     static const HANDLE console = CreateFileA("CONOUT$", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
     if (console == INVALID_HANDLE_VALUE || length <= 0) return;
@@ -465,16 +474,22 @@ void ReportCompileProgress(bool failed) {
     WriteFile(console, text, static_cast<DWORD>(length), &written, nullptr);
 }
 
+// A registration-time preparation that cannot run yet rather than one that failed: a call target
+// computed from data the dispatch supplies (resolved when the dispatch links its callees).
+bool DeferredAtRegistration(const char* what) {
+    return std::strstr(what, "is not statically resolvable") != nullptr;
+}
+
 std::shared_ptr<const ShaderRecompiler::SourceHandle> TryPrepareShader(const ShaderRecompiler::RecompileRequest& request) {
     try {
         const auto started = std::chrono::steady_clock::now();
         auto handle = ShaderRecompiler::PrepareShader(request);
         const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         if (seconds > 0.2) std::fprintf(stderr, "[prepare] shader 0x%llx stage %u (%zu words) took %.2f s on thread %lu\n", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.shader.stage), request.shader.code.size(), seconds, GetCurrentThreadId());
-        ReportCompileProgress(false);
+        ReportCompileProgress(CompileOutcome::Compiled);
         return handle;
     } catch (const std::exception& error) {
-        ReportCompileProgress(true);
+        ReportCompileProgress(DeferredAtRegistration(error.what()) ? CompileOutcome::Deferred : CompileOutcome::Failed);
         static std::mutex reportMutex;
         static std::set<std::uint64_t> reported;
         bool first = false;
@@ -486,6 +501,22 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> TryPrepareShader(const Sha
             char line[320];
             const int length = std::snprintf(line, sizeof(line), "[prepare] shader 0x%llx left unprepared: %.200s\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
             if (length > 0) std::fwrite(line, 1, std::min<std::size_t>(static_cast<std::size_t>(length), sizeof(line) - 1), stderr);
+            // APS5_DUMP_SHADER_FAILURES also saves registration-time failures (shader_<address>.req)
+            // for agc_shader_replay; deferred call targets are not failures.
+            static const bool dumpFailures = std::getenv("APS5_DUMP_SHADER_FAILURES") != nullptr;
+            if (dumpFailures && !DeferredAtRegistration(error.what())) {
+                try {
+                    const auto text = ShaderRecompiler::RequestSerializer{}.Serialize(request);
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "shader_%llx.req", static_cast<unsigned long long>(request.shader.codeAddress));
+                    if (std::FILE* file = std::fopen(name, "wb")) {
+                        std::fwrite(text.data(), 1, text.size(), file);
+                        std::fclose(file);
+                    }
+                } catch (const std::exception& serializeError) {
+                    std::fprintf(stderr, "[prepare] could not serialize request for 0x%llx: %s\n", static_cast<unsigned long long>(request.shader.codeAddress), serializeError.what());
+                }
+            }
         }
         return nullptr;
     }
@@ -503,7 +534,9 @@ std::vector<PreparedShaders::Entry> PrepareRegisteredImpl(const ShaderSnapshot& 
     case 1: stage = Stage::Fragment; programRegister = 0x008; resourceRegister = 0x00b; break;
     case 2: stage = Stage::Vertex; programRegister = 0x0c8; resourceRegister = 0x08b; firstUser = 8; break;
     case 4: stage = Stage::Mesh; programRegister = 0x0c8; resourceRegister = 0x08b; break;
-    case 5: stage = Stage::Local; programRegister = 0x148; resourceRegister = 0x10b; firstUser = 8; break;
+    // Local programs are prepared at their first draw, for its tessellation configuration (their
+    // LDS layout is the hull's input).
+    case 5: return {};
     case 6: stage = Stage::Mesh; programRegister = 0x088; resourceRegister = 0x08b; break;
     case 7: stage = Stage::TessellationControl; programRegister = 0x108; resourceRegister = 0x10b; break;
     default: throw std::runtime_error("AGC driver: unsupported registered shader type");
@@ -536,7 +569,7 @@ std::vector<PreparedShaders::Entry> PrepareRegisteredImpl(const ShaderSnapshot& 
     } else {
         const auto routing = RegisterValue(state.context, 0x2d5);
         wave = (routing & 0x00400000u) != 0 ? 32u : 64u;
-        if ((routing & 0x20u) != 0 || stage == Stage::Mesh || (routing & 4u) != 0) {
+        if ((routing & 0x20u) != 0 || stage == Stage::Mesh || (routing & 4u) != 0 || ((routing >> 3u) & 3u) == 1u) {
             if (registration) return {};
             auto stageState = state;
             stageState.context[0x1b6] = 0;
@@ -574,10 +607,31 @@ std::vector<PreparedShaders::Entry> PrepareRegisteredImpl(const ShaderSnapshot& 
 }
 
 std::vector<PreparedShaders::Entry> PrepareRegistered(const ShaderSnapshot& snapshot, const VulkanDevice& device, const QueueState& state, bool registration) {
+    // A type outside the stage table (e.g. 8) has no program registers a draw or dispatch binds:
+    // nothing to prepare at registration (it still throws if ever prepared for use).
+    if (registration && (snapshot.type == 3 || snapshot.type > 7)) {
+        ReportCompileProgress(CompileOutcome::Deferred);
+        static std::mutex unsupportedMutex;
+        static std::set<std::uint32_t> told;
+        std::lock_guard lock(unsupportedMutex);
+        if (told.insert(snapshot.type).second) std::fprintf(stderr, "[prepare] shaders of registered type %u are not prepared at registration (no stage uses them)\n", snapshot.type);
+        return {};
+    }
+    // Geometry (4, 6), tessellation local (5) and hull (7) programs only run in a mesh or
+    // tessellation pipeline, so they are prepared with the draw's stage state at first use; their
+    // headers need not carry the program address registers (e.g. the high word) the draw sets.
+    if (registration && snapshot.type >= 4 && snapshot.type <= 7) {
+        ReportCompileProgress(CompileOutcome::Deferred);
+        return {};
+    }
+    // Registration prepares these at every boot: the shader warm list neither records them nor
+    // counts them as first uses (a static ABI resolution, registration == false, is a first use).
+    std::optional<ShaderRecompiler::WarmList::RegistrationScope> registrationScope;
+    if (registration) registrationScope.emplace();
     try {
         return PrepareRegisteredImpl(snapshot, device, state, registration);
     } catch (const std::exception& error) {
-        ReportCompileProgress(true);
+        ReportCompileProgress(DeferredAtRegistration(error.what()) ? CompileOutcome::Deferred : CompileOutcome::Failed);
         static std::mutex reportMutex;
         static std::set<std::uint64_t> reported;
         bool first = false;
@@ -606,6 +660,8 @@ public:
     }
 
     void Submit(std::function<void()> task) {
+        outstanding.fetch_add(1, std::memory_order_relaxed);
+        busyAt.store(NowMs(), std::memory_order_relaxed);
         {
             std::lock_guard lock(mutex);
             tasks.push_back(std::move(task));
@@ -613,7 +669,17 @@ public:
         ready.notify_one();
     }
 
+    // Whether no preparation is queued or running and none was for `quietMs` (the shader warm
+    // list's replay yields to registration).
+    bool IdleFor(std::int64_t quietMs) const {
+        return outstanding.load(std::memory_order_relaxed) == 0 && NowMs() - busyAt.load(std::memory_order_relaxed) >= quietMs;
+    }
+
 private:
+    static std::int64_t NowMs() {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
+
     RegistrationPreparePool() {
         const auto count = std::max(2u, std::thread::hardware_concurrency() / 2u);
         pthread_attr_t attributes;
@@ -637,6 +703,8 @@ private:
                 pool.tasks.pop_front();
             }
             task();
+            pool.busyAt.store(NowMs(), std::memory_order_relaxed);
+            pool.outstanding.fetch_sub(1, std::memory_order_relaxed);
         }
         return nullptr;
     }
@@ -644,11 +712,44 @@ private:
     std::mutex mutex;
     std::condition_variable ready;
     std::deque<std::function<void()>> tasks;
+    std::atomic<std::int64_t> outstanding{0};
+    // Starts busy: the first registration follows the pool's creation.
+    std::atomic<std::int64_t> busyAt{NowMs()};
 };
 
 bool AsyncRegistrationPrepare() {
     static const bool sync = std::getenv("APS5_SYNC_SHADER_PREPARE") != nullptr;
     return !sync;
+}
+
+// Starts the shader warm list (ShaderWarmList.hpp) at the first registration: what earlier sessions
+// prepared at first use (deferred programs with their draw state, captured-call dispatches, static
+// ABI resolutions, specialized modules) is replayed on a few below-normal threads whenever the
+// registration pool has been idle for a second. APS5_SHADER_WARM=0 turns recording and replay off;
+// APS5_SHADER_WARM_THREADS=<n> sets the replay threads (default: a sixth of the cores, 1 to 4).
+void StartShaderWarmList(const VulkanDevice& device) {
+    static std::once_flag once;
+    std::call_once(once, [&] {
+        const char* enabled = std::getenv("APS5_SHADER_WARM");
+        if (enabled != nullptr && std::strcmp(enabled, "0") == 0) {
+            std::fprintf(stderr, "[shader-warm] off (APS5_SHADER_WARM=0)\n");
+            return;
+        }
+        ShaderRecompiler::WarmList::ReplayOptions options;
+        const char* threads = std::getenv("APS5_SHADER_WARM_THREADS");
+        const auto requested = threads != nullptr ? static_cast<unsigned>(std::strtoul(threads, nullptr, 10)) : 0u;
+        options.threads = requested != 0 ? std::min(requested, 16u) : std::clamp(std::thread::hardware_concurrency() / 6u, 1u, 4u);
+        options.waitTurn = [] {
+            while (!RegistrationPreparePool::Instance().IdleFor(1000)) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            return true;
+        };
+        try {
+            options.target = device.Target();
+        } catch (const std::exception&) {
+            options.target.reset();
+        }
+        ShaderRecompiler::WarmList::Start(std::move(options));
+    });
 }
 
 void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<VulkanDevice> device, QueueState registered) {
@@ -691,7 +792,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
     }
     std::vector<PreparedGraphicsStage> prepared;
     std::uint32_t pushOffset = 0;
-    const auto capacity = decoded.state.stages.mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : Graphics::PipelinePushConstantBytes;
+    const auto capacity = decoded.state.stages.mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : ShaderRecompiler::LayerLimitPushBytes;
     for (std::size_t index = 0; index < decoded.programs.size(); ++index) {
         if (decoded.roles[index] == ShaderRecompiler::ProgramRole::GeometryBack) continue;
         const auto& program = decoded.programs[index];
@@ -1126,6 +1227,7 @@ void Driver::registerSnapshot(ShaderSnapshot snapshot, ShaderPreparationTransact
         localDevice = device;
     }
     snapshot.registeredState = std::make_shared<const RegisteredShaderState>(DecodeRegisteredState(snapshot));
+    StartShaderWarmList(*localDevice);
     if (prepare && AsyncRegistrationPrepare()) {
         QueueState registered{};
         registered.shader = snapshot.registeredState->shader;

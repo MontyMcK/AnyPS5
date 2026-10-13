@@ -20,6 +20,7 @@
 #include "prx/libc/include/General.hpp"
 #include "SaveData.hpp"
 #include "prx/libSceSaveData/SaveDataFile.hpp"
+#include "prx/libkernel/Automation/include/Automation.hpp"
 
 static constexpr char SAVE_DIR[] = "_sd";
 
@@ -175,8 +176,14 @@ int traceLimit() {
     static const int limit = std::getenv("APS5_SAVEDATA_TRACE") != nullptr ? std::numeric_limits<int>::max() : 3;
     return limit;
 }
+// With APS5_AUTOMATION every traced call is also an event.
 #define SAVEDATA_TRACE(...) \
     do { \
+        if (Automation::Enabled()) { \
+            char automationText[512]; \
+            std::snprintf(automationText, sizeof(automationText), __VA_ARGS__); \
+            Automation::Fields().Str("call", automationText).Emit("savedata"); \
+        } \
         static std::atomic<int> traceCount{0}; \
         if (traceCount.fetch_add(1, std::memory_order_relaxed) < traceLimit()) { \
             std::fprintf(stderr, "[SAVEDATA:native] " __VA_ARGS__); \

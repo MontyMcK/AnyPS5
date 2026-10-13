@@ -392,13 +392,49 @@ void ShaderStageTests() {
     queue.context[0x2d5] = 0x200d;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "Patch topology and HS_EN disagree");
     queue.userConfig[0x242] = 9;
-    queue.context[0x2d6] = (3u << 8u) | (3u << 14u);
-    queue.context[0x2db] = 1u | (2u << 2u) | (2u << 5u);
+    queue.context[0x2d6] = 0xc355;
+    queue.context[0x2db] = 0x40049;
+    queue.context[0x286] = 0x42800000;
+    queue.context[0x287] = 0x3f800000;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "unsupported tessellation routing");
+    queue.context[0x2d5] = 0x0200010d;
+    expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "unsupported tessellation routing");
+    queue.context[0x2d5] = 0x0200210d;
+    {
+        std::vector<AgcDriver::Graphics::RegisterRead> tessellationLog;
+        AgcDriver::Graphics::RegisterReadLog() = &tessellationLog;
+        stages = AgcDriver::Graphics::DecodeState(queue).stages;
+        AgcDriver::Graphics::RegisterReadLog() = nullptr;
+        for (const auto read : tessellationLog) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a tessellation register the decoder reads: " + std::to_string(read.offset));
+    }
+    Require(stages.path == AgcDriver::Graphics::ShaderPath::Tessellation && stages.tessellation, "tessellation routing changed");
+    const auto& decodedPatches = *stages.tessellation;
+    Require(decodedPatches.inputControlPoints == 3 && decodedPatches.outputControlPoints == 3 && decodedPatches.domain == 1 && decodedPatches.partitioning == 2 && decodedPatches.outputTopology == 2, "the passthrough triangle-patch configuration decoded differently");
+    queue.context[0x2d6] = 0x1043f;
+    queue.context[0x2db] = 0x4004a;
     stages = AgcDriver::Graphics::DecodeState(queue).stages;
-    Require(stages.path == AgcDriver::Graphics::ShaderPath::Tessellation && stages.tessellation && stages.tessellation->inputControlPoints == 3, "tessellation routing changed");
+    Require(stages.tessellation && stages.tessellation->inputControlPoints == 4 && stages.tessellation->outputControlPoints == 4 && stages.tessellation->domain == 2 && stages.tessellation->partitioning == 2 && stages.tessellation->outputTopology == 2, "the quad-patch configuration decoded differently");
+    queue.context[0x2d6] = 0xc355;
+    for (const auto [parameters, reason] : {std::pair{0x44049u, "VGT_TF_PARAM"}, std::pair{0x140049u, "VGT_TF_PARAM"}, std::pair{0x2040049u, "VGT_TF_PARAM"}, std::pair{0x40059u, "unsupported tessellation domain, partitioning"}, std::pair{0x40048u, "unsupported tessellation domain, partitioning"}, std::pair{0x40041u, "only fractional-odd"}, std::pair{0x40045u, "only fractional-odd"}, std::pair{0x4004du, "only fractional-odd"}}) {
+        queue.context[0x2db] = parameters;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, reason);
+    }
+    for (const auto [parameters, domain, topology] : {std::tuple{0x40069u, 1u, 3u}, std::tuple{0x4006au, 2u, 3u}, std::tuple{0x40028u, 0u, 1u}}) {
+        queue.context[0x2db] = parameters;
+        stages = AgcDriver::Graphics::DecodeState(queue).stages;
+        Require(stages.tessellation && stages.tessellation->domain == domain && stages.tessellation->partitioning == 2 && stages.tessellation->outputTopology == topology, "a fractional-odd tessellation configuration decoded differently: VGT_TF_PARAM " + std::to_string(parameters));
+    }
+    queue.context[0x2db] = 0x40049;
+    for (const auto [maximum, minimum] : {std::pair{0x41100000u, 0x3f800000u}, std::pair{0x42800000u, 0x40000000u}}) {
+        queue.context[0x286] = maximum;
+        queue.context[0x287] = minimum;
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "tessellation level clamps");
+    }
+    queue.context[0x286] = 0x42800000;
+    queue.context[0x287] = 0x3f800000;
     queue.context[0x2d5] = 0x202d;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "combined tessellation and geometry");
-    queue.context[0x2d5] = 0x200d;
+    queue.context[0x2d5] = 0x0200210d;
     queue.context[0x2d6] = 0;
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "control-point counts");
     queue = makeState();
@@ -939,6 +975,7 @@ void DepthBoundsBiasTests() {
 }
 
 alignas(256) std::array<std::uint8_t, 4> dccKeys{};
+alignas(256) std::array<std::byte, 1024> resolveMemory{};
 
 void metadataPassTests() {
     using AgcDriver::Graphics::ColorMetadataPass;
@@ -980,8 +1017,30 @@ void metadataPassTests() {
     queue.context[0x202] = 0xcc0030;
     queue.context[0x1c5] = 9;
     queue.context[0x8f] = 0xf;
-    Require(!DecodeColorMetadataPass(queue).has_value(), "resolve decoded as a metadata pass");
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "without a destination color target");
     Require(AgcDriver::Graphics::DrawRejection(queue, false).find("mode resolve") != std::string::npos, "the resolve rejection does not name the mode");
+    for (const auto offset : {0x318u, 0x31bu, 0x31cu, 0x31du}) queue.context[offset + 0xfu] = queue.context[offset];
+    for (const auto offset : {0x3b0u, 0x3b8u}) queue.context[offset + 1u] = queue.context[offset];
+    const auto resolveAddress = reinterpret_cast<std::uintptr_t>(resolveMemory.data());
+    queue.context[0x327] = static_cast<std::uint32_t>(resolveAddress >> 8u);
+    queue.context[0x391] = static_cast<std::uint32_t>(resolveAddress >> 40u);
+    pass = DecodeColorMetadataPass(queue);
+    Require(pass.has_value() && pass->mode == ColorMetadataPass::Mode::Resolve && pass->targets.size() == 2 && pass->targets[0].address == reinterpret_cast<std::uintptr_t>(colorMemory.data()) && pass->targets[1].address == resolveAddress, "CB resolve did not decode CB_COLOR0 as its source and CB_COLOR1 as its destination");
+    Require(pass->region.offset.x == 0 && pass->region.offset.y == 0 && pass->region.extent.width == 64 && pass->region.extent.height == 4, "the resolve of a whole target does not cover it");
+    expectFailure([&] { AgcDriver::Graphics::RunColorMetadataPass(AgcDriver::Graphics::Context{}, *pass); }, "has no storage image");
+    queue.context[0x8e] = 0;
+    Require(!DecodeColorMetadataPass(queue).has_value(), "a resolve-mode draw without color writes became a resolve pass");
+    queue.context[0x8e] = 0xf;
+    queue.context[0x91] = 0x40020;
+    pass = DecodeColorMetadataPass(queue);
+    Require(pass->region.offset.x == 0 && pass->region.extent.width == 32 && pass->region.extent.height == 4, "the resolve region ignored the scissor");
+    queue.context[0x91] = 0x40040;
+    queue.context[0x10f] = std::bit_cast<std::uint32_t>(16.0f);
+    pass = DecodeColorMetadataPass(queue);
+    Require(pass->region.offset.x == 16 && pass->region.extent.width == 32 && pass->region.extent.height == 4, "the resolve region ignored the viewport");
+    queue.context[0x10f] = std::bit_cast<std::uint32_t>(32.0f);
+    queue.context[0x32b] = (queue.context[0x32b] & ~0x7cu) | (1u << 2u);
+    expectFailure([&] { DecodeColorMetadataPass(queue); }, "different color formats");
 
     queue = makeState();
     queue.context[0x0] = 0;
@@ -2423,10 +2482,12 @@ void ConservativeRasterizationTests() {
         expectFailure([&] { AgcDriver::Graphics::DecodeState(geometry); }, rejected);
     }
     auto tessellation = queue;
-    tessellation.context[0x2d5] = 0x200d;
+    tessellation.context[0x2d5] = 0x0200210d;
     tessellation.userConfig[0x242] = 9;
-    tessellation.context[0x2d6] = (3u << 8u) | (3u << 14u);
+    tessellation.context[0x2d6] = 0xc355;
     tessellation.context[0x2db] = 1u | (2u << 2u) | (2u << 5u);
+    tessellation.context[0x286] = 0x42800000;
+    tessellation.context[0x287] = 0x3f800000;
     const auto tessellated = AgcDriver::Graphics::DecodeState(tessellation);
     Require(tessellated.stages.path == AgcDriver::Graphics::ShaderPath::Tessellation && tessellated.conservativeRasterization == VK_CONSERVATIVE_RASTERIZATION_MODE_OVERESTIMATE_EXT, "OVER_RAST_ENABLE did not overestimate clockwise tessellated triangles");
     for (const auto& [parameters, rejected] : std::array<std::pair<std::uint32_t, std::string_view>, 3>{{{1u | (2u << 2u), "conservative rasterization of points is unsupported (VGT_TF_PARAM=0x9)"}, {1u | (2u << 2u) | (1u << 5u), "conservative rasterization of lines is unsupported (VGT_TF_PARAM=0x29)"}, {(2u << 2u) | (1u << 5u), "conservative rasterization of lines is unsupported (VGT_TF_PARAM=0x28)"}}}) {

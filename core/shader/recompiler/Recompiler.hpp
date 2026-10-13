@@ -271,8 +271,16 @@ struct TessellationConfiguration {
     std::uint32_t outputTopology;
 };
 
-inline constexpr std::uint32_t MeshDrawPushOffsetBytes = 104;
-inline constexpr std::uint32_t MeshDrawPushBytes = 24;
+inline constexpr std::uint32_t MeshDrawPushOffsetBytes = 100;
+inline constexpr std::uint32_t MeshDrawPushBytes = 28;
+// The highest render target array layer of the draw's framebuffer: the hardware clamps a shader's
+// layer to the color view's SLICE_MAX, while Vulkan leaves a layer past the framebuffer undefined
+// (the device writes outside the image), so a mesh shader's layer output is clamped to it.
+inline constexpr std::uint32_t MeshLayerLimitDword = 6;
+// The same dword for a vertex-pipeline stage that writes gl_Layer: the last push constant dword,
+// which a non-mesh pipeline's user data does not use (LayerLimitPushBytes).
+inline constexpr std::uint32_t LayerLimitPushDword = (MeshDrawPushOffsetBytes / 4u) + MeshLayerLimitDword;
+inline constexpr std::uint32_t LayerLimitPushBytes = LayerLimitPushDword * 4u;
 inline constexpr std::uint32_t MeshArgumentAddressDword = 4;
 inline constexpr std::uint32_t MeshArgumentIndexCountDword = 3;
 inline constexpr std::uint32_t MeshArgumentFirstIndexDword = 4;
@@ -360,7 +368,7 @@ struct DescriptorBinding {
     std::vector<bool> bufferWritten;
     std::vector<bool> samplerUnnormalized;
     std::vector<bool> imageUnnormalized;
-    std::vector<std::uint32_t> imageSamplers;
+    std::vector<std::uint64_t> imageSamplers;
 };
 
 struct VertexAttribute {

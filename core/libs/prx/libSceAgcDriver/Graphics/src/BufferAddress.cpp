@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/AddressLedger.hpp"
 
 namespace AgcDriver::Graphics {
 
@@ -12,6 +13,7 @@ void Buffer::initializeAddress(VkBufferUsageFlags usage) {
     const VkBufferDeviceAddressInfo info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO, nullptr, buffer};
     deviceAddress = context.Function<PFN_vkGetBufferDeviceAddressKHR>("vkGetBufferDeviceAddressKHR")(context.device, &info);
     Require(deviceAddress != 0, "vkGetBufferDeviceAddressKHR returned a null address");
+    AddressLedger::Made(buffer, deviceAddress, capacity, "buffer");
 }
 
 }

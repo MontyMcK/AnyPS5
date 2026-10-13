@@ -32,6 +32,14 @@ enum class DebugKey : std::uint32_t {
     ClearSampledDepth,
     SplitDepthSlices,
     ClearDepthPerFrame,
+    TraceReads,
+    TraceTargetMinWidth,
+    TraceTargetMaxWidth,
+    TraceReadsInto,
+    DumpGuest,
+    DumpGuestBytes,
+    TraceBufferWrites,
+    TraceTargetFormat,
     Count
 };
 
@@ -58,6 +66,20 @@ inline constexpr std::array<DebugKeyInfo, static_cast<std::size_t>(DebugKey::Cou
     {"clear_sampled_depth", "APS5_CLEAR_SAMPLED_DEPTH", true},
     {"split_depth_slices", "APS5_SPLIT_DEPTH_SLICES", false},
     {"clear_depth_per_frame", "APS5_CLEAR_DEPTH_PER_FRAME", true},
+    // Every draw sampling a texture at this address: its shaders' code addresses and the texture's extent.
+    {"trace_reads", "APS5_TRACE_READS", true},
+    // trace_target only reports draws whose render extent width lies in [min, max] (0: unbounded).
+    {"trace_target_min_width", "APS5_TRACE_TARGET_MIN_WIDTH", false},
+    {"trace_target_max_width", "APS5_TRACE_TARGET_MAX_WIDTH", false},
+    // Every distinct texture sampled by draws rendering into the color target at this address.
+    {"trace_reads_into", "APS5_TRACE_READS_INTO", true},
+    // Writes dump_guest_<address>.bin: the guest memory at this address, dump_guest_bytes long (default 4 MiB).
+    {"dump_guest", "APS5_DUMP_GUEST", true},
+    {"dump_guest_bytes", "APS5_DUMP_GUEST_BYTES", true},
+    // Every written guest buffer binding whose range covers this address, with its shader.
+    {"trace_buffer_writes", "APS5_TRACE_BUFFER_WRITES", true},
+    // trace_target only reports color targets of this Vulkan format (0: any; 1: any, with the 400-draw budget), and then the first 400 draws.
+    {"trace_target_format", "APS5_TRACE_TARGET_FORMAT", false},
 }};
 
 struct DebugControlState {

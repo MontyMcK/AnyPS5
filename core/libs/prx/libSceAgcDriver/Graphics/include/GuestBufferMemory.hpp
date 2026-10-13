@@ -29,6 +29,9 @@ struct HostImport {
     VkDeviceAddress address;
     void* alias = nullptr;
     std::weak_ptr<const GuestAllocations::Range> range {};
+    // A span import (several adjacent registered ranges imported as one, for a region crossing
+    // their boundary): the ranges it covers, all of which must stay registered unchanged.
+    std::vector<std::weak_ptr<const GuestAllocations::Range>> parts {};
     // Identity for the life of this import (see HostImportSerial); 0 until first asked for.
     std::uint64_t serial = 0;
     bool unwatched = false;
@@ -222,6 +225,13 @@ public:
     struct AddressSpace;
     void WriteBack();
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const;
+    // The GPU buffer and byte offset holding [address, address + bytes) of a copied region (not a
+    // host import or mirror) this upload's shader writes: in recorded order its contents are the
+    // shader's results before any write-back reaches guest memory. Nothing otherwise.
+    std::optional<std::pair<VkBuffer, VkDeviceSize>> CopiedSource(std::uint64_t address, std::size_t bytes) const;
+    // Whether [address, address + bytes) lies in a region the shader reads and writes in place in a
+    // host import: its writes land in guest memory in recorded order, with no write-back.
+    bool InPlaceRange(std::uint64_t address, std::size_t bytes) const;
     // Guest ranges the shader may write through descriptors, as [begin, end).
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& Writes() const { return writes; }
     // Whether any written range lives in a copied buffer, so a write-back must run once the GPU is done.

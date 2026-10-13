@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cstdio>
 #include "prx/libSceAgcDriver/Graphics/include/DebugControls.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
@@ -109,7 +110,12 @@ constexpr std::uint32_t DepthControlMask = ~0x007007f0u;
 constexpr std::uint32_t ShaderControlMask = ~(0x0000f870u | 0x00020600u | 0x00010000u);
 constexpr std::uint32_t PixelStageRunsMask = 0x00020747u;
 constexpr std::uint32_t AlphaToCoverageMask = ~0x0001ff00u;
-constexpr std::uint32_t ScanModeMask = ~0x22u;
+// PA_SC_AA_CONFIG: the sample count, sample distance, exposed samples and centroid fields are
+// accepted and the draw rasterizes single-sampled (render targets are single-sampled); coverage
+// conversion and detail-to-exposed modes stay unsupported.
+constexpr std::uint32_t AaConfigMask = ~(0x7u | 0x10u | 0x1e000u | 0x700000u);
+// PA_SC_MODE_CNTL_0 MSAA_ENABLE (bit 0) is accepted with the single-sampled rasterization above.
+constexpr std::uint32_t ScanModeMask = ~0x23u;
 constexpr std::uint32_t ScanControlMask = ~0x06023fffu;
 constexpr std::uint32_t ScreenOffsetMask = ~0x01ff01ffu;
 // Bits 26/27 (ZCLIP_NEAR/FAR_DISABLE) become depth clamping; bit 19 selects the [0, 1] clip space.
@@ -464,12 +470,18 @@ ShaderStages DecodeShaderStages(const QueueState& queue) {
         validate((value & ~0x0247a010u) == 0, "unsupported vertex routing, scheduling or wave-ID state");
     } else if (path == ShaderPath::Tessellation) {
         validate((value & 0x00600020u) == 0, "wave32 tessellation or geometry amplification is unsupported");
-        validate((value & ~0x0007ed0du) == 0 && (value & 3u) == 1u && ((value >> 3u) & 3u) == 1u, "unsupported tessellation routing");
+        // The domain program runs as an NGG passthrough ES (PRIMGEN_EN, PRIMGEN_PASSTHRU_EN): its
+        // primitive export is the passthrough primitive, which TessellationLowering removes.
+        validate((value & ~0x0207ed0du) == 0 && (value & 0x02002000u) == 0x02002000u && (value & 3u) == 1u && ((value >> 3u) & 3u) == 1u, "unsupported tessellation routing");
         const auto config = read(queue.context, 0x2d6);
         const auto parameters = read(queue.context, 0x2db);
-        ShaderRecompiler::TessellationConfiguration tess{(config >> 8u) & 0x3fu, (config >> 14u) & 0x3fu, parameters & 3u, (parameters >> 2u) & 3u, (parameters >> 5u) & 3u};
+        ShaderRecompiler::TessellationConfiguration tess{(config >> 8u) & 0x3fu, (config >> 14u) & 0x3fu, parameters & 3u, (parameters >> 2u) & 7u, (parameters >> 5u) & 7u};
         validate(tess.inputControlPoints != 0 && tess.inputControlPoints <= 32 && tess.outputControlPoints != 0 && tess.outputControlPoints <= 32, "invalid tessellation control-point counts");
-        validate(tess.domain == 1 && tess.partitioning == 2 && tess.outputTopology == 2, "only triangular, fractional-odd, clockwise tessellation is supported by the reference path");
+        if ((parameters & ~0x000600ffu) != 0) Require(false, zeroMessage(0x2db, parameters, "VGT_TF_PARAM donut, factor detection, memory type or reserved state"));
+        validate(tess.domain <= 2 && tess.partitioning <= 3 && tess.outputTopology <= 3 && (tess.domain == 0 || tess.outputTopology != 1) && (tess.domain != 0 || tess.outputTopology <= 1), "unsupported tessellation domain, partitioning or output topology");
+        // The factor clamp (EmitSetTessellationAttribute) implements the fractional-odd level range.
+        validate(tess.partitioning == 2, "only fractional-odd tessellation is supported by the reference path");
+        Require(readFloat(queue.context, 0x287) <= 1.0f && readFloat(queue.context, 0x286) >= 63.0f, "tessellation level clamps inside the fractional-odd range [1, 63] are unsupported");
         result.tessellation = tess;
     } else {
         validate((value & ~0x0047ec30u) == 0, "unsupported geometry routing, fast launch or wave-ID state");
@@ -559,7 +571,7 @@ State DecodeState(const QueueState& queue) {
     }
     zero(cx, 0x203, shaderControlMask(read(cx, 0x1c4)), "depth export, shader coverage or ordered fragment execution");
     zero(cx, 0x2dc, AlphaToCoverageMask, "alpha-to-coverage");
-    zero(cx, 0x2f8, ~0u, "multisampling or coverage conversion");
+    zero(cx, 0x2f8, AaConfigMask, "multisampling or coverage conversion");
     zero(cx, 0x292, ScanModeMask, "scan conversion mode");
     zero(cx, 0x293, ScanControlMask, "sample iteration, primitive discard or out-of-order rasterization");
     zero(cx, 0x80, ~0u, "window offset");
@@ -813,17 +825,13 @@ GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
     return surface;
 }
 
-static bool BlendedFloat11Target(std::uint32_t blend, std::uint64_t surfaceAddress) {
-    static std::mutex mutex;
-    static std::unordered_set<std::uint64_t> blended;
+// Whether this draw blends into a COLOR_11_11_10 target, which then renders natively (B10G11R11) so
+// the blend works. Decided per draw: transient heaps hand the same address to unrelated targets, and
+// a native target's bits are not the guest's 11_11_10 layout, which format-43 readers decode.
+static bool BlendedFloat11Target(std::uint32_t blend, std::uint64_t) {
     const bool enabled = ((blend >> 30u) & 1u) != 0;
     const bool replace = (blend & 0x1fu) == 1u && ((blend >> 8u) & 0x1fu) == 0u && ((blend >> 5u) & 7u) == 0u;
-    std::lock_guard lock(mutex);
-    if (enabled && !replace) {
-        blended.insert(surfaceAddress);
-        return true;
-    }
-    return blended.contains(surfaceAddress);
+    return enabled && !replace;
 }
 
 ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
@@ -837,14 +845,17 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     const auto format = (info >> 2u) & 0x1fu;
     auto decoded = DecodeColorFormat(format, number, swap);
     // ROUND_MODE (bit 18) only affects unorm rounding. With DCC_ENABLE (bit 28) the target is written
-    if ((info & ~(0x00039f7cu | 0x00040000u | 0x10000000u | 0x00002000u)) != 0) throw std::runtime_error("AGC graphics: color compression, DCC, endian conversion, nonstandard rounding or color optimization is unsupported (CB_COLOR_INFO 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%08x", info); return std::string(text); }() + ")");
+    // COMPRESSION (bit 14) is FMASK compression of a multisampled target, which renders single-sampled.
+    if ((info & ~(0x00039f7cu | 0x00040000u | 0x10000000u | 0x00002000u | 0x00004000u)) != 0) throw std::runtime_error("AGC graphics: color compression, DCC, endian conversion, nonstandard rounding or color optimization is unsupported (CB_COLOR_INFO 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%08x", info); return std::string(text); }() + ")");
     Require((info & 0x8000u) != 0 || number == 7 || number == 4 || number == 5, "unclamped normalized color is unsupported");
     const auto view = read(cx, 0x31b + stride);
     Require((view & ~0x3fffffffu) == 0, "reserved CB_COLOR_VIEW bits are set");
     const auto slice = view & 0x1fffu;
     const auto lastSlice = (view >> 13u) & 0x1fffu;
     const auto viewMip = (view >> 26u) & 0xfu;
-    zero(cx, 0x31d + stride, ~0u, "color samples, fragments or destination alpha override");
+    // CB_COLOR_ATTRIB: the FMASK tiling, sample and fragment counts and fetch-size hints are accepted;
+    // a multisampled target renders single-sampled. Destination alpha override stays unsupported.
+    zero(cx, 0x31d + stride, ~(0x00000fe0u | 0x0001f000u | 0x001c0000u), "color samples, fragments or destination alpha override");
     const auto attrib2 = read(cx, 0x3b0 + slot);
     const auto maxMip = attrib2 >> 28u;
     Require(viewMip <= maxMip, "color view mip exceeds the surface");
@@ -882,9 +893,42 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     Require((high & ~0xffu) == 0, "invalid color address extension");
     color.surfaceAddress = (static_cast<std::uint64_t>(high) << 40u) | (static_cast<std::uint64_t>(read(cx, 0x318 + stride)) << 8u);
     const auto baseSurfaceAddress = color.surfaceAddress;
-    if (slice != 0 && !volume && color.arraySize == 1u) color.surfaceAddress += slice * ComputeSurfaceSize(ComputeElementMipLayout(ColorTextureTileMode(color.tileMode), color.elementBytes, color.surfaceExtent.width, color.surfaceExtent.height, color.mipCount), 1);
-    color.address = color.surfaceAddress + mipOffset;
-    if (decoded.packing == ShaderRecompiler::ColorExportPacking::Float11_11_10 && DebugValue(DebugKey::Packed111110) == 0 && (color.mipCount > 1u || BlendedFloat11Target(read(cx, 0x1e0 + slot), baseSurfaceAddress))) {
+    // APS5_RT_SLICE_LAYERS=1 (experiment): a single-slice view of a 2D surface that declares more
+    // slices renders into that layer of the array image (cube faces), not into a 2D image of its own
+    // at the slice's address, which round-trips through guest memory against the array.
+    static const bool sliceLayers = std::getenv("APS5_RT_SLICE_LAYERS") != nullptr;
+    const auto declaredSlices = (attrib3 & 0x1fffu) + 1u;
+    bool sliceLayer = false;
+    if (slice != 0 && !volume && color.arraySize == 1u) {
+        if (sliceLayers && declaredSlices > slice && (info & 0x10002000u) == 0 && (color.tileMode == ColorTileMode::RenderTarget || color.tileMode == ColorTileMode::Standard4KB)) {
+            color.arraySize = declaredSlices;
+            color.depthSlice = slice;
+            color.layers = 1;
+            sliceLayer = true;
+        } else {
+            color.surfaceAddress += slice * ComputeSurfaceSize(ComputeElementMipLayout(ColorTextureTileMode(color.tileMode), color.elementBytes, color.surfaceExtent.width, color.surfaceExtent.height, color.mipCount), 1);
+        }
+    }
+    color.address = sliceLayer ? color.surfaceAddress : color.surfaceAddress + mipOffset;
+    // A blended COLOR_11_11_10 draw stays packed (the guest's 11_11_10 bits, which format-43 readers
+    // decode) and loses its blend. Rendering it natively stores another bit layout, and readers of that
+    // memory decode garbage (PPSA01317's flyover foliage turned to Inf/NaN). packed_11_11_10=4 blends
+    // through a B10G11R11 attachment proxy repacked to and from the packed bits around the pass (the
+    // layouts agree, yet the probe still accumulates NaN there: not the default until that is found);
+    // packed_11_11_10=3 renders blended draws natively as before.
+    bool blendProxy = false;
+    if (decoded.packing == ShaderRecompiler::ColorExportPacking::Float11_11_10 && DebugValue(DebugKey::Packed111110) != 1 && BlendedFloat11Target(read(cx, 0x1e0 + slot), baseSurfaceAddress)) {
+        if (DebugValue(DebugKey::Packed111110) == 3) {
+            decoded = {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4, 0xc6u};
+        } else if (DebugValue(DebugKey::Packed111110) == 4 && color.depth == 1u) {
+            decoded = {VK_FORMAT_R32_UINT, 4, 0xc6u};
+            blendProxy = true;
+        } else {
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[color] COLOR_11_11_10 target 0x%llx blends (%u levels, %u layers); rendered packed without the blend\n", static_cast<unsigned long long>(baseSurfaceAddress), color.mipCount, color.arraySize);
+        }
+    }
+    if (decoded.packing == ShaderRecompiler::ColorExportPacking::Float11_11_10 && DebugValue(DebugKey::Packed111110) == 0 && color.mipCount > 1u) {
         decoded = {VK_FORMAT_B10G11R11_UFLOAT_PACK32, 4, 0xc6u};
     }
     color.bytes = colorLayout.Bytes();
@@ -892,6 +936,7 @@ ColorTarget DecodeColorBuffer(const Registers& cx, std::uint32_t slot) {
     color.format = decoded.format;
     color.componentMapping = decoded.componentMapping;
     color.packing = decoded.packing;
+    color.blendProxy111110 = blendProxy;
     Require(color.packing == ShaderRecompiler::ColorExportPacking::None || (info & 0x10002000u) == 0, "compressed packed float color targets are unsupported");
     for (std::uint32_t word = 0; word < 2; ++word) {
         const auto clear = find(cx, 0x323 + word + stride);
@@ -930,11 +975,13 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
     const auto control = find(cx, 0x202);
     if (control == cx.end()) return std::nullopt;
     const auto mode = (control->second >> 4u) & 7u;
-    if (mode != 2u && mode != 6u) return std::nullopt;
-    ColorMetadataPass pass{mode == 2u ? ColorMetadataPass::Mode::EliminateFastClear : ColorMetadataPass::Mode::DccDecompress, {}};
+    if (mode != 2u && mode != 3u && mode != 6u) return std::nullopt;
+    // A resolve-mode word on a draw without color writes renders as a normal draw (colorControlSupported); only a draw DrawRejection would refuse becomes a resolve pass.
+    if (mode == 3u && (find(cx, 0x8e) == cx.end() || find(cx, 0x8f) == cx.end() || ColorWriteMask(cx) == 0)) return std::nullopt;
+    ColorMetadataPass pass{mode == 2u ? ColorMetadataPass::Mode::EliminateFastClear : mode == 3u ? ColorMetadataPass::Mode::Resolve : ColorMetadataPass::Mode::DccDecompress, {}};
     Require((control->second & ~0x70u) == 0xcc0000u, "CB metadata pass with a nonstandard ROP, dual quads disabled or degamma");
     Require((read(cx, 0x200) & 0xfu) == 0 && (read(cx, 0x0) & 0xfu) == 0, "CB metadata pass with depth or stencil work");
-    zero(cx, 0x2f8, ~0u, "multisampling or coverage conversion");
+    zero(cx, 0x2f8, AaConfigMask, "multisampling or coverage conversion");
     zero(cx, 0x80, ~0u, "window offset");
     const auto viewportControl = read(cx, 0x206);
     if (viewportControl != 0x43fu) throw std::runtime_error(vteMessage(viewportControl));
@@ -947,6 +994,40 @@ std::optional<ColorMetadataPass> DecodeColorMetadataPass(const QueueState& queue
     intersect(covered, cx, 0x81, false);
     intersect(covered, cx, 0x90, false);
     if ((read(cx, 0x292) & 2u) != 0) intersect(covered, cx, 0x94, false);
+    if (pass.mode == ColorMetadataPass::Mode::Resolve) {
+        // CB_RESOLVE: the CB reads the multisampled CB_COLOR0 and stores its resolved texels into the
+        // single-sampled CB_COLOR1 wherever the draw rasterizes; CB_TARGET_MASK and the pixel
+        // shader's exports take no part. Multisampled targets render single-sampled here, so the
+        // resolve copies CB_COLOR0's texels. The draw is taken to cover its viewport (a resolve's
+        // full-viewport rectangle): the pixels resolved are those whose centers lie inside the
+        // viewport and the scissors, inside both targets.
+        for (std::uint32_t slot = 0; slot < 2; ++slot) {
+            const auto info = find(cx, 0x31c + slot * 0xfu);
+            if (info == cx.end() || ((info->second >> 2u) & 0x1fu) == 0) throw std::runtime_error(slot == 0 ? "AGC graphics: CB resolve without a source color target in CB_COLOR0" : "AGC graphics: CB resolve without a destination color target in CB_COLOR1");
+            pass.targets.push_back(DecodeColorBuffer(cx, slot));
+        }
+        const auto& source = pass.targets[0];
+        const auto& destination = pass.targets[1];
+        // Compare the guest format fields (FORMAT 6:2, NUMBER_TYPE 10:8, COMP_SWAP 12:11), not the
+        // decoded VkFormat: an R11G11B10 surface decodes as B10G11R11_UFLOAT once it was blended
+        // (BlendedFloat11Target) and as packed R32_UINT otherwise, with the same bits in memory.
+        const auto sourceFormat = read(cx, 0x31c) & 0x1f7cu;
+        const auto destinationFormat = read(cx, 0x31c + 0xfu) & 0x1f7cu;
+        if (sourceFormat != destinationFormat || source.elementBytes != destination.elementBytes) {
+            char text[192];
+            std::snprintf(text, sizeof(text), "AGC graphics: CB resolve between different color formats (CB_COLOR0_INFO format fields 0x%04x into CB_COLOR1_INFO 0x%04x) is unsupported", static_cast<unsigned>(sourceFormat), static_cast<unsigned>(destinationFormat));
+            throw std::runtime_error(text);
+        }
+        Require(source.depth == 1 && destination.depth == 1 && source.arraySize == 1 && destination.arraySize == 1 && source.layers == 1 && destination.layers == 1, "CB resolve of a 3D or layered color target is unsupported");
+        Require(source.address != destination.address, "CB resolve onto its own source is unsupported");
+        const auto center = [](float edge) { return static_cast<std::int64_t>(std::ceil(edge - 0.5f)); };
+        const auto left = std::max<std::int64_t>({0, covered.offset.x, center(xo - xs)});
+        const auto top = std::max<std::int64_t>({0, covered.offset.y, center(yo - ys)});
+        const auto right = std::min<std::int64_t>({static_cast<std::int64_t>(covered.offset.x) + covered.extent.width, center(xo + xs), source.extent.width, destination.extent.width});
+        const auto bottom = std::min<std::int64_t>({static_cast<std::int64_t>(covered.offset.y) + covered.extent.height, center(yo + ys), source.extent.height, destination.extent.height});
+        if (right > left && bottom > top) pass.region = {{static_cast<std::int32_t>(left), static_cast<std::int32_t>(top)}, {static_cast<std::uint32_t>(right - left), static_cast<std::uint32_t>(bottom - top)}};
+        return pass;
+    }
     const auto targetMask = read(cx, 0x8e);
     for (std::uint32_t slot = 0; slot < 8; ++slot) {
         if (((targetMask >> (4u * slot)) & 0xfu) == 0 || ((read(cx, 0x31c + slot * 0xfu) >> 2u) & 0x1fu) == 0) continue;
@@ -997,7 +1078,7 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     static_cast<void>(value(cx, 0x1c4, zFormat));
     if (auto reason = nonzero(cx, 0x203, shaderControlMask(zFormat), "depth export, shader coverage or ordered fragment execution"); !reason.empty()) return reason;
     if (auto reason = nonzero(cx, 0x2dc, AlphaToCoverageMask, "alpha-to-coverage"); !reason.empty()) return reason;
-    if (auto reason = nonzero(cx, 0x2f8, ~0u, "multisampling or coverage conversion"); !reason.empty()) return reason;
+    if (auto reason = nonzero(cx, 0x2f8, AaConfigMask, "multisampling or coverage conversion"); !reason.empty()) return reason;
     if (auto reason = nonzero(cx, 0x292, ScanModeMask, "scan conversion mode"); !reason.empty()) return reason;
     if (auto reason = nonzero(cx, 0x293, ScanControlMask, "sample iteration, primitive discard or out-of-order rasterization"); !reason.empty()) return reason;
     if (auto reason = nonzero(cx, 0x80, ~0u, "window offset"); !reason.empty()) return reason;

@@ -88,8 +88,9 @@ MeshArguments ResolveMeshArguments(const Pm4::DrawArguments& record, const MeshA
 // recordable (no recorder, APS5_SYNC_DRAWS, APS5_DUMP_TARGETS), a resident target is gone from the
 // storage cache, the template is gone, the pipeline is gone from the pipeline store, or the
 // template's proof failed (ShaderResources::ProveCurrent; the template is removed from the
-// resource cache and kept by the batch).
-enum class DrawRecipeMiss : std::uint8_t { None, NotRecordable, TargetGone, TemplateGone, ObjectsGone, Proof, Count };
+// resource cache and kept by the batch), the depth target's attachment view is not the recipe's
+// any more (DepthGone), or a moved-buffer recipe's buffers cannot be rebound (MovedRefused).
+enum class DrawRecipeMiss : std::uint8_t { None, NotRecordable, TargetGone, TemplateGone, ObjectsGone, Proof, DepthGone, MovedRefused, Count };
 const char* DrawRecipeMissName(DrawRecipeMiss miss);
 struct DrawRecipeOutcome {
     bool recorded = false;
@@ -98,6 +99,13 @@ struct DrawRecipeOutcome {
     // APS5_PROFILE_DRAW: the proof's and the record's time.
     double proofUs = 0;
     double recordUs = 0;
+    // The recipe had a depth target / rebound moved buffers (the [recipe] line's depth and moved
+    // counts), and APS5_VERIFY_DRAW_RECIPE checked the hit against the ordinary path's lookups
+    // (`replaced`: the template or pipeline those return is another, live object).
+    bool depth = false;
+    bool moved = false;
+    bool verified = false;
+    bool replaced = false;
 };
 // A draw-cache hit recorded from its recipe, under GuestMemory::GpuMutex after the packet's labels
 // (design_cpu_final M8, step 8b): the validation with the recipe's stored outputs, the index and
@@ -108,6 +116,10 @@ struct DrawRecipeOutcome {
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe);
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();
+// Whether draws with a depth target get recipes (APS5_NO_DEPTH_RECIPE unset), and draws whose
+// template hit rebinds moved read-only buffers (APS5_NO_MOVED_RECIPE unset).
+bool DepthDrawRecipes();
+bool MovedDrawRecipes();
 
 // How an indirect draw's records were read, for the [draws] line (APS5_PROFILE_DRAW): Gpu is
 // vkCmdDrawIndirect from the host import; every other value names why the CPU read them instead,

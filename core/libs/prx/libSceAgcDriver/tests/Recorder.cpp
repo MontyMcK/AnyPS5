@@ -2663,6 +2663,91 @@ void metadataPassTests(const Device& device, Recorder& recorder) {
     Require(keysUncompressed() && memoryHolds({0xff, 0xff, 0xff, 0xff}), "a pass over a remade resident image did not store the 1111 value");
 }
 
+// CB resolve (ColorMetadataPass::Mode::Resolve): the region of CB_COLOR0's resident image is
+// copied on the device into CB_COLOR1's, which is then pending like a draw's target; the source's
+// resident results (not its guest bytes) are what is copied, and the source stays as it was.
+void resolvePassTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: resolve passes not tested\n";
+        return;
+    }
+    constexpr std::uint32_t side = 256;
+    constexpr std::size_t surfaceBytes = side * side * 4;
+    constexpr std::size_t texels = side * side;
+    constexpr std::size_t bytes = surfaceBytes * 2;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the resolve pass block");
+    auto* memory = static_cast<std::uint8_t*>(block);
+    std::memset(memory, 0x77, surfaceBytes);
+    std::memset(memory + surfaceBytes, 0x11, surfaceBytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            ClearCachedTextures(context.device);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    if (HostImportFor(base, address, bytes) == nullptr) {
+        std::cout << "host import of the resolve pass block refused: resolve passes not tested\n";
+        return;
+    }
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    ColorTarget source{};
+    source.address = address;
+    source.extent = {side, side};
+    source.format = VK_FORMAT_R8G8B8A8_UNORM;
+    source.bytes = surfaceBytes;
+    source.componentMapping = 0xe4u;
+    source.tileMode = ColorTileMode::RenderTarget;
+    source.elementBytes = 4;
+    auto destination = source;
+    destination.address = address + surfaceBytes;
+    destination.slot = 1;
+    const auto count = [&](std::uint64_t at, std::uint32_t value) {
+        StorageTexture::FlushPending(at, surfaceBytes, nullptr, "test");
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        std::vector<std::uint32_t> stored(texels);
+        AgcDriver::GuestMemory::Read(at, std::as_writable_bytes(std::span(stored)), 1);
+        return static_cast<std::size_t>(std::count(stored.begin(), stored.end(), value));
+    };
+    constexpr std::size_t regionTexels = 64 * 48;
+    RunColorMetadataPass(context, {ColorMetadataPass::Mode::Resolve, {source, destination}, {{16, 32}, {64, 48}}});
+    Require(StorageTexture::FindPending(destination.address, surfaceBytes) != nullptr && memory[surfaceBytes] == 0x11, "the resolve did not stay in the destination's resident image");
+    Require(StorageTexture::FindPending(source.address, surfaceBytes) == nullptr, "the resolve left results of its source pending");
+    Require(count(destination.address, 0x77777777u) == regionTexels && count(destination.address, 0x11111111u) == texels - regionTexels, "a partial resolve stored outside its region or missed part of it");
+    RunColorMetadataPass(context, {ColorMetadataPass::Mode::Resolve, {source, destination}, {{0, 0}, {side, side}}});
+    Require(count(destination.address, 0x77777777u) == texels && count(source.address, 0x77777777u) == texels, "a full resolve did not copy the source's texels or changed the source");
+    const auto sourceImage = CachedStorageSurface(context, SurfaceForTarget(source));
+    const std::array<std::uint32_t, 4> pattern{0x22222222u, 0x22222222u, 0x22222222u, 0x22222222u};
+    const char* refusal = nullptr;
+    if (!sourceImage->FillClear(std::span<const std::uint32_t, 4>(pattern), StorageTexture::WholeImage, refusal)) {
+        std::cout << "storage clear refused (" << (refusal != nullptr ? refusal : "?") << "): resolve of pending results not tested\n";
+        return;
+    }
+    RunColorMetadataPass(context, {ColorMetadataPass::Mode::Resolve, {source, destination}, {{0, 0}, {side, side}}});
+    Require(count(destination.address, 0x22222222u) == texels, "a resolve did not copy the source's pending results");
+}
+
 // The data word positions of a dispatch-cache variant (Driver.cpp's data-only hits): leaves
 // located among the runs' words, aliased, unaligned, out-of-run and mismatched ones skipped.
 void dataWordPositionsTests() {
@@ -3527,6 +3612,7 @@ int main(int argc, char** argv) {
         singleCubeTests(device, recorder);
         atomicViewTests(device, recorder);
         metadataPassTests(device, recorder);
+        resolvePassTests(device, recorder);
         pendingKeyStoreTests(device, recorder);
         sampleDumpTests(device, recorder);
         std::cout << "Recorder read tracking and label tests passed\n";

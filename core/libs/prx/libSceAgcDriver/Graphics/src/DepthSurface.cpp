@@ -22,6 +22,14 @@
 #include <vector>
 
 namespace AgcDriver::Graphics {
+
+// A depth surface's memory viewed in a shape its depth plane cannot have (another format, mips,
+// slices) is colour memory the title reuses (transient pools): served by the ordinary colour paths.
+// APS5_NO_DEPTH_REPURPOSE=1 refuses such views as before.
+bool RepurposedDepthMemory() {
+    static const bool enabled = std::getenv("APS5_NO_DEPTH_REPURPOSE") == nullptr;
+    return enabled;
+}
 namespace {
 
 std::uint64_t NextDepthGeneration() {
@@ -108,6 +116,13 @@ public:
         const bool depthBits = !stencil && words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) == (d16 ? 16u : 32u);
         const bool oneSlice = resource.dimension == TextureDimension::k2D || (resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray == 0);
         if ((format != expected && !depthBits) || !oneSlice || resource.width != target.extent.width || resource.height != target.extent.height || resource.baseLevel != 0 || resource.lastLevel != 0 || resource.baseArray != 0) {
+            if (RepurposedDepthMemory()) {
+                // A view the depth plane cannot be (another format, mips or slices): the memory is a
+                // colour resource now (the title reuses transient memory), served as one.
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1) < 8) std::fprintf(stderr, "[depth] 0x%llx (%ux%u, vk %d) sampled as a %ux%u texture of vk %d, levels %u-%u: treated as colour memory\n", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), resource.width, resource.height, static_cast<int>(format), resource.baseLevel, resource.lastLevel);
+                return nullptr;
+            }
             char text[448];
             std::snprintf(text, sizeof(text), "AGC graphics: sampling the %s plane of depth surface 0x%llx (%ux%u, vk format %d) as a %ux%u texture of guest format %u (vk %d), tile mode %u, dimension %d, levels %u-%u, slice %u is not implemented (T# %08x %08x %08x %08x %08x %08x %08x %08x)",
                           stencil ? "stencil" : "depth", static_cast<unsigned long long>(target.address), target.extent.width, target.extent.height, static_cast<int>(target.format), resource.width, resource.height, resource.format, static_cast<int>(format),
@@ -137,6 +152,14 @@ public:
     const StorageTexture* seeded = nullptr;
     std::uint32_t writerLayer = 0;
     std::uint64_t generation = NextDepthGeneration();
+
+    bool TransferFits(const StorageTexture& storage, std::uint32_t layer) const {
+        const auto& descriptor = storage.Descriptor();
+        const bool d16 = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+        const auto storageFormat = storage.StorageFormat();
+        const bool sized = d16 ? (storageFormat == VK_FORMAT_R16_UINT || storageFormat == VK_FORMAT_R16_UNORM || storageFormat == VK_FORMAT_R16_SINT || storageFormat == VK_FORMAT_R16_SNORM || storageFormat == VK_FORMAT_R16_SFLOAT) : (storageFormat == VK_FORMAT_R32_SFLOAT || storageFormat == VK_FORMAT_R32_UINT || storageFormat == VK_FORMAT_R32_SINT);
+        return sized && descriptor.width == target.extent.width && descriptor.height == target.extent.height && descriptor.mipCount == 1 && (descriptor.dimension == TextureDimension::k2D || descriptor.dimension == TextureDimension::k2DArray) && (layer == 0 || layer <= descriptor.depthOrLastArray);
+    }
 
     void Transfer(StorageTexture& storage, bool into, std::uint32_t layer) {
         const auto& descriptor = storage.Descriptor();
@@ -576,6 +599,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     const auto layers = cube ? 6u : layered ? resource.depthOrLastArray + 1u : 1u;
     if (base.layers > 1u && resource.dimension == TextureDimension::k2DArray && layers <= base.layers && format == copyFormat && !integer && resource.width == base.extent.width && resource.height == base.extent.height && resource.baseLevel == 0 && resource.lastLevel == 0) return (*found)->Layered(components);
     if (format != copyFormat || resource.width != base.extent.width || resource.height != base.extent.height || resource.baseLevel != 0 || resource.lastLevel != 0 || resource.baseArray != 0 || (cube && resource.depthOrLastArray != 0 && resource.depthOrLastArray != 5) || (resource.dimension != TextureDimension::k2D && resource.dimension != TextureDimension::k2DArray && !cube)) {
+        if (RepurposedDepthMemory()) return nullptr;
         char text[320];
         std::snprintf(text, sizeof(text), "AGC graphics: sampling the depth planes of depth surface 0x%llx (%ux%u, vk format %d) as a %ux%u texture of guest format %u (vk %d), dimension %d, %u slices, levels %u-%u, base slice %u is not implemented", static_cast<unsigned long long>(base.address), base.extent.width, base.extent.height, static_cast<int>(base.format), resource.width, resource.height, resource.format, static_cast<int>(format), static_cast<int>(resource.dimension), layers, resource.baseLevel, resource.lastLevel, resource.baseArray);
         throw std::runtime_error(text);
@@ -621,6 +645,13 @@ void SeedStorageFromDepth(const Context& context, const std::shared_ptr<StorageT
         if (slice == list.rend()) continue;
         auto& surface = **slice;
         if (surface.seeded == storage.get() && surface.writerLayer == layer && surface.writer.lock() == storage) continue;
+        if (RepurposedDepthMemory() && !surface.TransferFits(*storage, layer)) {
+            // A storage image of another format or mip count over the depth surface's memory: the
+            // memory is reused for colour, so the image keeps its own contents.
+            static std::atomic<int> told{0};
+            if (told.fetch_add(1) < 8) std::fprintf(stderr, "[depth] storage image over depth surface 0x%llx (vk %d) is a colour resource (vk %d, %u mips): not seeded\n", static_cast<unsigned long long>(surface.target.address), static_cast<int>(surface.target.format), static_cast<int>(storage->StorageFormat()), storage->Descriptor().mipCount);
+            return;
+        }
         surface.ApplyFastClear();
         surface.TakeWrites();
         surface.Transfer(*storage, true, layer);

@@ -15,6 +15,7 @@
 #include "SceTypes.hpp"
 #include "ModuleTable.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libkernel/Automation/include/Automation.hpp"
 
 namespace {
 
@@ -126,6 +127,7 @@ int APS5_VABI sceSysmoduleLoadModule(std::uint16_t id) {
         // throw std::runtime_error(std::string("sceSysmoduleLoadModule: unknown id ") + std::to_string(id));
         return 0;
     }
+    if (Automation::Enabled()) Automation::Fields().Hex("id", id).Str("name", findModuleName(id)).Emit("sysmodule");
     std::lock_guard<std::mutex> lock(gMutex);
     gLoadCount[id]++;
     return 0;

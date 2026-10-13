@@ -100,6 +100,8 @@ std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();
 void SetCollectHistoryFlag(bool (*flag)());
 std::uint64_t CollectedGeneration();
+// Moves whenever any block is stamped: an UnchangedSince answer stays what it was while this does.
+std::uint64_t StampSerial();
 std::uint64_t UnwatchSerial();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // Frame capture (FrameCapture.cpp). `dirty` is called for every page a walk of any thread reports
@@ -153,7 +155,16 @@ public:
 
 private:
     void acquired();
+    // The lock itself: an SRW lock made recursive by its owner's thread id and depth on Windows
+    // (winpthread's recursive mutex costs several times as much per acquisition), std::recursive_mutex
+    // elsewhere or with APS5_STD_GPU_MUTEX=1.
+    bool rawTryLock();
+    void rawLock();
+    void rawUnlock();
     std::recursive_mutex mutex;
+    void* srwLock = nullptr;
+    std::atomic<unsigned long> srwOwner{0};
+    std::uint32_t srwDepth = 0;
     // The holder's thread token and recursion depth, written by the holder only; another thread
     // reads the owner just to see that it is not itself.
     std::atomic<const void*> owner{nullptr};
@@ -170,6 +181,17 @@ void SetGpuUnlockHook(void (*hook)());
 // only be reached under it (a resource build's stage A runs without it, see ShaderResources).
 void AssertGpuLockHeld(const char* where);
 void SetForkTrap(void (*trap)(const char* site));
+class ProbeSink {
+public:
+    virtual void Baked(std::uint64_t address, std::size_t bytes, std::uint64_t generation) = 0;
+    virtual void Event(const char* reason) = 0;
+
+protected:
+    ~ProbeSink() = default;
+};
+ProbeSink* SetProbeSink(ProbeSink* sink);
+void NoteBaked(std::uint64_t address, std::size_t bytes, std::uint64_t generation = 0);
+void NoteProbeEvent(const char* reason);
 void TagGpuLockThread(std::uint32_t queue);
 // The presenter stays untagged (its tag is a queue id to the recorder) but takes its own column
 // of the [lock] holder matrix, apart from the game threads.

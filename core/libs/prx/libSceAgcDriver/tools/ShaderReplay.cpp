@@ -49,6 +49,11 @@ bool g_maintenance8 = false;
 bool g_code = false;
 bool g_images = false;
 bool g_rawControlFlow = false;
+bool g_prepare = false;
+// --synthetic-memory: guest reads outside the captured regions (descriptor tables the dumps do not
+// carry) return 0, so the descriptor walk and the SPIR-V emission run without the title's memory.
+bool g_syntheticMemory = false;
+std::uint64_t g_syntheticReads = 0;
 
 bool ReplayControlFlow(const char* path) {
     std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -90,6 +95,13 @@ bool ReadCaptured(void* context, std::uint64_t address, std::uint32_t* value) {
     return false;
 }
 
+bool ReadSynthetic(void* context, std::uint64_t address, std::uint32_t* value) {
+    if (ReadCaptured(context, address, value)) return true;
+    ++g_syntheticReads;
+    *value = 0;
+    return true;
+}
+
 bool Replay(const char* path) {
     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
     // A replay measures the current implementation, not a prior cached artifact.
@@ -106,6 +118,18 @@ bool Replay(const char* path) {
         if (graphics.mesh.has_value()) {
             const auto& mesh = *graphics.mesh;
             std::printf("  mesh: input primitive %u, %u primitives / %u vertices per group, max %u vertices / %u primitives, %u threads, lds %u dwords, provoking %u, ESGS item %u\n", mesh.inputPrimitive, mesh.primitivesPerGroup, mesh.verticesPerGroup, mesh.maxVertices, mesh.maxPrimitives, mesh.threadsPerGroup, mesh.ldsSizeDwords, mesh.provokingVertex, mesh.esgsItemSize);
+        }
+    }
+    if (g_prepare) {
+        try {
+            const auto start = std::chrono::steady_clock::now();
+            const auto handle = ShaderRecompiler::PrepareShader(request.request);
+            const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            std::printf("  prepared: %s, %.1f ms\n", handle != nullptr ? "yes" : "no handle", ms);
+            return handle != nullptr;
+        } catch (const std::exception& error) {
+            std::printf("  prepare failed: %s\n", FirstLine(error.what()).c_str());
+            return false;
         }
     }
     ShaderRecompiler::CapturedCallProgram captured;
@@ -215,9 +239,17 @@ bool Replay(const char* path) {
     try {
         if (g_maintenance8) request.request.target.nonConstantImageOffsets = true;
         const auto start = std::chrono::steady_clock::now();
-        const auto result = ShaderRecompiler::Recompile(request.request);
+        std::shared_ptr<const ShaderRecompiler::RecompileResult> synthetic;
+        if (g_syntheticMemory) {
+            g_syntheticReads = 0;
+            const ShaderRecompiler::SrtRuntime runtime{request.request.context.userData, request.request.shader.codeAddress, ReadSynthetic, &request.request, ReadSynthetic};
+            const auto capture = ShaderRecompiler::CaptureResources(request.request, runtime);
+            synthetic = ShaderRecompiler::Recompile(request.request, *capture);
+        }
+        const auto result = synthetic != nullptr ? *synthetic : ShaderRecompiler::Recompile(request.request);
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         std::printf("  recompiled: %zu SPIR-V words, %.1f ms\n", result.spirv.size(), ms);
+        if (g_syntheticMemory) std::printf("  synthetic memory: %llu guest reads outside the captured regions returned 0\n", static_cast<unsigned long long>(g_syntheticReads));
         if (g_spirv) {
             std::string name(path);
             name = name.substr(name.find_last_of("/\\") + 1) + ".spv";
@@ -253,13 +285,17 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--images] [--spv] [--code] [--maintenance8] <shader.req>...\n  agc_shader_replay --raw-control-flow <validation.bin>...\n  the driver writes shader_<address>.req files with APS5_DUMP_SHADERS or APS5_DUMP_SHADER_FAILURES\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--images] [--spv] [--synthetic-memory] [--code] [--maintenance8] [--prepare] <shader.req>...\n  agc_shader_replay --raw-control-flow <validation.bin>...\n  the driver writes shader_<address>.req files with APS5_DUMP_SHADERS or APS5_DUMP_SHADER_FAILURES\n");
         return 2;
     }
     int failures = 0;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--raw-control-flow") {
             g_rawControlFlow = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--prepare") {
+            g_prepare = true;
             continue;
         }
         if (std::string(argv[i]) == "--images") {
@@ -292,6 +328,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--spv") {
             g_spirv = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--synthetic-memory") {
+            g_syntheticMemory = true;
             continue;
         }
         try {

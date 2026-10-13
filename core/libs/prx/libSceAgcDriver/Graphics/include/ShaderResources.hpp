@@ -154,6 +154,8 @@ public:
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
+    std::optional<std::pair<VkBuffer, VkDeviceSize>> CopiedSource(std::uint64_t address, std::size_t bytes) const { return guestMemory.CopiedSource(address, bytes); }
+    bool InPlaceRange(std::uint64_t address, std::size_t bytes) const { return guestMemory.InPlaceRange(address, bytes); }
     // Whether a region the recorded work reads in place through a host import overlaps the range.
     bool ReadsOverlap(std::uint64_t address, std::size_t bytes) const;
     // The recorder's hazard tracker inputs (Recorder::NoteAccess): the written elements' guest
@@ -279,6 +281,10 @@ public:
         };
         std::uint64_t version = 0;
         std::uint64_t pendingSerial = 0;
+        // StorageTexture cache evictions when the proof began (the fast accept requires none since).
+        std::uint64_t evictions = 0;
+        // GuestMemory::StampSerial before the proof's unchanged checks.
+        std::uint64_t stamps = 0;
         bool scanned = false;
         std::vector<Surface> surfaces;
         std::vector<StorageTexture::PendingQuery> pending;
@@ -304,6 +310,18 @@ public:
         std::size_t slot;
         bool firstLayer;
         std::array<std::uint32_t, 8> words;
+        // The stage-A record of the element, made on the prep thread (recorded false: none), so the
+        // committer runs only the fastTexture predicate on the cache entry it names.
+        bool recorded = false;
+        GuestTextureResource resource{};
+        std::uint64_t guestBytes = 0;
+        VkComponentMapping components{};
+        DccKeys keys = DccKeys::Uncompressed;
+        std::uint64_t generation = 0;
+        std::shared_ptr<Texture> texture;
+        std::shared_ptr<StorageTexture> source;
+        DccKeys entryKeys = DccKeys::Uncompressed;
+        std::uint64_t entryGeneration = 0;
     };
     SpeculationMiss SpeculateProof(ProofSpeculation& speculation) const;
     SpeculationMiss ProveSpeculated(const ProofSpeculation& speculation);

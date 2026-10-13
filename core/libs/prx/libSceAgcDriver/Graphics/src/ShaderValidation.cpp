@@ -246,7 +246,8 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                     capability == spv::CapabilityStorageBuffer8BitAccess ||
                     capability == spv::CapabilityPhysicalStorageBufferAddresses ||
                     capability == spv::CapabilitySampledImageArrayDynamicIndexing ||
-                    capability == spv::CapabilityStorageImageArrayDynamicIndexing;
+                    capability == spv::CapabilityStorageImageArrayDynamicIndexing ||
+                    capability == spv::CapabilityShaderClockKHR;
 
                 // Bindless image tables index their slots non-uniformly in graphics stages
                 // (VK_EXT_descriptor_indexing, enabled by the device setup when available).
@@ -288,7 +289,7 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
                     Require(fragment && fragmentShaderBarycentric, "SPV_KHR_fragment_shader_barycentric requires enabled fragmentShaderBarycentric in a fragment shader");
                     break;
                 }
-                Require(extension == "SPV_KHR_float_controls" || (imageInt64Atomics && extension == "SPV_EXT_shader_image_int64") || (viewportIndexLayer && extension == "SPV_EXT_shader_viewport_index_layer") || (mesh && (extension == "SPV_EXT_mesh_shader" || extension == "SPV_KHR_physical_storage_buffer")) || (descriptorIndexing && extension == "SPV_EXT_descriptor_indexing") || (shader.bdaAbiVersion == ShaderRecompiler::BdaAbi::Version && (extension == "SPV_KHR_physical_storage_buffer" || extension == "SPV_KHR_8bit_storage")), "unsupported SPIR-V extension");
+                Require(extension == "SPV_KHR_float_controls" || extension == "SPV_KHR_shader_clock" || (imageInt64Atomics && extension == "SPV_EXT_shader_image_int64") || (viewportIndexLayer && extension == "SPV_EXT_shader_viewport_index_layer") || (mesh && (extension == "SPV_EXT_mesh_shader" || extension == "SPV_KHR_physical_storage_buffer")) || (descriptorIndexing && extension == "SPV_EXT_descriptor_indexing") || (shader.bdaAbiVersion == ShaderRecompiler::BdaAbi::Version && (extension == "SPV_KHR_physical_storage_buffer" || extension == "SPV_KHR_8bit_storage")), "unsupported SPIR-V extension");
                 break;
             }
             case spv::OpDecorateId:
@@ -403,11 +404,27 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
         Require(state.rectList || state.stages.tessellation.has_value(), "tessellation configuration is missing");
         mode(spv::ExecutionModeOutputVertices, {state.rectList ? 4u : state.stages.tessellation->outputControlPoints});
         Require(module.modes.size() == 1, "unsupported tessellation-control execution mode");
-    } else if (evaluation) {
-        mode(state.rectList ? spv::ExecutionModeQuads : spv::ExecutionModeTriangles, {});
-        mode(state.rectList ? spv::ExecutionModeSpacingEqual : spv::ExecutionModeSpacingFractionalOdd, {});
+    } else if (evaluation && state.rectList) {
+        mode(spv::ExecutionModeQuads, {});
+        mode(spv::ExecutionModeSpacingEqual, {});
         mode(spv::ExecutionModeVertexOrderCw, {});
         Require(module.modes.size() == 3, "unsupported tessellation-evaluation execution mode");
+    } else if (evaluation) {
+        // The modes DefineTessellationExecutionModes derives from VGT_TF_PARAM: the domain, the
+        // spacing, and the point mode or the winding of tessellated triangles and quads.
+        Require(state.stages.tessellation.has_value(), "tessellation configuration is missing");
+        const auto& tess = *state.stages.tessellation;
+        mode(tess.domain == 2u ? spv::ExecutionModeQuads : tess.domain == 1u ? spv::ExecutionModeTriangles : spv::ExecutionModeIsolines, {});
+        mode(tess.partitioning == 2u ? spv::ExecutionModeSpacingFractionalOdd : tess.partitioning == 3u ? spv::ExecutionModeSpacingFractionalEven : spv::ExecutionModeSpacingEqual, {});
+        std::size_t modes = 2;
+        if (tess.outputTopology == 0u) {
+            mode(spv::ExecutionModePointMode, {});
+            ++modes;
+        } else if (tess.domain != 0u) {
+            mode(tess.outputTopology == 3u ? spv::ExecutionModeVertexOrderCcw : spv::ExecutionModeVertexOrderCw, {});
+            ++modes;
+        }
+        Require(module.modes.size() == modes, "unsupported tessellation-evaluation execution mode");
     } else if (fragment) {
         for (const auto& [name, operands] : module.modes) Require(operands.empty() && (name == spv::ExecutionModeOriginUpperLeft || name == spv::ExecutionModeEarlyFragmentTests || name == spv::ExecutionModeDepthReplacing || name == spv::ExecutionModeDepthLess || name == spv::ExecutionModeDepthGreater || name == spv::ExecutionModePixelInterlockOrderedEXT), "unsupported fragment execution mode");
     } else Require(module.modes.empty(), "unsupported vertex execution mode");

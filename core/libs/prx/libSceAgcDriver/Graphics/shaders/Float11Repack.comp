@@ -1,0 +1,32 @@
+#version 450
+// Moves a COLOR_11_11_10 surface between the guest's packed layout (red's 10-bit float in bits
+// 0-9, green 10-20, blue 21-31, as format-43 textures read it) and the Vulkan B10G11R11 layout
+// (11 bits at 0, 11 at 11, 10 at 22) that blending needs. Both images are viewed as R32_UINT.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0, r32ui) uniform readonly uimage2D source;
+layout(set = 0, binding = 1, r32ui) uniform writeonly uimage2D destination;
+layout(push_constant) uniform Parameters {
+    uint width;
+    uint height;
+    uint toNative;
+} parameters;
+
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (p.x >= parameters.width || p.y >= parameters.height) return;
+    uint value = imageLoad(source, ivec2(p)).x;
+    uint result;
+    if (parameters.toNative != 0u) {
+        // A 10-bit field gains a zero mantissa bit; an 11-bit field stored in 10 bits loses its lowest.
+        result = ((value & 0x3ffu) << 1u) | (((value >> 10u) & 0x7ffu) << 11u) | (((value >> 21u) & 0x7ffu) >> 1u << 22u);
+    } else {
+        // Vulkan blending overflows to infinity; the color unit converts round-toward-zero, so a
+        // finite result too large for the format is the largest finite value (as the packed path).
+        uint r = value & 0x7ffu, g = (value >> 11u) & 0x7ffu, b = (value >> 22u) & 0x3ffu;
+        if (r == 0x7c0u) r = 0x7bfu;
+        if (g == 0x7c0u) g = 0x7bfu;
+        if (b == 0x3e0u) b = 0x3dfu;
+        result = (r >> 1u) | (g << 10u) | ((b << 1u) << 21u);
+    }
+    imageStore(destination, ivec2(p), uvec4(result, 0u, 0u, 0u));
+}

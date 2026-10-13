@@ -755,6 +755,9 @@ enum class StampKind : std::uint8_t { Cpu, Driver, ImportWindow };
 void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_t generation);
 #endif
 
+// Moves with every block stamp (see StampSerial).
+std::atomic<std::uint64_t> stampSerial{0};
+
 struct WriteTracker {
     std::mutex mutex;
     bool initialized = false;
@@ -943,6 +946,8 @@ struct WriteTracker {
     void stamp(std::uint64_t block, std::uint32_t stampGeneration, StampKind kind) {
         const bool cpu = kind != StampKind::Driver;
         const bool written = kind != StampKind::ImportWindow;
+        // Stamps change only here, under the tracker mutex: one writer.
+        stampSerial.store(stampSerial.load(std::memory_order_relaxed) + 1, std::memory_order_release);
 #ifdef _WIN32
         blocks[block] = stampGeneration;
         if (cpu) cpuBlocks[block] = stampGeneration;
@@ -1359,8 +1364,26 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 
 }
 
+namespace {
+thread_local ProbeSink* probeSink = nullptr;
+}
+
+ProbeSink* SetProbeSink(ProbeSink* sink) {
+    return std::exchange(probeSink, sink);
+}
+
+void NoteBaked(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    if (probeSink != nullptr) probeSink->Baked(address, bytes, generation);
+}
+
+void NoteProbeEvent(const char* reason) {
+    if (probeSink != nullptr) probeSink->Event(reason);
+}
+
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
-    return collectWrites(address, bytes, true);
+    const auto generation = collectWrites(address, bytes, true);
+    if (probeSink != nullptr) probeSink->Baked(address, bytes, generation);
+    return generation;
 }
 
 void SetCaptureObservers(void (*dirty)(std::uint64_t, std::size_t), void (*stored)(std::uint64_t, std::size_t)) {
@@ -1427,7 +1450,9 @@ void CollectForCapture(std::uint64_t address, std::size_t bytes, std::vector<std
 }
 
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes) {
-    return collectWrites(address, bytes, false);
+    const auto generation = collectWrites(address, bytes, false);
+    if (probeSink != nullptr) probeSink->Baked(address, bytes, generation);
+    return generation;
 }
 
 void BumpCollectEpoch() {
@@ -1455,6 +1480,10 @@ void SetCollectHistoryFlag(bool (*flag)()) {
 
 std::uint64_t CollectedGeneration() {
     return Tracker().generation.load(std::memory_order_relaxed);
+}
+
+std::uint64_t StampSerial() {
+    return stampSerial.load(std::memory_order_acquire);
 }
 
 std::uint64_t UnwatchSerial() {
@@ -1526,7 +1555,9 @@ bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t gene
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
     const auto first = tracker.blockOf(address);
     const auto last = tracker.blockOf(address + bytes - 1);
-    return tracker.unchanged(first, last, generation);
+    const bool unchanged = tracker.unchanged(first, last, generation);
+    if (unchanged && probeSink != nullptr) probeSink->Baked(address, bytes, generation);
+    return unchanged;
 }
 
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
@@ -1539,6 +1570,9 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
         const auto first = tracker.blockOf(address);
         const auto last = tracker.blockOf(address + bytes - 1);
         if (!tracker.unchanged(first, last, generation)) return false;
+    }
+    if (probeSink != nullptr) {
+        for (const auto& [address, bytes, generation] : queries) probeSink->Baked(address, bytes, generation);
     }
     return true;
 }
@@ -1647,6 +1681,7 @@ bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint
     for (auto block = first; block <= last; ++block) {
         if (tracker.cpuStampOf(block) > generation) return false;
     }
+    if (probeSink != nullptr) probeSink->Baked(address, bytes, generation);
     return true;
 }
 
@@ -1837,6 +1872,66 @@ void SetForkTrap(void (*trap)(const char* site)) {
     forkTrap = trap;
 }
 
+namespace {
+
+bool SrwGpuMutex() {
+#ifdef _WIN32
+    static const bool enabled = std::getenv("APS5_STD_GPU_MUTEX") == nullptr;
+    return enabled;
+#else
+    return false;
+#endif
+}
+
+}
+
+bool GpuMutexType::rawTryLock() {
+#ifdef _WIN32
+    if (SrwGpuMutex()) {
+        const auto me = GetCurrentThreadId();
+        if (srwOwner.load(std::memory_order_relaxed) == me) {
+            ++srwDepth;
+            return true;
+        }
+        if (!TryAcquireSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srwLock))) return false;
+        srwOwner.store(me, std::memory_order_relaxed);
+        srwDepth = 1;
+        return true;
+    }
+#endif
+    return mutex.try_lock();
+}
+
+void GpuMutexType::rawLock() {
+#ifdef _WIN32
+    if (SrwGpuMutex()) {
+        const auto me = GetCurrentThreadId();
+        if (srwOwner.load(std::memory_order_relaxed) == me) {
+            ++srwDepth;
+            return;
+        }
+        AcquireSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srwLock));
+        srwOwner.store(me, std::memory_order_relaxed);
+        srwDepth = 1;
+        return;
+    }
+#endif
+    mutex.lock();
+}
+
+void GpuMutexType::rawUnlock() {
+#ifdef _WIN32
+    if (SrwGpuMutex()) {
+        if (--srwDepth == 0) {
+            srwOwner.store(0, std::memory_order_relaxed);
+            ReleaseSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srwLock));
+        }
+        return;
+    }
+#endif
+    mutex.unlock();
+}
+
 void GpuMutexType::acquired() {
     owner.store(ThreadToken(), std::memory_order_relaxed);
     ++depth;
@@ -1845,7 +1940,7 @@ void GpuMutexType::acquired() {
 bool GpuMutexType::try_lock() {
     if (forkTrap != nullptr) forkTrap("gpu mutex try");
     if (!GpuLockProfiled()) {
-        if (!mutex.try_lock()) return false;
+        if (!rawTryLock()) return false;
         acquired();
         return true;
     }
@@ -1854,7 +1949,7 @@ bool GpuMutexType::try_lock() {
     auto& stats = LockStats();
     const auto tagged = std::exchange(stats.nextSite, GpuLockSite::Other);
     ++stats.tries;
-    if (!mutex.try_lock()) {
+    if (!rawTryLock()) {
         ++stats.triesFailed;
         return false;
     }
@@ -1878,7 +1973,7 @@ void GpuMutexType::unlock() {
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
     }
-    mutex.unlock();
+    rawUnlock();
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
     // of the hold nor waited for by the next holder.
     if (outermost) {
@@ -1906,9 +2001,9 @@ void AssertGpuLockHeld(const char* where) {
 void GpuMutexType::lock() {
     if (forkTrap != nullptr) forkTrap("gpu mutex");
     if (!GpuLockProfiled()) {
-        if (!mutex.try_lock()) {
+        if (!rawTryLock()) {
             contenders.fetch_add(1, std::memory_order_relaxed);
-            mutex.lock();
+            rawLock();
             contenders.fetch_sub(1, std::memory_order_relaxed);
         }
         acquired();
@@ -1920,13 +2015,13 @@ void GpuMutexType::lock() {
     ++stats.siteAcquisitions[site];
     // An uncontended (or recursive) acquisition costs no clock reads for the wait; only a wait is
     // timed. The hold timer (outermost acquisitions only) starts once the mutex is held.
-    if (!mutex.try_lock()) {
+    if (!rawTryLock()) {
         const bool holders = GpuHoldProfiled();
         HolderMatrixValues before{};
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
         contenders.fetch_add(1, std::memory_order_relaxed);
-        mutex.lock();
+        rawLock();
         contenders.fetch_sub(1, std::memory_order_relaxed);
         acquired();
         const auto now = std::chrono::steady_clock::now();
@@ -2054,6 +2149,7 @@ void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
 
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
     if (destination.empty()) return;
+    if (probeSink != nullptr) probeSink->Baked(address, destination.size(), 0);
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
@@ -2070,6 +2166,7 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
 
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     if (destination.empty()) return;
+    if (probeSink != nullptr) probeSink->Baked(address, destination.size(), 0);
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
@@ -2089,6 +2186,7 @@ bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
 
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
+    if (probeSink != nullptr) probeSink->Baked(address, bytes.size(), 0);
     const TimedAccess timed(CounterCompare, bytes.size());
     if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) == 0;
     for (const auto& [begin, end] : CommittedRanges(address, bytes.size())) {
@@ -2100,6 +2198,7 @@ bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> b
 Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return Compare::Equal;
     if (address == 0 || bytes.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
+    if (probeSink != nullptr) probeSink->Baked(address, bytes.size(), 0);
     auto outcome = Compare::Equal;
     // Each run's page state is consulted right before its bytes are compared.
     const bool queried = describePages(static_cast<std::uintptr_t>(address), bytes.size(), [&](const PageRun& run) {
@@ -2113,6 +2212,7 @@ Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {
 Compare CopyMapped(std::uint64_t address, std::span<std::byte> out) {
     if (out.empty()) return Compare::Equal;
     if (address == 0 || out.size() > std::numeric_limits<std::uintptr_t>::max() - address) return Compare::Unmapped;
+    if (probeSink != nullptr) probeSink->Baked(address, out.size(), 0);
     auto outcome = Compare::Equal;
     const bool queried = describePages(static_cast<std::uintptr_t>(address), out.size(), [&](const PageRun& run) {
         if (!run.readable) outcome = Compare::Unmapped;

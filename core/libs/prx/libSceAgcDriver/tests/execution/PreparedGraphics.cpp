@@ -42,7 +42,7 @@ struct Fixture {
         header.shader.type = type;
         header.shader.user_data = &header.users;
         code.fill(0xffffffffu);
-        code.back() = 0xbf810000u;
+        code.back() = type == 5u ? 0xbefd2106u : 0xbf810000u;
         const auto address = reinterpret_cast<std::uintptr_t>(code.data());
         const auto headerAddress = reinterpret_cast<std::uintptr_t>(&header);
         snapshot = std::make_shared<AgcDriver::DriverDetail::ShaderSnapshot>();
@@ -113,7 +113,7 @@ void Check(AgcDriver::VulkanDevice& device, AgcDriver::Graphics::ShaderPath path
     for (std::size_t index = 0; index < prepared.programs.size(); ++index) {
         const auto& expected = prepared.programs[index];
         const auto& actual = draw.programs[index];
-        Require(expected.codeOffset == 64u && expected.binary.code.size() == (prepared.roles[index] == ProgramRole::Fragment ? pixelCode.size() : 1u) && expected.binary.code[0] == (prepared.roles[index] == ProgramRole::Fragment ? pixelCode[0] : 0xbf810000u), "graphics entry point did not trim the code prefix");
+        Require(expected.codeOffset == 64u && expected.binary.code.size() == (prepared.roles[index] == ProgramRole::Fragment ? pixelCode.size() : 1u) && expected.binary.code[0] == (prepared.roles[index] == ProgramRole::Fragment ? pixelCode[0] : prepared.roles[index] == ProgramRole::Local ? 0xbefd2106u : 0xbf810000u), "graphics entry point did not trim the code prefix");
         Require(expected.binary.stage == actual.binary.stage && expected.firstUserSgpr == actual.firstUserSgpr && expected.userData.size() == actual.userData.size(), "graphics preparation changed the user SGPR ABI");
     }
     auto target = device.Target();

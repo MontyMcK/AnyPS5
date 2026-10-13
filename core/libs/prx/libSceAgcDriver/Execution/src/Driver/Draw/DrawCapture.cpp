@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -22,7 +23,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         program.binary,
         {waveSize, program.firstUserSgpr, program.userData, std::nullopt, program.binary.stage == Stage::Fragment ? std::optional(pixel) : std::nullopt, vertexInfos[i], memory},
         localDevice->Target(),
-        {0, 0, pushOffset, (graphics.stages.mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : Graphics::PipelinePushConstantBytes) - pushOffset},
+        {0, 0, pushOffset, (graphics.stages.mesh ? ShaderRecompiler::MeshDrawPushOffsetBytes : ShaderRecompiler::LayerLimitPushBytes) - pushOffset},
         ShaderRecompiler::GraphicsCompileContext{program.firstUserSgpr, linked, graphics.stages.mesh, graphics.stages.tessellation, {drawParameters.indexAddress, drawParameters.indexCount, drawParameters.indexSize, drawParameters.instanceCount}}
     };
     try {
@@ -89,12 +90,17 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
                     std::fwrite(program.binary.code.data(), sizeof(std::uint32_t), program.binary.code.size(), file);
                     std::fclose(file);
                 }
-                std::fprintf(stderr, "[skipshader] 0x%llx stage %d: %.300s\n", static_cast<unsigned long long>(program.binary.codeAddress), static_cast<int>(program.binary.stage), error.what());
+                const auto skipSlot0 = (static_cast<std::uint64_t>(readRegister(queue.context, 0x390)) << 40u) | (static_cast<std::uint64_t>(readRegister(queue.context, 0x318)) << 8u);
+                std::fprintf(stderr, "[skipshader] 0x%llx stage %d (color slot 0 at 0x%llx): %.300s\n", static_cast<unsigned long long>(program.binary.codeAddress), static_cast<int>(program.binary.stage), static_cast<unsigned long long>(skipSlot0), error.what());
             }
             throw;
         }
         timing.Mark("materialize");
         phaseTiming.Phase(DrawRowRecompile);
+        // Debug aid: APS5_DUMP_DRAW_SHADER=<hex code address> saves that stage's request once.
+        static const std::uint64_t dumpAddress = [] { const char* text = std::getenv("APS5_DUMP_DRAW_SHADER"); return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull; }();
+        static std::atomic<bool> dumped{false};
+        if (dumpAddress != 0 && program.binary.codeAddress == dumpAddress && !dumped.exchange(true)) static_cast<void>(dumpRequest(program.binary.codeAddress, request));
         return stageCapture.compiled;
     } catch (const std::exception&) {
         static const bool dumpFailures = std::getenv("APS5_DUMP_SHADER_FAILURES") != nullptr;

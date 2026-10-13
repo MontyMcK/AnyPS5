@@ -19,11 +19,12 @@ VkDescriptorSet TextureDetiler::allocateSet() {
     constexpr std::uint32_t setsPerPool = 64;
     const auto poolIndex = allocatedSets / setsPerPool;
     if (poolIndex == descriptorPools.size()) {
-        const VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, setsPerPool * 2};
+        // The layout's image binding (DispatchImage) takes a descriptor of each set too.
+        const VkDescriptorPoolSize sizes[2]{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, setsPerPool * 2}, {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, setsPerPool}};
         VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
         info.maxSets = setsPerPool;
-        info.poolSizeCount = 1;
-        info.pPoolSizes = &size;
+        info.poolSizeCount = 2;
+        info.pPoolSizes = sizes;
         descriptorPools.reserve(descriptorPools.size() + 1);
         VkDescriptorPool pool = VK_NULL_HANDLE;
         Check(context.Function<PFN_vkCreateDescriptorPool>("vkCreateDescriptorPool")(context.device, &info, nullptr, &pool), "vkCreateDescriptorPool texture detiler");

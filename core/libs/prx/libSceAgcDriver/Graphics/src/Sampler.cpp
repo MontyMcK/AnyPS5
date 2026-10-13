@@ -79,9 +79,9 @@ namespace AgcDriver::Graphics {
         return sampler;
     }
 
-    void RequireFilterMinmax(const Context& context, VkFormat format, std::uint32_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers) {
+    void RequireFilterMinmax(const Context& context, VkFormat format, std::uint64_t samplerMask, std::span<const std::shared_ptr<Sampler>> samplers) {
         bool filtered = false;
-        for (std::uint32_t element = 0; element < 32u; ++element) {
+        for (std::uint32_t element = 0; element < 64u; ++element) {
             if (((samplerMask >> element) & 1u) == 0u) continue;
             if (element >= samplers.size()) Require(false, "a sampled texture is paired with sampler element " + std::to_string(element) + ", which its shader does not bind");
             filtered = filtered || samplers[element]->RequiresFilterMinmax();

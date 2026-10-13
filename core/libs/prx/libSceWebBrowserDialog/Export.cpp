@@ -4,6 +4,7 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libkernel/Automation/include/Automation.hpp"
 
 namespace {
 std::atomic<int> g_status{0};
@@ -27,8 +28,11 @@ int APS5_VABI sceWebBrowserDialogInitialize(void) {
 }
 
 int APS5_VABI sceWebBrowserDialogTerminate(void) {
-    int expected = 1;
-    if (!g_status.compare_exchange_strong(expected, 0)) throw std::logic_error("sceWebBrowserDialogTerminate: not initialized or still running");
+    const int status = g_status.load();
+    if (status == COMMON_DIALOG_STATUS_NONE) return COMMON_DIALOG_ERROR_NOT_INITIALIZED;
+    if (status == COMMON_DIALOG_STATUS_RUNNING) return COMMON_DIALOG_ERROR_BUSY;
+    g_status = COMMON_DIALOG_STATUS_NONE;
+    if (Automation::Enabled()) Automation::Fields().Str("dialog", "webbrowser").Str("op", "terminate").Emit("dialog");
     return 0;
 }
 
@@ -56,6 +60,7 @@ int APS5_VABI sceWebBrowserDialogOpen(const void* param) {
  if (status == COMMON_DIALOG_STATUS_RUNNING) return COMMON_DIALOG_ERROR_BUSY;
  if (param == nullptr) return COMMON_DIALOG_ERROR_ARG_NULL;
  g_status = COMMON_DIALOG_STATUS_FINISHED;
+ if (Automation::Enabled()) Automation::Fields().Str("dialog", "webbrowser").Str("op", "open").Emit("dialog");
  return 0;
 }
 

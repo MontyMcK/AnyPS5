@@ -7,6 +7,7 @@
 #include <cstring>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -26,7 +27,7 @@
 
 namespace AgcDriver::Graphics {
 
-void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline) {
+void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipeline, std::string_view header) {
     if (!context.pipelineExecutableInfo) return;
     const auto getProperties = context.Function<PFN_vkGetPipelineExecutablePropertiesKHR>("vkGetPipelineExecutablePropertiesKHR");
     const auto getStatistics = context.Function<PFN_vkGetPipelineExecutableStatisticsKHR>("vkGetPipelineExecutableStatisticsKHR");
@@ -37,6 +38,13 @@ void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipel
     std::vector<VkPipelineExecutablePropertiesKHR> properties(count, {VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR});
     Check(getProperties(context.device, &pipelineInfo, &count, properties.data()), "vkGetPipelineExecutablePropertiesKHR");
     properties.resize(count);
+    // Pipelines compile on several threads, so each pipeline's report is one line written at once.
+    std::string line = "[pipeline-stats]";
+    if (!header.empty()) {
+        line += ' ';
+        line += header;
+    }
+    char item[160];
     for (std::uint32_t index = 0; index < properties.size(); ++index) {
         VkPipelineExecutableInfoKHR executable{VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR};
         executable.pipeline = pipeline;
@@ -47,28 +55,34 @@ void LogPipelineStatistics_nid_no_patch(const Context& context, VkPipeline pipel
         Check(getStatistics(context.device, &executable, &count, statistics.data()), "vkGetPipelineExecutableStatisticsKHR");
         statistics.resize(count);
         const auto& property = properties[index];
-        std::fprintf(stderr, "[pipeline-stats] executable=%u stages=0x%x subgroup=%u name=%s\n", index, property.stages, property.subgroupSize, property.name);
+        std::snprintf(item, sizeof(item), " | %s stages=0x%x subgroup=%u", property.name, property.stages, property.subgroupSize);
+        line += item;
         for (const auto& statistic : statistics) {
-            std::fprintf(stderr, "[pipeline-stats] executable=%u %s=", index, statistic.name);
+            std::string name = statistic.name;
+            for (auto& c : name) {
+                if (c == ' ') c = '_';
+            }
             switch (statistic.format) {
             case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
-                std::fprintf(stderr, "%s", statistic.value.b32 ? "true" : "false");
+                std::snprintf(item, sizeof(item), " %s=%s", name.c_str(), statistic.value.b32 ? "true" : "false");
                 break;
             case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
-                std::fprintf(stderr, "%lld", static_cast<long long>(statistic.value.i64));
+                std::snprintf(item, sizeof(item), " %s=%lld", name.c_str(), static_cast<long long>(statistic.value.i64));
                 break;
             case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
-                std::fprintf(stderr, "%llu", static_cast<unsigned long long>(statistic.value.u64));
+                std::snprintf(item, sizeof(item), " %s=%llu", name.c_str(), static_cast<unsigned long long>(statistic.value.u64));
                 break;
             case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
-                std::fprintf(stderr, "%.17g", statistic.value.f64);
+                std::snprintf(item, sizeof(item), " %s=%.17g", name.c_str(), statistic.value.f64);
                 break;
             default:
                 throw std::runtime_error("unsupported pipeline statistic format");
             }
-            std::fprintf(stderr, " (%s)\n", statistic.description);
+            line += item;
         }
     }
+    line += '\n';
+    std::fwrite(line.data(), 1, line.size(), stderr);
 }
 
 Framebuffer::Framebuffer(const Context& context, VkRenderPass renderPass, std::span<const VkImageView> targets, VkExtent2D extent, std::uint32_t layers) : context(context) {
@@ -142,6 +156,29 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             VkShaderModuleCreateInfo module{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
             module.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
             module.pCode = shader.spirv.data();
+            // APS5_SPV_OVERRIDE=<dir>: a module whose SPIR-V bytes hash (FNV-1a 64) to H is replaced by
+            // <dir>/<H as 16 hex digits>.spv when that file exists, for trying offline-transformed shaders.
+            std::vector<std::uint32_t> overrideCode;
+            if (static const char* overrideDir = std::getenv("APS5_SPV_OVERRIDE"); overrideDir != nullptr && *overrideDir != '\0') {
+                std::uint64_t hash = 14695981039346656037ull;
+                const auto* bytes = reinterpret_cast<const unsigned char*>(shader.spirv.data());
+                for (std::size_t b = 0; b < module.codeSize; ++b) hash = (hash ^ bytes[b]) * 1099511628211ull;
+                char path[512];
+                std::snprintf(path, sizeof(path), "%s/%016llx.spv", overrideDir, static_cast<unsigned long long>(hash));
+                if (auto* file = std::fopen(path, "rb")) {
+                    std::fseek(file, 0, SEEK_END);
+                    const auto size = std::ftell(file);
+                    std::fseek(file, 0, SEEK_SET);
+                    overrideCode.resize(static_cast<std::size_t>(size) / sizeof(std::uint32_t));
+                    const auto read = std::fread(overrideCode.data(), sizeof(std::uint32_t), overrideCode.size(), file);
+                    std::fclose(file);
+                    if (read == overrideCode.size() && !overrideCode.empty()) {
+                        module.codeSize = overrideCode.size() * sizeof(std::uint32_t);
+                        module.pCode = overrideCode.data();
+                        std::fprintf(stderr, "[spv-override] variant 0x%llx replaced by %s (%zu -> %zu bytes)\n", static_cast<unsigned long long>(shader.PipelineVariantId()), path, shader.spirv.size() * sizeof(std::uint32_t), static_cast<std::size_t>(module.codeSize));
+                    }
+                }
+            }
             Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &module, nullptr, &_modules[i]), "vkCreateShaderModule graphics");
             const auto stage = VulkanStage(shaders[i].stage);
             stages[i].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -271,7 +308,18 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         const auto createSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - createStarted).count();
         if (createSeconds > 0.25) std::fprintf(stderr, "[draw] graphics pipeline took %.2f s\n", createSeconds);
         timing.Mark("create");
-        LogPipelineStatistics_nid_no_patch(context, pipeline);
+        if (context.pipelineExecutableInfo) {
+            // Names the pipeline's stages (their variant ids) in its statistics line.
+            std::string header = "graphics";
+            char item[48];
+            for (const auto& shader : shaders) {
+                std::snprintf(item, sizeof(item), " stage%u=0x%llx", static_cast<unsigned>(shader.stage), static_cast<unsigned long long>(shader.program != nullptr ? shader.program->PipelineVariantId() : 0));
+                header += item;
+            }
+            std::snprintf(item, sizeof(item), " extent %ux%u", state.renderExtent.width, state.renderExtent.height);
+            header += item;
+            LogPipelineStatistics_nid_no_patch(context, pipeline, header);
+        }
     } catch (...) {
         release();
         throw;
@@ -316,6 +364,10 @@ VkPipelineLayout Pipeline::Layout() const {
 std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImageView> targets, std::span<const std::shared_ptr<StorageTexture>> owners, VkExtent2D extent, std::uint32_t layers) {
     Require(targets.size() == attachments && owners.size() == colorAttachments, "render targets do not match the pipeline's attachments");
     const bool resident = std::all_of(owners.begin(), owners.end(), [](const auto& owner) { return owner != nullptr; });
+    if (!resident && layers > 1) {
+        static std::atomic<int> told{0};
+        if (told.fetch_add(1) < 8) std::fprintf(stderr, "[framebuffer] layered framebuffer (%u layers, %ux%u) over a non-resident single-layer render target\n", layers, extent.width, extent.height);
+    }
     if (resident) {
         const auto matches = [&](const CachedFramebuffer& entry) {
             if (entry.extent.width != extent.width || entry.extent.height != extent.height || entry.layers != layers || !std::equal(entry.views.begin(), entry.views.end(), targets.begin(), targets.end())) return false;
@@ -355,19 +407,74 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
     return framebuffer;
 }
 
+namespace {
+
+// The graphics pipeline, viewport and scissor last recorded into a command buffer inside its open
+// render pass. Continue is the only graphics bind, and every pipeline declares viewport and scissor
+// dynamic, so they persist across pipeline binds; Begin forgets them (a recycled command buffer
+// always opens a pass first). APS5_NO_BIND_FILTER=1 records every bind.
+struct BoundGraphicsState {
+    std::mutex mutex;
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkViewport viewport{};
+    VkRect2D scissor{};
+    bool viewportSet = false;
+};
+
+BoundGraphicsState& boundGraphicsState() {
+    static BoundGraphicsState state;
+    return state;
+}
+
+bool bindFilter() {
+    static const bool enabled = std::getenv("APS5_NO_BIND_FILTER") == nullptr;
+    return enabled;
+}
+
+bool sameViewport(const VkViewport& a, const VkViewport& b) {
+    return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height && a.minDepth == b.minDepth && a.maxDepth == b.maxDepth;
+}
+
+bool sameScissor(const VkRect2D& a, const VkRect2D& b) {
+    return a.offset.x == b.offset.x && a.offset.y == b.offset.y && a.extent.width == b.extent.width && a.extent.height == b.extent.height;
+}
+
+}
+
 void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, VkExtent2D extent, const State& state) const {
     VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
     begin.renderPass = renderPass;
     begin.framebuffer = framebuffer.Handle();
     begin.renderArea = {{0, 0}, extent};
     context.Resolved(&DeviceFunctions::cmdBeginRenderPass, "vkCmdBeginRenderPass")(commands, &begin, VK_SUBPASS_CONTENTS_INLINE);
+    if (bindFilter()) {
+        auto& bound = boundGraphicsState();
+        std::lock_guard lock(bound.mutex);
+        bound.commands = VK_NULL_HANDLE;
+    }
     Continue(commands, state);
 }
 
 void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
-    context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-    context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
-    context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
+    bool bindPipeline = true, setViewport = true, setScissor = true;
+    if (bindFilter()) {
+        auto& bound = boundGraphicsState();
+        std::lock_guard lock(bound.mutex);
+        if (bound.commands == commands) {
+            bindPipeline = bound.pipeline != pipeline;
+            setViewport = !bound.viewportSet || !sameViewport(bound.viewport, state.viewport);
+            setScissor = !bound.viewportSet || !sameScissor(bound.scissor, state.scissor);
+        }
+        bound.commands = commands;
+        bound.pipeline = pipeline;
+        bound.viewport = state.viewport;
+        bound.scissor = state.scissor;
+        bound.viewportSet = true;
+    }
+    if (bindPipeline) context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+    if (setViewport) context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
+    if (setScissor) context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
     if (depthBias) context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, state.depthBiasConstant, state.depthBiasClamp, state.depthBiasSlope);
     if (!depthBounds) return;
     context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.minDepthBounds, state.maxDepthBounds);

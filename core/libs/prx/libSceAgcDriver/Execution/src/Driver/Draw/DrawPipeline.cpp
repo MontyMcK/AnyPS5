@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/ReplayProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSpeculation.hpp"
@@ -8,8 +9,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <typeinfo>
 
 namespace AgcDriver::DriverDetail {
 
@@ -20,6 +24,34 @@ constexpr std::array<const char*, static_cast<std::size_t>(DrawPipeline::DrainRe
 std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
 }
+
+// Debug aid: APS5_PROFILE_COMMIT_KINDS=1 splits committer time by the commit's lambda type (one per
+// enqueue site) in the 10 s report.
+struct CommitKinds {
+    std::mutex mutex;
+    std::vector<std::tuple<const char*, std::uint64_t, std::uint64_t>> kinds;
+    static bool Enabled() {
+        static const bool enabled = std::getenv("APS5_PROFILE_COMMIT_KINDS") != nullptr;
+        return enabled;
+    }
+    void Note(const char* name, std::uint64_t ns) {
+        std::lock_guard lock(mutex);
+        for (auto& [kind, count, total] : kinds) {
+            if (kind != name) continue;
+            ++count;
+            total += ns;
+            return;
+        }
+        kinds.emplace_back(name, 1, ns);
+    }
+    void Report() {
+        std::lock_guard lock(mutex);
+        std::sort(kinds.begin(), kinds.end(), [](const auto& a, const auto& b) { return std::get<2>(a) > std::get<2>(b); });
+        for (const auto& [kind, count, total] : kinds) std::fprintf(stderr, "[commit-kinds] %8llu x %6.1f us = %7.1f ms  %.160s\n", static_cast<unsigned long long>(count), static_cast<double>(total) / 1e3 / static_cast<double>(count), static_cast<double>(total) / 1e6, kind);
+        kinds.clear();
+    }
+};
+CommitKinds commitKinds;
 
 std::atomic<DrawPipeline::ForkRunner*> forkRunner{nullptr};
 
@@ -274,6 +306,12 @@ bool& DrawPipeline::PrepEnqueued() {
 }
 
 void DrawPipeline::Prepare(Commit job, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes) {
+    if (auto segment = ReplayProbe::Hold()) {
+        job = [segment = std::move(segment), inner = std::move(job)] {
+            const ReplayProbe::Scope probeScope(segment);
+            inner();
+        };
+    }
     std::unique_lock lock(prepMutex);
     const auto room = Depth() * PrepWorkers();
     if (prepOutstanding.load(std::memory_order_relaxed) >= room) {
@@ -441,7 +479,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         rethrowFailure();
         if (!PrepReorder()) waitPrepTurn(prepared);
         PrepEnqueued() = true;
-        deliverPrepared(prepared, Item{std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), 0, unknownWrites, std::move(fork)});
+        deliverPrepared(prepared, Item{std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), 0, unknownWrites, std::move(fork), ReplayProbe::Tag()});
         return;
     }
     if (prepared != 0) {
@@ -475,7 +513,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     }
     depthSum += items.size();
     ++enqueued;
-    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), ++nextItemSequence, unknownWrites, std::move(fork)});
+    items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), ++nextItemSequence, unknownWrites, std::move(fork), ReplayProbe::Tag()});
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) thread = std::thread([this] { run(); });
     if (committerWaiting) wake.notify_one();
@@ -491,6 +529,12 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         char item[64];
         std::snprintf(item, sizeof(item), " %s %llu (%.1f ms)", DrainNames[i], static_cast<unsigned long long>(drains[i]), static_cast<double>(drainWaitNs[i]) / 1e6);
         drainText += item;
+    }
+    {
+        char item[96];
+        std::snprintf(item, sizeof(item), "; waits taken before the drain %llu (%.1f ms)", static_cast<unsigned long long>(earlyWaits), static_cast<double>(earlyWaitNs) / 1e6);
+        drainText += item;
+        earlyWaits = earlyWaitNs = 0;
     }
     drainText += "; packet drains by opcode:";
     for (int shown = 0; shown < 5; ++shown) {
@@ -513,6 +557,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         std::fprintf(stderr, "[draw] split preparation (10 s): %llu draws at %.1f us each, %llu failed, %.1f ms waiting for room\n", static_cast<unsigned long long>(prepJobs), prepJobs == 0 ? 0.0 : static_cast<double>(prepNs) / 1e3 / static_cast<double>(prepJobs), static_cast<unsigned long long>(prepFailures), static_cast<double>(prepWaitNs) / 1e6);
         prepJobs = prepNs = prepWaitNs = prepFailures = 0;
     }
+    if (CommitKinds::Enabled()) commitKinds.Report();
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = 0;
     drains = {};
     drainWaitNs = {};
@@ -531,6 +576,7 @@ void DrawPipeline::run() {
         if (hold.owns_lock() && (outstanding.load(std::memory_order_acquire) == 0 || GuestMemory::GpuMutex().Contenders() != 0 || std::chrono::steady_clock::now() - heldSince > holdBudget || !Graphics::CommitHoldEnabled())) hold.unlock();
         Commit* commit = nullptr;
         std::uint64_t sequence = 0;
+        std::shared_ptr<ReplaySegment> segment;
         bool stream = false;
         forkJobs.clear();
         {
@@ -549,6 +595,7 @@ void DrawPipeline::run() {
             committerWaiting = false;
             commit = &items.front().commit;
             sequence = items.front().sequence;
+            segment = items.front().segment;
             gatherForkRun(forkJobs);
             stream = forkRunner.load(std::memory_order_acquire) != nullptr && items.front().fork != nullptr && items.front().fork->eligible && Graphics::ForkStreamEnabled();
         }
@@ -562,17 +609,31 @@ void DrawPipeline::run() {
             hold.lock();
             heldSince = std::chrono::steady_clock::now();
         }
-        static_cast<void>(runCommit(*commit, sequence));
+        static_cast<void>(runCommit(*commit, sequence, std::move(segment)));
+        // APS5_STARVE_SUBMIT=<commands> (experiment): between commits, the open batch goes to the GPU
+        // once it holds that many commands and every submitted batch has completed.
+        static const std::uint64_t starveSubmit = [] {
+            const char* text = std::getenv("APS5_STARVE_SUBMIT");
+            return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        }();
+        if (starveSubmit != 0) {
+            if (auto* recorder = Graphics::Recorder::Active(); recorder != nullptr && Graphics::Recorder::RecordedWorkSinceSubmit() >= starveSubmit) {
+                std::unique_lock<GuestMemory::GpuMutexType> submitLock(GuestMemory::GpuMutex(), std::defer_lock);
+                if (!hold.owns_lock()) submitLock.lock();
+                if (recorder->SubmitIfStarved(starveSubmit)) ++starvedSubmits;
+            }
+        }
     }
 }
 
-bool DrawPipeline::runCommit(const Commit& commit, std::uint64_t sequence) {
+bool DrawPipeline::runCommit(const Commit& commit, std::uint64_t sequence, std::shared_ptr<ReplaySegment> segment) {
     const auto start = std::chrono::steady_clock::now();
     std::exception_ptr fatal;
     bool failed = false;
     PipeTrace(Trace::Commit);
     CommittingSequence() = sequence;
     try {
+        const ReplayProbe::Scope probeScope(segment);
         commit();
     } catch (const std::exception& error) {
         failed = true;
@@ -584,7 +645,10 @@ bool DrawPipeline::runCommit(const Commit& commit, std::uint64_t sequence) {
     CommittingSequence() = 0;
     PipeTrace(Trace::CommitEnd);
     const auto spent = elapsedNs(start);
+    if (CommitKinds::Enabled()) commitKinds.Note(commit.target_type().name(), spent);
+    if (segment != nullptr) ReplayProbe::Committed(*segment, spent, failed || fatal != nullptr);
     std::lock_guard lock(mutex);
+    commitNsTotal += spent;
     if (Graphics::DrawTokensEnabled()) {
         std::lock_guard appliedLock(appliedMutex);
         if (applied.size() != AppliedCapacity) applied.resize(AppliedCapacity);
@@ -644,13 +708,15 @@ std::size_t DrawPipeline::runForked(std::span<ForkJob* const> jobs) {
         handled = runner->Run(jobs, [this, &committed](std::size_t, const Commit* body) {
             const Commit* own = nullptr;
             std::uint64_t sequence = 0;
+            std::shared_ptr<ReplaySegment> segment;
             {
                 std::lock_guard lock(mutex);
                 own = &items.front().commit;
                 sequence = items.front().sequence;
+                segment = items.front().segment;
             }
             ++committed;
-            return runCommit(body != nullptr ? *body : *own, sequence);
+            return runCommit(body != nullptr ? *body : *own, sequence, std::move(segment));
         });
     } catch (...) {
         handled = committed;
@@ -679,13 +745,15 @@ std::size_t DrawPipeline::runStream() {
         }, [this, &committed](const Commit* body) {
             const Commit* own = nullptr;
             std::uint64_t sequence = 0;
+            std::shared_ptr<ReplaySegment> segment;
             {
                 std::lock_guard lock(mutex);
                 own = &items.front().commit;
                 sequence = items.front().sequence;
+                segment = items.front().segment;
             }
             ++committed;
-            return runCommit(body != nullptr ? *body : *own, sequence);
+            return runCommit(body != nullptr ? *body : *own, sequence, std::move(segment));
         });
     } catch (...) {
         handled = committed;
@@ -719,6 +787,50 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
     drainWaitNs[index] += elapsedNs(start);
     rethrowFailure();
+}
+
+bool DrawPipeline::DrainUnless(DrainReason reason, std::uint32_t opcode, const std::function<bool()>& ready) {
+    if (!Busy()) return false;
+    const ProducerScope producer(Producer::Draining);
+    if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
+    const auto start = std::chrono::steady_clock::now();
+    constexpr auto poll = std::chrono::microseconds(100);
+    bool early = false;
+    for (;;) {
+        // The predicate runs without the pipeline's locks (it reads labels and guest memory).
+        if (ready()) {
+            early = true;
+            break;
+        }
+        if (prepOutstanding.load(std::memory_order_acquire) != 0) {
+            std::unique_lock prepLock(prepMutex);
+            prepIdle.wait_for(prepLock, poll, [&] { return prepOutstanding.load(std::memory_order_relaxed) == 0; });
+            continue;
+        }
+        std::unique_lock lock(mutex);
+        if (items.empty()) break;
+        ++idleWaiters;
+        idle.wait_for(lock, poll, [&] { return items.empty(); });
+        --idleWaiters;
+        if (items.empty()) break;
+    }
+    std::lock_guard lock(mutex);
+    const auto index = static_cast<std::size_t>(reason);
+    if (early) {
+        ++earlyWaits;
+        earlyWaitNs += elapsedNs(start);
+    } else {
+        ++drains[index];
+        ++drainOpcodes[std::min<std::uint32_t>(opcode, 0x100)];
+        drainWaitNs[index] += elapsedNs(start);
+    }
+    rethrowFailure();
+    return early;
+}
+
+std::uint64_t DrawPipeline::CommitNsTotal() {
+    std::lock_guard lock(mutex);
+    return commitNsTotal;
 }
 
 std::uint64_t& DrawPipeline::CommittingSequence() {

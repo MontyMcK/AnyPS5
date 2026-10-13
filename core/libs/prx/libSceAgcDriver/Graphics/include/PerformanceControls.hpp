@@ -58,6 +58,7 @@ bool ForkStreamLazyEnabled();
 bool CommitHoldEnabled();
 bool CommitTrimEnabled();
 bool VerifyForks();
+bool ReplayProbeEnabled();
 
 }
 

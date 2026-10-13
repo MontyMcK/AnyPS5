@@ -300,6 +300,9 @@ private:
     std::list<std::uint64_t> dispatchOrder;
     std::mutex dispatchCacheMutex;
     std::uint64_t dispatchCacheHits = 0;
+    // Ticks on every hit and every insert: an entry's recency stamp (DispatchEntry::touched) in this clock
+    // lets a hit promote an entry that inserts pushed back, even while hits are rare.
+    std::uint64_t dispatchCacheClock = 0;
     std::uint64_t dispatchCacheEvictions = 0;
 
     std::uint64_t dispatchCacheVariants = 0;
@@ -318,6 +321,7 @@ private:
     std::list<std::uint64_t> drawOrder;
     std::mutex drawCacheMutex;
     std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
+    std::uint64_t drawCacheClock = 0; // hits + inserts, the recency clock of DrawEntry::touched
 
     DrawEntryCounters drawEntryCounters;
 

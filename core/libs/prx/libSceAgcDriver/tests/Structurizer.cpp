@@ -157,6 +157,9 @@ int main() {
         auto chain = makeGraph(diamonds);
         Structurizer{}.Structurize(chain);
         requireExactPostDominators(chain, "a chain of fifty selections");
+        auto discardArms = makeGraph({{1, 6}, {2, 13}, {3, 12}, {4, 11}, {5, 10}, {7}, {7, 14}, {8, 9}, {9}, {}, {}, {}, {}, {}, {}});
+        Structurizer{}.Structurize(discardArms);
+        requireStructuredBranches(discardArms, "a selection arm that discards or joins its parent's merge beside another arm");
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;

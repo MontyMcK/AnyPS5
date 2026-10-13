@@ -238,9 +238,12 @@ std::vector<std::uint32_t> ShaderDataDwordsFor(const IrBindingLayout& layout, st
 
 }
 
-std::uint32_t PointFilteredSamplerWord(std::uint32_t word0, std::uint32_t filter) {
+std::uint32_t PointFilteredSamplerWord(std::uint32_t word0, std::uint32_t filter, bool depthReduction, bool integerOnly) {
     const bool reduced = ((word0 >> 29u) & 3u) != 0u;
-    if (reduced && (((filter >> 20u) & 0xfu) != 0u || ((filter >> 26u) & 3u) == 2u)) {
+    // A depth-bits image is sampled through its float depth view and the result turned back into bits,
+    // so a min or max over texels or mips there is the min or max of the depth values, as on the GPU.
+    if (reduced && depthReduction) return filter;
+    if (reduced && !integerOnly && (((filter >> 20u) & 0xfu) != 0u || ((filter >> 26u) & 3u) == 2u)) {
         fail("DescriptorBindingBuilder: a min or max reduction sampler that filters between texels or mip levels samples an image that needs point filtering (sint, converted or depth-bits format), which is not implemented");
     }
     const bool mipmapped = ((filter >> 26u) & 3u) != 0u;
@@ -328,13 +331,31 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         for (std::uint32_t component = 0; component < 4u; ++component) plan.specialization.push_back({PipelineSpecialization::ExportBase + target * 4u + component, (exportMappings[target] >> (component * 2u)) & 3u});
     }
     std::vector<std::uint32_t> samplerModes(info.samplers.size(), 0u);
+    std::vector<bool> samplerNonDepthPoint(info.samplers.size(), false);
+    std::vector<bool> samplerNotInteger(info.samplers.size(), false);
+    std::vector<std::string> samplerPointWhy(info.samplers.size());
+    const auto nonDepthPoint = [](const ImageResource& image) { return image.numericClass == IrTextureNumericClass::Sint || image.conversionFormat != IrBufferFormat::Invalid; };
+    const auto pointWhy = [](const ImageResource& image) { return " (image numeric class " + std::to_string(static_cast<int>(image.numericClass)) + ", conversion format " + std::to_string(static_cast<unsigned>(image.conversionFormat)) + ", depth bits " + std::to_string(image.depthBits ? 1 : 0) + ")"; };
     const auto samplerMode = [](const ImageResource& image) { return image.numericClass == IrTextureNumericClass::Sint || image.conversionFormat != IrBufferFormat::Invalid || image.depthBits ? 2u : 1u; };
     for (const auto& pair : info.sampledPairs) {
         const auto& image = info.images.at(pair.image);
-        if (image.indirectRoot == ImageResource::NoIndirectImage) samplerModes.at(pair.sampler) |= samplerMode(info.runtimeImageModes.at(pair.image).at(imageModes[pair.image]));
+        if (image.indirectRoot == ImageResource::NoIndirectImage) {
+            samplerModes.at(pair.sampler) |= samplerMode(info.runtimeImageModes.at(pair.image).at(imageModes[pair.image]));
+            if (nonDepthPoint(info.runtimeImageModes.at(pair.image).at(imageModes[pair.image]))) samplerNonDepthPoint.at(pair.sampler) = true;
+            samplerPointWhy.at(pair.sampler) += pointWhy(info.runtimeImageModes.at(pair.image).at(imageModes[pair.image]));
+            {
+                const auto& mode = info.runtimeImageModes.at(pair.image).at(imageModes[pair.image]);
+                // Only the images that take the point-filtered sampler element matter here; float images use the other one.
+                if (samplerMode(mode) == 2u && (mode.numericClass != IrTextureNumericClass::Sint || mode.conversionFormat != IrBufferFormat::Invalid)) samplerNotInteger.at(pair.sampler) = true;
+            }
+        }
         else {
             const auto& root = info.images.at(image.indirectRoot);
-            for (const auto slot : root.indirectResources) samplerModes.at(pair.sampler) |= samplerMode(info.runtimeImageModes.at(slot).at(imageModes[slot]));
+            for (const auto slot : root.indirectResources) {
+                samplerModes.at(pair.sampler) |= samplerMode(info.runtimeImageModes.at(slot).at(imageModes[slot]));
+                if (nonDepthPoint(info.runtimeImageModes.at(slot).at(imageModes[slot]))) samplerNonDepthPoint.at(pair.sampler) = true;
+                samplerNotInteger.at(pair.sampler) = true;
+            }
         }
     }
     for (std::uint32_t index = 0; index < info.images.size(); ++index) {
@@ -440,7 +461,12 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
                 for (const auto& pair : info.sampledPairs) if (pair.sampler == resource) compare |= info.images.at(pair.image).depthCompare && compareStates.at(pair.image) == 0u;
                 physical.samplerDepthCompare.push_back(compare);
                 physical.samplerUnnormalized.push_back(unnormalized.samplers.at(resource));
-                if ((originals[element] & 1u) != 0u) entry.samplerFilterElements.push_back(element);
+                if ((originals[element] & 1u) != 0u) {
+                    entry.samplerFilterElements.push_back(element);
+                    entry.samplerDepthReduction.push_back(!samplerNonDepthPoint.at(resource));
+                    entry.samplerPointWhy.push_back(samplerPointWhy.at(resource));
+                    entry.samplerIntegerOnly.push_back(!samplerNotInteger.at(resource));
+                }
             }
         } else if (physical.role == DescriptorRole::ShaderData && layout.UsesPushData()) {
             fail("DescriptorBindingBuilder::Populate shader-data binding must not exist when push data is used");
@@ -449,11 +475,11 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         entry.resources = std::move(compact.resources);
         plan.bindings.push_back(std::move(entry));
     }
-    std::vector<std::uint32_t> samplerMasks(info.samplers.size());
+    std::vector<std::uint64_t> samplerMasks(info.samplers.size());
     for (const auto& binding : plan.bindings) {
         if (binding.descriptor.role != DescriptorRole::GuestSamplers) continue;
         if (binding.resources.size() > ShaderInfo::MaxSamplers) fail("prepared sampler mask capacity exceeded");
-        for (std::uint32_t element = 0; element < binding.resources.size(); ++element) samplerMasks.at(binding.resources[element]) |= 1u << element;
+        for (std::uint32_t element = 0; element < binding.resources.size(); ++element) samplerMasks.at(binding.resources[element]) |= std::uint64_t{1} << element;
     }
     for (auto& binding : plan.bindings) {
         if (binding.descriptor.role != DescriptorRole::GuestImages) continue;
@@ -515,9 +541,16 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             break;
         case DescriptorRole::GuestSamplers:
             physical.guestDescriptor = GuestSamplersDescriptor(entry.resources, snapshot);
-            for (const auto element : entry.samplerFilterElements) {
+            for (std::size_t index = 0; index < entry.samplerFilterElements.size(); ++index) {
+                const auto element = entry.samplerFilterElements[index];
                 auto& filter = physical.guestDescriptor.at(element * 4u + 2u);
-                filter = PointFilteredSamplerWord(physical.guestDescriptor.at(element * 4u), filter);
+                try {
+                    filter = PointFilteredSamplerWord(physical.guestDescriptor.at(element * 4u), filter, entry.samplerDepthReduction.at(index), entry.samplerIntegerOnly.at(index));
+                    // The texture unit does not filter integer images, so their min or max reduction is a plain point sample.
+                    if (entry.samplerIntegerOnly.at(index)) physical.guestDescriptor.at(element * 4u) &= ~(3u << 29u);
+                } catch (const std::exception& error) {
+                    fail(std::string(error.what()) + entry.samplerPointWhy.at(index));
+                }
             }
             break;
         case DescriptorRole::FlattenedSrt:
