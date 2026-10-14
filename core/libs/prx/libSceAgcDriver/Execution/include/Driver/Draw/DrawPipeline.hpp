@@ -19,6 +19,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/PassRun.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -64,6 +65,9 @@ public:
         virtual ~ForkJob() = default;
         std::uint64_t passHint = 0;
         bool eligible = false;
+        // Made for the fork flags (fork_build, fork_stats, fork_ahead), not only for the pass hint
+        // live `parallel_commit` reads: only such jobs go to the fork runner.
+        bool forFork = false;
     };
     class ForkRunner {
     public:
@@ -139,6 +143,7 @@ private:
     static bool PrepReorder();
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
+    void reportPassRuns();
 
     std::mutex mutex;
     std::condition_variable wake;
@@ -200,6 +205,13 @@ private:
     std::uint64_t forkRuns = 0;
     std::uint64_t forkRunItems = 0;
     std::uint64_t forkHandled = 0;
+    // Live `parallel_commit` pass runs (PassRun.hpp): the committer's tracker statistics, moved
+    // here under `mutex` for the [parcommit] report, and the APS5_VERIFY_PARALLEL_COMMIT counts
+    // of draws inside runs (after the head) that continued the pass or began one.
+    PassRunStatistics passRunStats;
+    std::uint64_t verifiedContinued = 0;
+    std::uint64_t verifiedBegun = 0;
+    std::uint64_t verifiedRuns = 0;
 };
 
 }

@@ -10,18 +10,86 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
+#include <chrono>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
 #include <atomic>
+#include <mutex>
 #include <cstdio>
 #include <array>
+#include <optional>
 #include <cstdlib>
 #include <stdexcept>
 
 namespace AgcDriver::DriverDetail {
 
 namespace {
+
+// APS5_DISPATCH_KEY_PROFILE=<queue hex> (default 22): why the dispatch cache misses on that queue.
+// Every 10 s: dispatches, distinct keys, how many keys were already seen in the previous window (an
+// unbounded cache would hit those), and for the busiest programs which user data words change
+// between dispatches and how many distinct values each takes.
+void profileDispatchKeys(std::uint64_t address, const std::vector<std::uint32_t>& userData, std::uint64_t key) {
+    static const std::uint32_t wanted = [] {
+        const char* text = std::getenv("APS5_DISPATCH_KEY_PROFILE");
+        if (text == nullptr) return 0xffffffffu;
+        const auto parsed = static_cast<std::uint32_t>(std::strtoul(text, nullptr, 16));
+        return parsed == 0 || parsed == 1 ? 0x22u : parsed;
+    }();
+    if (wanted == 0xffffffffu || GuestMemory::GpuLockThreadTag() != wanted) return;
+    struct Word { std::uint32_t last = 0; std::uint64_t changes = 0; std::unordered_set<std::uint32_t> values; };
+    struct Program { std::uint64_t dispatches = 0; std::unordered_set<std::uint64_t> keys; std::vector<Word> words; };
+    static std::mutex mutex;
+    static std::unordered_map<std::uint64_t, Program> programs;
+    static std::unordered_set<std::uint64_t> window, previous;
+    static std::uint64_t dispatches = 0, seenBefore = 0, seenThisWindow = 0;
+    static auto last = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    ++dispatches;
+    if (previous.contains(key)) ++seenBefore;
+    else if (window.contains(key)) ++seenThisWindow;
+    window.insert(key);
+    auto& program = programs[address];
+    ++program.dispatches;
+    if (program.keys.size() < 65536) program.keys.insert(key);
+    if (program.words.size() < userData.size()) program.words.resize(userData.size());
+    for (std::size_t i = 0; i < userData.size(); ++i) {
+        auto& word = program.words[i];
+        if (program.dispatches > 1 && word.last != userData[i]) ++word.changes;
+        word.last = userData[i];
+        if (word.values.size() < 4096) word.values.insert(userData[i]);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    std::fprintf(stderr, "[key-churn] queue 0x%x (10 s): %llu dispatches, %zu distinct keys; keys seen in the previous window %llu (%.0f%%), first seen earlier this window %llu (%.0f%%), %zu programs\n", wanted, static_cast<unsigned long long>(dispatches), window.size(), static_cast<unsigned long long>(seenBefore), dispatches != 0 ? 100.0 * static_cast<double>(seenBefore) / static_cast<double>(dispatches) : 0.0, static_cast<unsigned long long>(seenThisWindow), dispatches != 0 ? 100.0 * static_cast<double>(seenThisWindow) / static_cast<double>(dispatches) : 0.0, programs.size());
+    std::vector<std::pair<std::uint64_t, const Program*>> order;
+    for (const auto& [programAddress, entry] : programs) order.emplace_back(programAddress, &entry);
+    std::sort(order.begin(), order.end(), [](const auto& a, const auto& b) { return a.second->dispatches > b.second->dispatches; });
+    for (std::size_t rank = 0; rank < order.size() && rank < 8; ++rank) {
+        const auto& entry = *order[rank].second;
+        std::string line;
+        char part[96];
+        for (std::size_t i = 0; i < entry.words.size(); ++i) {
+            if (entry.words[i].values.size() <= 1) continue;
+            std::snprintf(part, sizeof(part), " u%zu:%llu/%zu", i, static_cast<unsigned long long>(entry.words[i].changes), entry.words[i].values.size());
+            line += part;
+        }
+        std::fprintf(stderr, "[key-churn]   program 0x%llx: %llu dispatches, %zu keys, %zu user words; changing words (changes/distinct values):%s\n", static_cast<unsigned long long>(order[rank].first), static_cast<unsigned long long>(entry.dispatches), entry.keys.size(), entry.words.size(), line.c_str());
+    }
+    previous = std::move(window);
+    window.clear();
+    programs.clear();
+    dispatches = seenBefore = seenThisWindow = 0;
+}
 
 void noteDwordFillKernel(std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, std::span<const std::uint32_t> packet, std::uint64_t indirectArguments, const ShaderRecompiler::ShaderComputeStageInfo& compute) {
     static const bool disabled = std::getenv("APS5_NO_DWORD_FILL_CLEAR") != nullptr;
@@ -38,6 +106,41 @@ void noteDwordFillKernel(std::span<const std::uint32_t> code, const std::vector<
     const auto base = userData[0] | (static_cast<std::uint64_t>(userData[1] & 0xffffu) << 32u);
     Graphics::TraceDepthMetadataFill(base, static_cast<std::size_t>(records * 4u), userData[4], true, "dword-fill dispatch");
     Graphics::NoteDepthMetadataFill(base, static_cast<std::size_t>(records * 4u), userData[4]);
+    // Live `fill_kernel_keys` (env APS5_FILL_KERNEL_KEYS): a fill of one repeated byte that is a DCC
+    // key code (the title fast-clears render-target keys with this kernel every frame) is noted
+    // in the key-store memo, as a buffer fill of the keys is (BufferFill.cpp): a key read of the
+    // range then answers the fill's keys instead of waiting for the GPU. The memo keeps the entry
+    // only while the dispatch's own write note is the newest over exactly this range
+    // (Recorder::LastWriteNote, PendingStoreKeys), so any other writer still makes the read wait.
+    static const bool keysDefault = std::getenv("APS5_FILL_KERNEL_KEYS") != nullptr;
+    const auto pattern = userData[4];
+    if (pattern != (pattern & 0xffu) * 0x01010101u || !Graphics::LiveFlag("fill_kernel_keys", keysDefault)) return;
+    Graphics::DccKeys keys = Graphics::DccKeys::Mixed;
+    switch (pattern & 0xffu) {
+        case 0x00: keys = Graphics::DccKeys::Clear0000; break;
+        case 0x40: keys = Graphics::DccKeys::Clear0001; break;
+        case 0x80: keys = Graphics::DccKeys::Clear1110; break;
+        case 0xc0: keys = Graphics::DccKeys::Clear1111; break;
+        case 0x20: keys = Graphics::DccKeys::ClearRegister; break;
+        case 0xff: keys = Graphics::DccKeys::Uncompressed; break;
+        default: return;
+    }
+    // The pipelined queue-0 path calls this after its device hold ended: take the mutex for the note
+    // (recursive; the stage-B path still holds it).
+    std::unique_lock<GuestMemory::GpuMutexType> hold(GuestMemory::GpuMutex(), std::defer_lock);
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+        hold.lock();
+    }
+    auto* recorder = Graphics::Recorder::Active();
+    if (recorder == nullptr) return;
+    // The dispatch notes its whole written buffer, which may extend past the filled records: the
+    // range is the dispatch's only while the newest note over it is one the dispatch itself made.
+    const auto bytes = static_cast<std::size_t>(records * 4u);
+    const auto note = recorder->NewestWriteNote(base, bytes);
+    const auto [first, last] = Graphics::Recorder::DispatchNotes();
+    if (note <= first || note > last) return;
+    Graphics::NoteKeysFillOnGpuAt(base, bytes, keys, note);
 }
 
 }
@@ -45,6 +148,13 @@ void noteDwordFillKernel(std::span<const std::uint32_t> code, const std::vector<
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     const DrawPipeline::TraceScope pipeTrace(DrawPipeline::Trace::QueueDispatch, DrawPipeline::Trace::QueueDispatchEnd, submission.queue);
     PerformanceTimer timing("Driver.Dispatch");
+    // Live `skip_queue_dispatches` (experiment only, wrong rendering): drops every dispatch of the
+    // queue named by APS5_SKIP_DISPATCH_QUEUE (hex, default 0x22), to measure what they cost a frame.
+    static const std::uint32_t skipQueue = [] {
+        const char* text = std::getenv("APS5_SKIP_DISPATCH_QUEUE");
+        return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 16)) : 0x22u;
+    }();
+    if (submission.queue == skipQueue && Graphics::LiveFlag("skip_queue_dispatches", false)) return;
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     auto it = submission.shaders->upper_bound(address);
     std::shared_ptr<const ShaderSnapshot> registeredShader;
@@ -179,6 +289,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             mix(value);
         }
     }
+    profileDispatchKeys(address, userData, key);
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiledResult;
 
     std::shared_ptr<DispatchVariant> keepVariant;
@@ -230,19 +341,61 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
 
     mix(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+    // Live `dispatch_shape_reuse` (env APS5_DISPATCH_SHAPE_REUSE=1): a miss with no entry may reuse
+    // an earlier capture of the same program whose user words differ only where the walk takes
+    // them as pointers or copies them (ShapeReuse.cpp). The static key is the key above without the
+    // user words: the shape key adds the words the program's plan does not let move.
+    const bool shapeOn = !noDispatchCache && !stampValidate() && !probeThis && shapeReuse();
+    std::uint64_t staticKey = 0;
+    if (shapeOn) {
+        staticKey = 0xcbf29ce484222325ull;
+        const auto mixStatic = [&](std::uint64_t value) {
+            staticKey ^= value;
+            staticKey *= 0x100000001b3ull;
+        };
+        mixStatic(address);
+        mixStatic(packet[4] & 0x8000u);
+        for (const auto threads : compute.partialThreads) mixStatic(threads);
+        mixStatic(userData.size());
+        if (keyHygiene) {
+            for (const auto offset : {0x207u, 0x208u, 0x209u, 0x212u, 0x213u}) {
+                const auto found = queue.shader.find(offset);
+                mixStatic(found == queue.shader.end() ? (1ull << 32u) : found->second);
+            }
+        } else {
+            for (const auto& [offset, value] : queue.shader) {
+                if (offset >= 0x240u && offset < 0x260u) continue;
+                mixStatic(offset);
+                mixStatic(value);
+            }
+        }
+        mixStatic(reinterpret_cast<std::uintptr_t>(registeredShader.get()));
+    }
     phaseTiming.Phase(PhaseKey);
     timing.Mark("decode_key_device_setup");
     lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
     timing.Mark("lookup_cache");
+    std::shared_ptr<const std::vector<std::uint32_t>> shapeWords;
+    bool shapeHit = false;
+    const auto forgetAtShape = GuestMemory::ForgetSerial();
+    if (!cached && shapeOn && missedEntry == nullptr) {
+        shapeHit = lookupShape(snapshot, codeOffset, request, memory, address, submission.queue, staticKey, registeredShader, userData, compiledResult, capture, captured, shaderMemory, shapeWords);
+        timing.Mark("shape_reuse");
+    }
     if (cached) {
         require(keepVariant != nullptr && keepVariant->shader == registeredShader, "dispatch cache belongs to another registered shader");
         captureMs += phaseTiming.Elapsed();
+    } else if (shapeHit) {
+        captureMs += phaseTiming.Elapsed();
+        phaseTiming.Phase(PhaseCapture);
+        insertDispatch(address, key, noDispatchCache, profile, registeredShader, forgetAtShape, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
     } else {
         shaderMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
         std::uint64_t forgetAtCapture = 0;
 
         static const bool dumpShaders = std::getenv("APS5_DUMP_SHADERS") != nullptr;
         static const bool dumpFailures = std::getenv("APS5_DUMP_SHADER_FAILURES") != nullptr;
+        const auto shapeStarted = std::chrono::steady_clock::now();
         try {
             const auto waitedBefore = traceCapSync() ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             forgetAtCapture = GuestMemory::ForgetSerial();
@@ -266,6 +419,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             timing.Mark("capture_resources");
             compiledResult = invocation.Materialize(*capture);
             timing.Mark("materialize");
+            if (shapeOn) {
+                CountShapeFullCapture(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - shapeStarted).count());
+                rememberShape(address, staticKey, registeredShader, userData, memory, *shaderMemory, invocation.Request(), capture, compiledResult);
+            }
             if (compiledResult->cacheHit) ++cacheHits;
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
             static double totalMs = 0;
@@ -338,9 +495,11 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
             const std::array<std::uint32_t, 5> packetWords{packet[0], packet[1], packet[2], packet[3], packet[4]};
             const auto runToken = Graphics::Recorder::DispatchRunToken();
-            auto commit = [this, localDevice, compiledResult, keepVariant, attachVariant, shaderMemory, captured, registeredShader, groups, address, dataHit, cached, commitQueue, commitPacket, epoch, packetWords, codeOffset, userData, compute, runToken]() mutable {
+            auto commit = [this, localDevice, compiledResult, keepVariant, attachVariant, shaderMemory, shapeWords, captured, registeredShader, groups, address, dataHit, cached, commitQueue, commitPacket, epoch, packetWords, codeOffset, userData, compute, runToken]() mutable {
                 DrawPipeline::FollowEpoch(epoch);
                 GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
+                // The dispatch's grid, for the store covers of its buffer elements (a direct dispatch).
+                const Graphics::DispatchGridScope gridScope(ShaderRecompiler::DispatchGrid{groups, compute.numThreads});
                 // The dispatch run token of the packet, for the committer's recordDispatch.
                 struct RunToken {
                     explicit RunToken(std::uint64_t token) { Graphics::Recorder::SetDispatchRunToken(token); }
@@ -419,6 +578,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     auto* const attachTo = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
+    // A direct dispatch's grid, for the store covers of its buffer elements (GuestBufferMemory's
+    // write-back elision); an indirect one's counts are not known here.
+    std::optional<Graphics::DispatchGridScope> gridScope;
+    if (indirectArguments == 0) gridScope.emplace(ShaderRecompiler::DispatchGrid{groups, compute.numThreads});
 
     for (;;) {
 

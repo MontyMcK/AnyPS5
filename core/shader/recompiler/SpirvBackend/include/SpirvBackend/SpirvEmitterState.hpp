@@ -127,6 +127,23 @@ struct SpirvEmitterState {
     std::uint32_t bdaClockLookup = 0;
     std::uint32_t bdaClockCalls = 0;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
+    // Reads whose 64-bit base is a pair of user data registers (one value for the whole draw): the
+    // table range holding that base, found once at the program's entry (see EmitBdaAnchors). A read
+    // that lies in it loads from the range's device address plus its offset, behind one branch;
+    // any other read takes the lookup path. The SPIR-V ids of the u64 values: the range's begin,
+    // size (0 when the base is in no usable readable range), device address, and base - begin.
+    struct BdaAnchor {
+        std::uint32_t lowRegister = 0;
+        std::uint32_t highRegister = 0;
+        std::uint32_t begin = 0;
+        std::uint32_t size = 0;
+        std::uint32_t device = 0;
+        std::uint32_t offset = 0;
+    };
+    std::vector<BdaAnchor> bdaAnchors;
+    std::uint32_t bdaAnchorFunction = 0;
+    // No lookup cache or hint (set for programs with anchors, see DefineGetBdaPointer).
+    bool bdaNoLookupState = false;
     std::uint32_t bdaStopValue = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
     bool bdaStopsInvocations = true;

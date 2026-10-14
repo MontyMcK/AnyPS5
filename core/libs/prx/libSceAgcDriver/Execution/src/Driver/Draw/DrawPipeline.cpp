@@ -1,8 +1,11 @@
+#include "prx/libSceAgcDriver/Graphics/include/CpuTimeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/ReplayProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSpeculation.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
 #include <cstdio>
@@ -571,6 +574,42 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (now - lastReport >= std::chrono::seconds(10)) report(now);
 }
 
+// [parcommit] (APS5_PROFILE_DRAW, every 10 s, under `mutex`): why render passes ended (the
+// recorder's counts: a pass that ends for anything but the guest's next draw is a pass break the
+// next draw pays for as a new head) and, with live `parallel_commit`, the pass runs.
+void DrawPipeline::reportPassRuns() {
+    const auto ends = Graphics::Recorder::TakePassEndCounts();
+    std::uint64_t total = 0;
+    for (const auto count : ends.causes) total += count;
+    std::string line = "[parcommit] (10 s) " + std::to_string(total) + " render pass ends by cause:";
+    for (std::size_t index = 1; index < ends.causes.size(); ++index) {
+        if (ends.causes[index] == 0) continue;
+        line += std::string(" ") + Graphics::Recorder::PassEndCauseName(static_cast<Graphics::Recorder::PassEndCause>(index)) + " " + std::to_string(ends.causes[index]);
+        if (static_cast<Graphics::Recorder::PassEndCause>(index) != Graphics::Recorder::PassEndCause::Submit) continue;
+        std::string reasons;
+        for (std::size_t reason = 0; reason < ends.submits.size(); ++reason) {
+            if (ends.submits[reason] == 0) continue;
+            reasons += std::string(reasons.empty() ? "" : " ") + Graphics::Recorder::SubmitReasonName(static_cast<Graphics::Recorder::SubmitReason>(reason)) + " " + std::to_string(ends.submits[reason]);
+        }
+        if (!reasons.empty()) line += " (" + reasons + ")";
+    }
+    line += ";";
+    char item[512];
+    std::snprintf(item, sizeof(item), " pass runs (parallel_commit %s): %llu runs of %.1f draws, %llu continued while others waited, %llu continuations (each a deferred starve check under APS5_STARVE_SUBMIT), %llu heads left outside a run to let waiters in; ended by:", Graphics::ParallelCommitEnabled() ? "on" : "off", static_cast<unsigned long long>(passRunStats.runs), passRunStats.runs != 0 ? static_cast<double>(passRunStats.draws) / static_cast<double>(passRunStats.runs) : 0.0, static_cast<unsigned long long>(passRunStats.contendedContinuations), static_cast<unsigned long long>(passRunStats.deferredStarveChecks), static_cast<unsigned long long>(passRunStats.cooldowns));
+    line += item;
+    for (std::size_t index = 0; index < passRunStats.ends.size(); ++index) {
+        if (passRunStats.ends[index] == 0) continue;
+        line += std::string(" ") + PassRunEndName(static_cast<PassRunEnd>(index)) + " " + std::to_string(passRunStats.ends[index]);
+    }
+    if (Graphics::VerifyParallelCommit()) {
+        std::snprintf(item, sizeof(item), "; verified %llu runs: draws after the head continued the pass %llu, began one %llu", static_cast<unsigned long long>(verifiedRuns), static_cast<unsigned long long>(verifiedContinued), static_cast<unsigned long long>(verifiedBegun));
+        line += item;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+    passRunStats = {};
+    verifiedRuns = verifiedContinued = verifiedBegun = 0;
+}
+
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     lastReport = now;
     std::string drainText;
@@ -607,13 +646,35 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
         prepJobs = prepNs = prepWaitNs = prepFailures = 0;
     }
     if (CommitKinds::Enabled()) commitKinds.Report();
+    reportPassRuns();
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = 0;
     drains = {};
     drainWaitNs = {};
 }
 
+namespace {
+
+PassRunLimits passRunLimits() {
+    static const PassRunLimits limits = [] {
+        PassRunLimits configured;
+        if (const char* text = std::getenv("APS5_PASS_RUN_US")) configured.budget = std::chrono::microseconds(std::clamp<unsigned long long>(std::strtoull(text, nullptr, 10), 10, 20000));
+        if (const char* text = std::getenv("APS5_PASS_RUN_DRAWS")) configured.maxDraws = static_cast<std::size_t>(std::clamp<unsigned long long>(std::strtoull(text, nullptr, 10), 2, 4096));
+        return configured;
+    }();
+    return limits;
+}
+
+[[noreturn]] void passRunVerifyFailed(const char* what) {
+    std::fprintf(stderr, "[parcommit] APS5_VERIFY_PARALLEL_COMMIT: %s\n", what);
+    std::fflush(stderr);
+    std::abort();
+}
+
+}
+
 void DrawPipeline::run() {
     GuestMemory::SetCollectRole(1);
+    Graphics::Recorder::MarkCommitterThread();
     static const auto holdBudget = [] {
         const char* text = std::getenv("APS5_COMMIT_HOLD_US");
         const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 300ull;
@@ -622,13 +683,31 @@ void DrawPipeline::run() {
     std::vector<ForkJob*> forkJobs;
     std::unique_lock<GuestMemory::GpuMutexType> hold(GuestMemory::GpuMutex(), std::defer_lock);
     auto heldSince = std::chrono::steady_clock::time_point{};
+    // Live `parallel_commit` pass runs (PassRun.hpp): while a run is active the committer holds
+    // `hold` across its commits whoever waits for the mutex, and defers its starve check to the
+    // run's end. Only this thread touches the tracker; its statistics move to `passRunStats`.
+    PassRunTracker passRun;
+    passRun.SetLimits(passRunLimits());
+    const auto runItem = [](const Item& item) { return PassRunItem{item.fork != nullptr, item.fork != nullptr ? item.fork->passHint : 0}; };
+    const auto publishRunStatistics = [&] {
+        const auto taken = passRun.TakeStatistics();
+        std::lock_guard lock(mutex);
+        passRunStats.runs += taken.runs;
+        passRunStats.draws += taken.draws;
+        passRunStats.contendedContinuations += taken.contendedContinuations;
+        passRunStats.deferredStarveChecks += taken.deferredStarveChecks;
+        passRunStats.cooldowns += taken.cooldowns;
+        for (std::size_t index = 0; index < passRunStats.ends.size(); ++index) passRunStats.ends[index] += taken.ends[index];
+    };
     for (;;) {
-        if (hold.owns_lock() && (outstanding.load(std::memory_order_acquire) == 0 || GuestMemory::GpuMutex().Contenders() != 0 || std::chrono::steady_clock::now() - heldSince > holdBudget || !Graphics::CommitHoldEnabled())) hold.unlock();
+        if (hold.owns_lock() && !passRun.Active() && (outstanding.load(std::memory_order_acquire) == 0 || GuestMemory::GpuMutex().Contenders() != 0 || std::chrono::steady_clock::now() - heldSince > holdBudget || !Graphics::CommitHoldEnabled())) hold.unlock();
         Commit* commit = nullptr;
         std::uint64_t sequence = 0;
         std::shared_ptr<ReplaySegment> segment;
         bool stream = false;
         forkJobs.clear();
+        PassRunItem front;
+        std::optional<PassRunItem> next;
         {
             std::unique_lock lock(mutex);
             committerWaiting = true;
@@ -646,13 +725,90 @@ void DrawPipeline::run() {
             commit = &items.front().commit;
             sequence = items.front().sequence;
             segment = items.front().segment;
+            front = runItem(items.front());
+            if (items.size() > 1) next = runItem(items[1]);
             gatherForkRun(forkJobs);
-            stream = forkRunner.load(std::memory_order_acquire) != nullptr && items.front().fork != nullptr && items.front().fork->eligible && Graphics::ForkStreamEnabled();
+            stream = forkRunner.load(std::memory_order_acquire) != nullptr && items.front().fork != nullptr && items.front().fork->forFork && items.front().fork->eligible && Graphics::ForkStreamEnabled();
         }
+        // A pass run starts at a draw that the queued draw behind it continues, and goes on while
+        // AfterCommit lets it; the flag switched off ends it at once.
+        const bool parallelCommit = Graphics::ParallelCommitEnabled();
+        if (!parallelCommit && passRun.Active()) {
+            passRun.Abandon(PassRunEnd::FlagOff);
+            publishRunStatistics();
+        }
+        const bool inRun = parallelCommit && passRun.BeforeCommit(front, next, std::chrono::steady_clock::now());
+        if (inRun && !hold.owns_lock()) {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+            hold.lock();
+            heldSince = std::chrono::steady_clock::now();
+        }
+        const bool verify = inRun && Graphics::VerifyParallelCommit();
+        const bool runHead = inRun && passRun.Committed() == 0;
+        const auto othersBefore = verify ? Graphics::Recorder::PassEndsByOtherThreads() : 0;
+        if (verify) {
+            if (!GuestMemory::GpuMutex().HeldByThisThread()) passRunVerifyFailed("a pass run commits without holding the GPU mutex");
+            static_cast<void>(Graphics::TakeDrawPassOutcome());
+        }
+        // After `count` commits: the run goes on only with the next queued draw of its pass while
+        // the recorder's pass stays continuable (read under `hold`), within its budget.
+        const auto afterCommits = [&](std::size_t count) {
+            if (!passRun.Active()) return;
+            if (verify) {
+                if (!GuestMemory::GpuMutex().HeldByThisThread()) passRunVerifyFailed("a pass run lost the GPU mutex during a commit");
+                if (Graphics::Recorder::PassEndsByOtherThreads() != othersBefore) passRunVerifyFailed("another thread ended the render pass inside a pass run");
+                const auto outcome = Graphics::TakeDrawPassOutcome();
+                std::lock_guard lock(mutex);
+                if (count == 1 && !runHead && outcome != 0) ++(outcome == 1 ? verifiedContinued : verifiedBegun);
+                if (runHead) ++verifiedRuns;
+            }
+            std::optional<PassRunItem> queued;
+            {
+                std::lock_guard lock(mutex);
+                if (!items.empty()) queued = runItem(items.front());
+            }
+            auto* recorder = Graphics::Recorder::Active();
+            const bool continuable = recorder != nullptr && recorder->PassContinuable();
+            static_cast<void>(passRun.AfterCommit(count, queued, continuable, GuestMemory::GpuMutex().Contenders() != 0, std::chrono::steady_clock::now()));
+            if (!passRun.Active()) publishRunStatistics();
+        };
+        // APS5_STARVE_SUBMIT=<commands> (experiment): between commits, the open batch goes to the GPU
+        // once it holds that many commands and every submitted batch has completed.
+        static const std::uint64_t starveSubmit = [] {
+            const char* text = std::getenv("APS5_STARVE_SUBMIT");
+            return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        }();
+        const auto starveCheck = [&] {
+            if (starveSubmit == 0) return;
+            // Inside a pass run the submit waits for the run's end: it would end the render pass.
+            if (passRun.Active()) return;
+            if (auto* recorder = Graphics::Recorder::Active(); recorder != nullptr && Graphics::Recorder::RecordedWorkSinceSubmit() >= starveSubmit) {
+                std::unique_lock<GuestMemory::GpuMutexType> submitLock(GuestMemory::GpuMutex(), std::defer_lock);
+                if (!hold.owns_lock()) submitLock.lock();
+                // Nothing left to commit: the committer goes idle next, so a young batch is not
+                // held for its age (Recorder::StarveAge) with nothing behind it to submit it.
+                if (recorder->SubmitIfStarved(starveSubmit, outstanding.load(std::memory_order_acquire) == 0)) ++starvedSubmits;
+            }
+        };
         if (stream) {
-            if (runStream() != 0) continue;
-        } else if (forkJobs.size() >= 2 && runForked(forkJobs) != 0) {
-            continue;
+            if (const auto handled = runStream(); handled != 0) {
+                // A stream window commits across passes (DrawForkRunner::Stream schedules ahead
+                // within a pass but keeps committing behind it): it ends the run.
+                if (handled > 1 && passRun.Active()) {
+                    passRun.Abandon(PassRunEnd::Stream);
+                    publishRunStatistics();
+                }
+                afterCommits(handled);
+                // With starve_age a batch held for its age must not be left behind a forked run.
+                if (Graphics::Recorder::StarveAge().count() != 0) starveCheck();
+                continue;
+            }
+        } else if (forkJobs.size() >= 2) {
+            if (const auto handled = runForked(forkJobs); handled != 0) {
+                afterCommits(handled);
+                if (Graphics::Recorder::StarveAge().count() != 0) starveCheck();
+                continue;
+            }
         }
         if (!hold.owns_lock() && Graphics::CommitHoldEnabled()) {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
@@ -660,19 +816,8 @@ void DrawPipeline::run() {
             heldSince = std::chrono::steady_clock::now();
         }
         static_cast<void>(runCommit(*commit, sequence, std::move(segment)));
-        // APS5_STARVE_SUBMIT=<commands> (experiment): between commits, the open batch goes to the GPU
-        // once it holds that many commands and every submitted batch has completed.
-        static const std::uint64_t starveSubmit = [] {
-            const char* text = std::getenv("APS5_STARVE_SUBMIT");
-            return text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
-        }();
-        if (starveSubmit != 0) {
-            if (auto* recorder = Graphics::Recorder::Active(); recorder != nullptr && Graphics::Recorder::RecordedWorkSinceSubmit() >= starveSubmit) {
-                std::unique_lock<GuestMemory::GpuMutexType> submitLock(GuestMemory::GpuMutex(), std::defer_lock);
-                if (!hold.owns_lock()) submitLock.lock();
-                if (recorder->SubmitIfStarved(starveSubmit)) ++starvedSubmits;
-            }
-        }
+        afterCommits(1);
+        starveCheck();
     }
 }
 
@@ -720,6 +865,7 @@ bool DrawPipeline::runCommit(const Commit& commit, std::uint64_t sequence, std::
     CommittingSequence() = 0;
     PipeTrace(Trace::CommitEnd);
     const auto spent = elapsedNs(start);
+    if (spent >= 1'000'000 && Graphics::CpuTimeline::Active()) Graphics::CpuTimeline::Event("commit", start, start + std::chrono::nanoseconds(spent), sequence, 0);
     if (CommitKinds::Enabled()) commitKinds.Note(commit.target_type().name(), spent);
     if (segment != nullptr) ReplayProbe::Committed(*segment, spent, failed || fatal != nullptr);
     std::lock_guard lock(mutex);
@@ -750,7 +896,7 @@ void DrawPipeline::gatherForkRun(std::vector<ForkJob*>& jobs) {
     const bool build = forkRunner.load(std::memory_order_acquire) != nullptr && Graphics::ForkBuildEnabled();
     if (!stats && !build) return;
     const auto& front = items.front();
-    if (front.fork == nullptr || !front.fork->eligible) {
+    if (front.fork == nullptr || !front.fork->forFork || !front.fork->eligible) {
         lastHinted = false;
         return;
     }
@@ -759,7 +905,7 @@ void DrawPipeline::gatherForkRun(std::vector<ForkJob*>& jobs) {
     const auto limit = ForkRunLimit();
     std::size_t length = 0;
     for (const auto& item : items) {
-        if (item.fork == nullptr || !item.fork->eligible || item.fork->passHint != hint) break;
+        if (item.fork == nullptr || !item.fork->forFork || !item.fork->eligible || item.fork->passHint != hint) break;
         if (build && continuing && jobs.size() < limit) jobs.push_back(item.fork.get());
         ++length;
         if (!stats && (!continuing || jobs.size() >= limit)) break;
@@ -813,7 +959,7 @@ std::size_t DrawPipeline::runStream() {
             std::vector<std::shared_ptr<ForkJob>> jobs;
             std::lock_guard lock(mutex);
             for (const auto& item : items) {
-                if (item.fork == nullptr || jobs.size() >= limit) break;
+                if (item.fork == nullptr || !item.fork->forFork || jobs.size() >= limit) break;
                 jobs.push_back(item.fork);
             }
             return jobs;

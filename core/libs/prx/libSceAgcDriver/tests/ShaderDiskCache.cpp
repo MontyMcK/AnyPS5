@@ -42,7 +42,7 @@ void setEnvironment(const char* name, const std::string& value) {
 }
 
 bool sameBinding(const DescriptorBinding& left, const DescriptorBinding& right) {
-    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.samplerUnnormalized == right.samplerUnnormalized && left.imageUnnormalized == right.imageUnnormalized && left.imageSamplers == right.imageSamplers;
+    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.samplerUnnormalized == right.samplerUnnormalized && left.imageUnnormalized == right.imageUnnormalized && left.imageSamplers == right.imageSamplers && left.bufferRead == right.bufferRead && left.bufferCovers == right.bufferCovers;
 }
 
 bool sameBindings(const std::vector<DescriptorBinding>& left, const std::vector<DescriptorBinding>& right) {
@@ -100,6 +100,17 @@ void requireSameVariant(const CompiledVariant& left, const CompiledVariant& righ
     require(left.bindings.pushConstantOffsetBytes == right.bindings.pushConstantOffsetBytes && left.bindings.pushConstantSizeBytes == right.bindings.pushConstantSizeBytes, prefix + "push constant range differs");
 }
 
+BufferStoreCover sampleCover(std::uint32_t seed) {
+    BufferStoreCover cover;
+    cover.offset = {seed, {256u, 0u, seed}, {4u, 1u, 0u}};
+    cover.scalarOffset = {16u * seed, {0u, 1u, 0u}, {}};
+    cover.immediate = 8u;
+    cover.bytes = 4u * (seed % 4u + 1u);
+    cover.indexed = seed % 2u == 0u;
+    cover.bounds = {{{0u, {}, {1u, 0u, 0u}}, 63u}, {{seed, {1u, 0u, 0u}, {}}, 0xffffffu}};
+    return cover;
+}
+
 DescriptorBinding sampleBinding(std::uint32_t seed) {
     DescriptorBinding binding{};
     binding.kind = DescriptorKind::StorageImage;
@@ -119,6 +130,8 @@ DescriptorBinding sampleBinding(std::uint32_t seed) {
     binding.samplerUnnormalized = {false, true, true};
     binding.imageUnnormalized = {true, false, seed % 2 == 0};
     binding.imageSamplers = {0x5u, 0u, 0x80000000u};
+    binding.bufferRead = {true, false, false, true, true, false};
+    binding.bufferCovers = {{}, {sampleCover(seed)}, {sampleCover(seed + 1u), sampleCover(seed + 2u)}};
     return binding;
 }
 
@@ -179,6 +192,7 @@ CompiledVariant sampleVariant() {
     buffer.descriptorFormatted = true;
     buffer.formattedReadMask = 5u;
     buffer.typedAlignment = 2u;
+    buffer.covers = {sampleCover(3u), sampleCover(4u)};
     info.info.buffers = {buffer, BufferResource{}};
     ImageResource image{};
     image.source = 5;
@@ -749,6 +763,7 @@ void verifyBindingPlanSelection() {
     info.buffers.resize(2);
     info.buffers[0].atomic = true;
     info.buffers[1].read = true;
+    info.buffers[1].covers = {sampleCover(5u)};
     CompiledBindingLayout compiled{};
     compiled.layout.descriptors = {{DescriptorBindingKind::Buffers, {0, 1}}, {DescriptorBindingKind::FlattenedSrt, {}}, {DescriptorBindingKind::ShaderData, {}}, {DescriptorBindingKind::Gds, {}}};
     compiled.layout.userDataRegisters = {0};
@@ -766,7 +781,7 @@ void verifyBindingPlanSelection() {
     BindingAllocationResult full;
     builder.Populate(full, compiled, plan, 0u, snapshot, {});
     require(full.bindings.size() == 4u, "binding plan lost a descriptor before module selection");
-    require(full.bindings[0].bufferAtomic == std::vector<bool>{true, false} && full.bindings[0].bufferWritten == std::vector<bool>{true, false}, "binding plan lost buffer access metadata");
+    require(full.bindings[0].bufferAtomic == std::vector<bool>{true, false} && full.bindings[0].bufferWritten == std::vector<bool>{true, false} && full.bindings[0].bufferRead == std::vector<bool>{true, true} && full.bindings[0].bufferCovers == std::vector<std::vector<BufferStoreCover>>{{}, {sampleCover(5u)}}, "binding plan lost buffer access metadata");
     const std::array liveBindings{full.bindings[0].binding, full.bindings[0].binding, full.bindings[3].binding};
     const auto selected = builder.Select(plan, liveBindings);
     snapshot.userData.clear();

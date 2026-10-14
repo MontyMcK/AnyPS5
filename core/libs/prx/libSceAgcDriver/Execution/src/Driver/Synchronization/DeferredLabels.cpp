@@ -154,7 +154,7 @@ bool Driver::recordLabelsForPacket(VulkanDevice* localDevice, std::uint32_t queu
     if (localDevice == nullptr || !packetFlush || !Graphics::Recorder::PendingLabelSince().has_value()) return false;
 
     const auto submitStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    localDevice->SubmitRecorded(queue == 0);
+    localDevice->SubmitRecorded(queue == 0, Graphics::Recorder::SubmitReason::PacketFlush);
     ++packetLockSubmits;
     if (profile) packetLockSubmitUs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - submitStart).count());
     return true;

@@ -3,7 +3,9 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "BdaAbi.hpp"
+#include "BufferStoreCover.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include <array>
 #include <memory>
 #include <optional>
 #include <span>
@@ -159,6 +161,59 @@ MirrorStats MirrorCounters();
 void ClearImageMirrors(VkDevice device);
 void ClearHostImports(VkDevice device);
 
+// The write-back elision by buffer usage (live storage_usage_elide, env APS5_STORAGE_USAGE_ELIDE=1).
+// A compute dispatch's guest buffer region that the shader never reads (no load, no atomic, through
+// any element over it) and that it is proved to overwrite in part (DescriptorBinding::bufferCovers,
+// evaluated for the dispatch's grid) does not take the write-back of the pending storage-image units
+// lying wholly inside the overwritten bytes: those results are dead once the dispatch ran, as on
+// the hardware, where the dispatch's stores land after them. The rest of the region is flushed as
+// before, and the skipped units are dropped right after the dispatch is recorded (DropElided), so no
+// later write-back can land over its stores. Live storage_usage_elide_verify (env
+// APS5_STORAGE_USAGE_ELIDE_VERIFY=1) keeps every write-back and checks the decision instead: the
+// bytes the dispatch reads under the skipped units (none by construction), and, on host-imported
+// regions, that the dispatch did overwrite them (a canary filled into them after the write-back,
+// synchronously checked and repaired after the dispatch). APS5_PROFILE_DRAW prints the [storage]
+// usage elide line every 10 s with the MiB not written back and the GPU time that saves.
+bool StorageUsageElide();
+bool StorageUsageVerify();
+// Tests: forces the two modes (nothing: back to the live flags and the environment).
+void SetStorageUsageModes(std::optional<bool> elide, std::optional<bool> verify);
+// The elision's counters (APS5_PROFILE_DRAW: since the last [storage] usage elide line, which resets them).
+struct StorageUsageCounts {
+    std::uint64_t elidedRegions = 0;
+    std::uint64_t droppedUnits = 0;
+    std::uint64_t droppedBytes = 0;
+    std::uint64_t verifyRegions = 0;
+    std::uint64_t canaryWords = 0;
+    std::uint64_t readBytes = 0;
+    std::uint64_t refused = 0;
+};
+StorageUsageCounts CurrentStorageUsageCounts();
+
+// The compute dispatch whose resources this thread prepares and records, for evaluating the
+// shader's store covers (set by the driver around a direct dispatch with a known grid); null
+// otherwise (draws, indirect dispatches, tests that set none).
+const ShaderRecompiler::DispatchGrid* CurrentDispatchGrid();
+class DispatchGridScope {
+public:
+    explicit DispatchGridScope(const ShaderRecompiler::DispatchGrid& grid);
+    ~DispatchGridScope();
+    DispatchGridScope(const DispatchGridScope&) = delete;
+    DispatchGridScope& operator=(const DispatchGridScope&) = delete;
+
+private:
+    ShaderRecompiler::DispatchGrid grid;
+    const ShaderRecompiler::DispatchGrid* previous;
+};
+
+// What a shader does with one guest buffer element (DescriptorBinding::bufferRead and
+// bufferCovers), with the element's V# words for evaluating the covers.
+struct BufferElementUsage {
+    bool read = true;
+    std::array<std::uint32_t, 4> words{};
+    std::vector<ShaderRecompiler::BufferStoreCover> covers;
+};
+
 struct AddressCopy {
     std::uint64_t begin;
     std::uint64_t end;
@@ -184,8 +239,28 @@ public:
     // (DescriptorBinding::bufferWritten): the CPU never has to wait for it. `atomic` marks an
     // element the shader updates atomically (DescriptorBinding::bufferAtomic), staged in device
     // memory whatever its size (see AllowDeviceStaging).
-    void AddWritable(std::uint64_t address, std::size_t bytes, bool atomic = false);
+    // `usage` (a guest buffer element's, see BufferElementUsage) lets the write-back elision skip
+    // results the element's stores overwrite; without it the element counts as read.
+    void AddWritable(std::uint64_t address, std::size_t bytes, bool atomic = false, const BufferElementUsage* usage = nullptr);
     void AddReadable(std::uint64_t address, std::size_t bytes);
+    // Ranges the recorded work writes through other bindings (storage images it stores to): a
+    // region overlapping one is never elided.
+    void SetOtherWrites(std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges) { otherWrites = std::move(ranges); }
+    // The flush of pending storage results over [begin, end), a region this upload binds in place
+    // (a reused build's proof, before the work is recorded again): as UploadFinish's own flush,
+    // with the write-back elision. Starts a use: elisions of an earlier use are forgotten.
+    void FlushBoundRange(std::uint64_t begin, std::uint64_t end, const char* reason);
+    // Forgets the elisions of an earlier use that never reached DropElided (UploadFinish and a
+    // reused build's proof call it before their flushes).
+    void BeginElisionUse();
+    // Whether this use elided write-backs not yet dropped (DropElided).
+    bool HasElided() const { return !elided.empty(); }
+    // Drops the pending storage-image units the elided flushes of this use skipped, right after the
+    // work was recorded (ShaderResources::MarkGpuWrites, under GuestMemory::GpuMutex): those of
+    // regions bound in place, or (`copied`) of regions the GPU copies out of their import, once
+    // their copy-backs are recorded too. In verify mode, checks the canaries (regions in place).
+    // Nothing to do without elisions.
+    void DropElided(bool copied);
     // Device-local staging of written and atomic elements inside host imports (see
     // GuestBufferMemory.cpp): allowed only for a build whose every use records its work and then
     // calls RecordCopyBacks (a dispatch), since a staged region's results reach guest memory by
@@ -346,7 +421,44 @@ private:
         // The device refused the shadow (memory or allocations exhausted): the region takes the
         // path it would take without staging, in both upload stages.
         bool unstaged = false;
+        // Whether any part of the region may be read by the recorded work (a readable or snapshot
+        // range, an element without usage or one the shader loads from); the write-only elements
+        // over it with store covers (`elements`), each at its V#'s base address.
+        bool read = true;
+        struct CoveredElement {
+            std::uint64_t base;
+            std::array<std::uint32_t, 4> words;
+            std::vector<ShaderRecompiler::BufferStoreCover> covers;
+        };
+        std::vector<CoveredElement> elements {};
     };
+    // Flushes pending storage results over a region the recorded work binds in place or copies on
+    // the GPU (`reason` the flush's), eliding the write-back of what the dispatch overwrites.
+    void flushBoundRegion(const Region& region, const char* reason, bool addressable, bool copied);
+    // The elision's decision for a region (`copied`: the GPU copies it out of its import and back),
+    // or false when the whole region must be flushed.
+    bool elideFlush(const Region& region, const char* reason, bool addressable, bool copied);
+    struct ElidedRange {
+        std::uint64_t begin;
+        std::uint64_t end;
+        // Verify mode: the import's bytes after the write-back, checked after the dispatch.
+        std::vector<std::byte> stored;
+        bool canary = false;
+        // A verify range: its units were stored as without the elision, only checked; the canary
+        // still to go in at the end of UploadFinish (armCanaries).
+        bool verify = false;
+        bool wantsCanary = false;
+        // The import table's epoch when the region's import was confirmed (canaries only).
+        std::uint64_t importsEpoch = 0;
+        // The region is copied out of its import and back by the GPU (dropped after the copy-back).
+        bool copied = false;
+    };
+    // Verify mode: fills the canaries of this use's verify ranges (end of UploadFinish).
+    void armCanaries();
+    // UploadFinish is running (its regions' imports are the ones the work binds).
+    bool uploadFinishing = false;
+    std::vector<ElidedRange> elided;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> otherWrites;
 
     // How [begin, end) lies against the space's base regions.
     enum class BaseOverlap { None, Inside, Partial };

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <cstring>
@@ -413,6 +414,21 @@ namespace {
 // render pass. Continue is the only graphics bind, and every pipeline declares viewport and scissor
 // dynamic, so they persist across pipeline binds; Begin forgets them (a recycled command buffer
 // always opens a pass first). APS5_NO_BIND_FILTER=1 records every bind.
+//
+// With live `bind_elide` the record also tracks, for the same command buffer and pass, the
+// descriptor set bound as set 0 with its pipeline layout, the push constant block with its layout
+// and stages, the vertex buffers, the index buffer, and the depth bias and depth bounds values; a
+// bind equal to the tracked one is skipped. Each is exact Vulkan state persistence: a set and push
+// constants bound with layout L stay valid for later pipelines of layout L (the same handle is
+// compatible with itself), vertex and index buffer bindings are untouched by pipeline binds, and
+// dynamic depth bias and bounds persist while every pipeline bound since declares them dynamic (a
+// pipeline bind without them forgets the tracked value). Begin forgets everything (a new pass, or a
+// recycled command buffer), as does a Continue into another command buffer. Every graphics bind a
+// recorded draw makes inside its pass goes through here (BindSet, PushConstants, BindDrawBuffers);
+// a draw that binds outside these (the synchronous path, after its own Begin) never continues a
+// pass, and its Begin reset the tracking first.
+enum BindKind : std::size_t { BindSetKind, BindPushKind, BindVertexKind, BindIndexKind, BindBiasKind, BindBoundsKind, BindKindCount };
+
 struct BoundGraphicsState {
     std::mutex mutex;
     VkCommandBuffer commands = VK_NULL_HANDLE;
@@ -420,6 +436,30 @@ struct BoundGraphicsState {
     VkViewport viewport{};
     VkRect2D scissor{};
     bool viewportSet = false;
+    // bind_elide's tracking (valid only while `commands` is the buffer recorded into).
+    bool setValid = false;
+    VkPipelineLayout setLayout = VK_NULL_HANDLE;
+    VkDescriptorSet set = VK_NULL_HANDLE;
+    bool pushValid = false;
+    VkPipelineLayout pushLayout = VK_NULL_HANDLE;
+    VkShaderStageFlags pushStages = 0;
+    std::array<std::byte, PipelinePushConstantBytes> push{};
+    bool vertexValid = false;
+    std::vector<VkBuffer> vertexBuffers;
+    std::vector<VkDeviceSize> vertexOffsets;
+    bool indexValid = false;
+    VkBuffer indexBuffer = VK_NULL_HANDLE;
+    VkDeviceSize indexOffset = 0;
+    VkIndexType indexType = VK_INDEX_TYPE_UINT16;
+    bool biasValid = false;
+    std::array<float, 3> bias{};
+    bool boundsValid = false;
+    std::array<float, 2> bounds{};
+    std::array<std::uint64_t, BindKindCount> recorded{};
+    std::array<std::uint64_t, BindKindCount> skipped{};
+    void forgetTracked() {
+        setValid = pushValid = vertexValid = indexValid = biasValid = boundsValid = false;
+    }
 };
 
 BoundGraphicsState& boundGraphicsState() {
@@ -430,6 +470,21 @@ BoundGraphicsState& boundGraphicsState() {
 bool bindFilter() {
     static const bool enabled = std::getenv("APS5_NO_BIND_FILTER") == nullptr;
     return enabled;
+}
+
+bool bindElide() {
+    static const bool requested = std::getenv("APS5_BIND_ELIDE") != nullptr;
+    return bindFilter() && LiveFlag("bind_elide", requested);
+}
+
+// A bind recorded while bind_elide was off went untracked (no lock is taken then): the tracked
+// state is forgotten at the next tracked bind, so a switch turned back on mid-pass never skips a
+// bind against what an untracked one replaced.
+std::atomic<bool> untrackedBind{false};
+
+bool trackBinds(BoundGraphicsState& bound) {
+    if (untrackedBind.exchange(false, std::memory_order_relaxed)) bound.forgetTracked();
+    return true;
 }
 
 bool sameViewport(const VkViewport& a, const VkViewport& b) {
@@ -452,12 +507,14 @@ void Pipeline::Begin(VkCommandBuffer commands, const Framebuffer& framebuffer, V
         auto& bound = boundGraphicsState();
         std::lock_guard lock(bound.mutex);
         bound.commands = VK_NULL_HANDLE;
+        bound.forgetTracked();
     }
     Continue(commands, state);
 }
 
 void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
     bool bindPipeline = true, setViewport = true, setScissor = true;
+    bool setBias = depthBias, setBounds = depthBounds;
     if (bindFilter()) {
         auto& bound = boundGraphicsState();
         std::lock_guard lock(bound.mutex);
@@ -465,24 +522,133 @@ void Pipeline::Continue(VkCommandBuffer commands, const State& state) const {
             bindPipeline = bound.pipeline != pipeline;
             setViewport = !bound.viewportSet || !sameViewport(bound.viewport, state.viewport);
             setScissor = !bound.viewportSet || !sameScissor(bound.scissor, state.scissor);
+        } else {
+            bound.forgetTracked();
         }
         bound.commands = commands;
         bound.pipeline = pipeline;
         bound.viewport = state.viewport;
         bound.scissor = state.scissor;
         bound.viewportSet = true;
+        // A pipeline bound without dynamic depth bias (bounds) applies its static value: the
+        // tracked dynamic value no longer stands.
+        if (bindPipeline && !depthBias) bound.biasValid = false;
+        if (bindPipeline && !depthBounds) bound.boundsValid = false;
+        const bool elide = bindElide();
+        if (depthBias) {
+            const std::array<float, 3> bias{state.depthBiasConstant, state.depthBiasClamp, state.depthBiasSlope};
+            setBias = !(elide && bound.biasValid && std::memcmp(bound.bias.data(), bias.data(), sizeof(bias)) == 0);
+            bound.bias = bias;
+            bound.biasValid = elide;
+            ++(setBias ? bound.recorded : bound.skipped)[BindBiasKind];
+        }
+        if (depthBounds) {
+            const std::array<float, 2> bounds{state.minDepthBounds, state.maxDepthBounds};
+            setBounds = !(elide && bound.boundsValid && std::memcmp(bound.bounds.data(), bounds.data(), sizeof(bounds)) == 0);
+            bound.bounds = bounds;
+            bound.boundsValid = elide;
+            ++(setBounds ? bound.recorded : bound.skipped)[BindBoundsKind];
+        }
     }
     if (bindPipeline) context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
     if (setViewport) context.Resolved(&DeviceFunctions::cmdSetViewport, "vkCmdSetViewport")(commands, 0, 1, &state.viewport);
     if (setScissor) context.Resolved(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &state.scissor);
-    if (depthBias) context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, state.depthBiasConstant, state.depthBiasClamp, state.depthBiasSlope);
-    if (!depthBounds) return;
+    if (setBias) context.Resolved(&DeviceFunctions::cmdSetDepthBias, "vkCmdSetDepthBias")(commands, state.depthBiasConstant, state.depthBiasClamp, state.depthBiasSlope);
+    if (!setBounds) return;
     context.Resolved(&DeviceFunctions::cmdSetDepthBounds, "vkCmdSetDepthBounds")(commands, state.minDepthBounds, state.maxDepthBounds);
 }
 
 void Pipeline::PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const {
     if (stages == 0) return;
+    // Switch off: no tracking (and no lock) at all, as before.
+    if (!bindElide()) {
+        untrackedBind.store(true, std::memory_order_relaxed);
+    } else {
+        auto& bound = boundGraphicsState();
+        std::lock_guard lock(bound.mutex);
+        if (trackBinds(bound) && bound.commands == commands) {
+            const bool elide = true;
+            // A push of other stages updates only theirs: the tracked block then no longer
+            // describes every stage's values, so it is replaced rather than merged.
+            if (elide && bound.pushValid && bound.pushLayout == layout && bound.pushStages == stages && std::memcmp(bound.push.data(), bytes.data(), PipelinePushConstantBytes) == 0) {
+                ++bound.skipped[BindPushKind];
+                return;
+            }
+            std::memcpy(bound.push.data(), bytes.data(), PipelinePushConstantBytes);
+            bound.pushLayout = layout;
+            bound.pushStages = stages;
+            bound.pushValid = elide;
+            ++bound.recorded[BindPushKind];
+        }
+    }
     context.Resolved(&DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, layout, stages, 0, PipelinePushConstantBytes, bytes.data());
+}
+
+void Pipeline::BindSet(VkCommandBuffer commands, VkDescriptorSet set) const {
+    if (!bindElide()) {
+        untrackedBind.store(true, std::memory_order_relaxed);
+    } else {
+        auto& bound = boundGraphicsState();
+        std::lock_guard lock(bound.mutex);
+        if (trackBinds(bound) && bound.commands == commands) {
+            const bool elide = true;
+            if (elide && bound.setValid && bound.setLayout == layout && bound.set == set) {
+                ++bound.skipped[BindSetKind];
+                return;
+            }
+            bound.setLayout = layout;
+            bound.set = set;
+            bound.setValid = elide;
+            ++bound.recorded[BindSetKind];
+        }
+    }
+    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0, nullptr);
+}
+
+void BindDrawBuffers(const Context& context, VkCommandBuffer commands, std::span<const VkBuffer> vertexBuffers, std::span<const VkDeviceSize> vertexOffsets, bool indexed, VkBuffer indexBuffer, VkDeviceSize indexOffset, VkIndexType indexType) {
+    bool bindVertex = !vertexBuffers.empty(), bindIndex = indexed;
+    if (!bindVertex && !bindIndex) {
+    } else if (!bindElide()) {
+        untrackedBind.store(true, std::memory_order_relaxed);
+    } else {
+        auto& bound = boundGraphicsState();
+        std::lock_guard lock(bound.mutex);
+        if (trackBinds(bound) && bound.commands == commands) {
+            const bool elide = true;
+            if (bindVertex) {
+                bindVertex = !(elide && bound.vertexValid && std::equal(vertexBuffers.begin(), vertexBuffers.end(), bound.vertexBuffers.begin(), bound.vertexBuffers.end()) && std::equal(vertexOffsets.begin(), vertexOffsets.end(), bound.vertexOffsets.begin(), bound.vertexOffsets.end()));
+                if (bindVertex) {
+                    bound.vertexBuffers.assign(vertexBuffers.begin(), vertexBuffers.end());
+                    bound.vertexOffsets.assign(vertexOffsets.begin(), vertexOffsets.end());
+                }
+                bound.vertexValid = elide;
+                ++(bindVertex ? bound.recorded : bound.skipped)[BindVertexKind];
+            }
+            if (bindIndex) {
+                bindIndex = !(elide && bound.indexValid && bound.indexBuffer == indexBuffer && bound.indexOffset == indexOffset && bound.indexType == indexType);
+                bound.indexBuffer = indexBuffer;
+                bound.indexOffset = indexOffset;
+                bound.indexType = indexType;
+                bound.indexValid = elide;
+                ++(bindIndex ? bound.recorded : bound.skipped)[BindIndexKind];
+            }
+        }
+    }
+    if (bindVertex) context.Resolved(&DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(vertexBuffers.size()), vertexBuffers.data(), vertexOffsets.data());
+    if (bindIndex) context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, indexBuffer, indexOffset, indexType);
+}
+
+bool BindElision() {
+    return bindElide();
+}
+
+BindCounts TakeBindCounts() {
+    auto& bound = boundGraphicsState();
+    std::lock_guard lock(bound.mutex);
+    BindCounts counts;
+    counts.recorded = std::exchange(bound.recorded, {});
+    counts.skipped = std::exchange(bound.skipped, {});
+    return counts;
 }
 
 namespace {
@@ -894,6 +1060,38 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     insertPipeline(store, context.device, context.bufferPool, hash, key, pipeline);
     if (const auto found = store.index.find(hash); found != store.index.end() && found->second->pipeline == pipeline) remember(found->second);
     return pipeline;
+}
+
+PipelinePeek PeekCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
+    if (disabled) return {};
+    // The key is built outside the store mutex, into this thread's own scratch.
+    thread_local std::vector<std::byte> key;
+    pipelineKeyInto(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    if (key.empty()) return {};
+    const auto hash = hashKey(key);
+    auto& store = Pipelines();
+    std::lock_guard lock(store.mutex);
+    const auto found = store.index.find(hash);
+    if (found == store.index.end() || found->second->key != key || !alive(*found->second, context)) return {};
+    return {found->second->pipeline, hash, &resources, context.device};
+}
+
+std::shared_ptr<Pipeline> TakePeekedPipeline(const Context& context, const PipelinePeek& peek, const ShaderResources& resources) {
+    if (peek.device != context.device || peek.resources != &resources) return nullptr;
+    const auto peeked = peek.pipeline.lock();
+    if (peeked == nullptr) return nullptr;
+    auto& store = Pipelines();
+    std::lock_guard lock(store.mutex);
+    reportPipelines(store);
+    // An entry's pipeline object is made for that entry alone, and the locked peek names that very
+    // object (a weak pointer locks only while the object it watched lives), so an entry holding it
+    // is the one inserted under the peeked key.
+    const auto found = store.index.find(peek.hash);
+    if (found == store.index.end() || found->second->pipeline != peeked || !alive(*found->second, context)) return nullptr;
+    ++store.hits;
+    store.entries.splice(store.entries.end(), store.entries, found->second);
+    return found->second->pipeline;
 }
 
 void ClearCachedPipelines(VkDevice device) {

@@ -56,4 +56,10 @@ void RunBdaContractTests() {
     invalid[0] = invalid[0] == 'A' ? 'B' : 'A';
     reject([&] { static_cast<void>(serializer.Deserialize(invalid)); }, "request signature");
     reject([&] { static_cast<void>(serializer.Deserialize("NVNQQWMAAAA=")); }, "serialization version");
+    // The table order the lookups and the anchors rely on (BdaAbi::RangesOrdered).
+    const auto ordered = [](std::initializer_list<BdaAbi::Range> ranges) { return BdaAbi::RangesOrdered(ranges.begin(), ranges.size()); };
+    AgcDriver::Graphics::Require(ordered({}) && ordered({{0x1000, 0x2000, 1, 1, 0}, {0x2000, 0x2000, 1, 1, 0}, {0x2000, 0x3000, 1, 1, 0}, {0x4000, 0x5000, 1, 1, 0}}), "ascending disjoint BDA ranges were refused");
+    AgcDriver::Graphics::Require(!ordered({{0x1000, 0x3000, 1, 1, 0}, {0x2000, 0x2100, 1, 1, 0}}), "overlapping BDA ranges were accepted");
+    AgcDriver::Graphics::Require(!ordered({{0x4000, 0x5000, 1, 1, 0}, {0x1000, 0x2000, 1, 1, 0}}), "unsorted BDA ranges were accepted");
+    AgcDriver::Graphics::Require(!ordered({{0x2000, 0x1000, 1, 1, 0}}), "a BDA range ending before its begin was accepted");
 }

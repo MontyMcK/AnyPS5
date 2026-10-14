@@ -8,6 +8,7 @@
 #include "Recompiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <list>
 #include <map>
@@ -117,6 +118,8 @@ public:
     ShaderResources& operator=(const ShaderResources&) = delete;
     VkDescriptorSetLayout Layout() const;
     void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
+    // The set Bind binds (none: VK_NULL_HANDLE, Bind records nothing).
+    VkDescriptorSet Set() const { return _set; }
     struct DrawBindings {
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;
@@ -163,6 +166,9 @@ public:
     // Whether a written buffer was copied (its results reach guest memory by the CPU write-back).
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
+    // The stamp of the ResourceCache entry that holds this object (0: none), set and cleared by the
+    // cache under its mutex; ResourceCache::TouchStamped checks it (live `spec_entry_stamp`).
+    std::atomic<std::uint64_t> cacheStamp{0};
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
     std::optional<std::pair<VkBuffer, VkDeviceSize>> CopiedSource(std::uint64_t address, std::size_t bytes) const { return guestMemory.CopiedSource(address, bytes); }
     bool InPlaceRange(std::uint64_t address, std::size_t bytes) const { return guestMemory.InPlaceRange(address, bytes); }
@@ -248,6 +254,13 @@ public:
     };
     static ReuseStats ReuseCounters();
     static bool AddressTemplates();
+    // Live `draw_set_writes` (env APS5_DRAW_SET_WRITES): see setWrites.
+    static bool DrawSetWrites();
+    // Live `moved_publish_check` (env APS5_MOVED_PUBLISH_CHECK): MovedStillFree's token fallback
+    // when only the recorder's pending-write snapshot moved since the proof tests just the pending
+    // writes of the moved ranges again (see MovedStillFree). The count taken so far (resets).
+    static bool MovedPublishCheck();
+    static std::uint64_t TakeMovedPublishChecks();
     enum class AddressMiss : std::size_t { None, Replaced, Imports, Proof, Moved, Outside, MovedOutside, Count };
     static std::shared_ptr<ShaderResources> AddressUse(const std::shared_ptr<ShaderResources>& source, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, AddressMiss& miss);
     static std::shared_ptr<ShaderResources> DetachAddressUse(const std::shared_ptr<ShaderResources>& source);
@@ -335,6 +348,11 @@ public:
         // GuestMemory::StampSerial before the proof's unchanged checks.
         std::uint64_t stamps = 0;
         bool scanned = false;
+        // Whether own-source view overlaps were accepted (SpeculateOwnPending when the proof was
+        // speculated); the committer's rescan judges by the same rule.
+        bool ownPending = false;
+        // Whether the prep thread's scan accepted such an overlap.
+        bool ownAccepted = false;
         std::vector<Surface> surfaces;
         std::vector<StorageTexture::PendingQuery> pending;
         std::vector<bool> skip;
@@ -372,6 +390,22 @@ public:
         DccKeys entryKeys = DccKeys::Uncompressed;
         std::uint64_t entryGeneration = 0;
     };
+    // How a pending-registry scan of a speculated proof (`scan`, one query per surface, in the
+    // order of `surfaces`) bears on the proof: Clear when no other image has results pending over
+    // any surface, or when every such surface is a sampled view whose own storage image is the one
+    // FindPending names for its range and `acceptOwnSource` holds (the committer's fast proof
+    // accepts exactly that overlap: the lookup views that image, see fastRevalidate). Otherwise the
+    // first other refusing surface's kind (ForeignView: another image is what FindPending names;
+    // Storage; Snapshot), or OwnSource when such views are the only overlaps and `acceptOwnSource`
+    // is off.
+    enum class PendingVerdict : std::uint8_t { Clear, OwnSource, ForeignView, Storage, Snapshot, Count };
+    static PendingVerdict SpeculatedPendingVerdict(std::span<const ProofSpeculation::Surface> surfaces, std::span<const StorageTexture::PendingQuery> scan, bool acceptOwnSource);
+    // Live `spec_own_pending` (env APS5_SPEC_OWN_PENDING): speculated proofs accept the overlaps
+    // SpeculatedPendingVerdict calls own-source views (requires the fast proof's own-source rule,
+    // APS5_NO_OWN_IMAGE_REFRESH unset).
+    static bool SpeculateOwnPending();
+    // The prep threads' pending refusals by PendingVerdict since the last call (the [spec] line).
+    static std::array<std::uint64_t, static_cast<std::size_t>(PendingVerdict::Count)> TakePendingVerdicts();
     SpeculationMiss SpeculateProof(ProofSpeculation& speculation) const;
     SpeculationMiss ProveSpeculated(const ProofSpeculation& speculation);
     bool MovedStillFree(std::span<const MovedBuffer> moved, Recorder* recorder, const MovedProof* proof = nullptr) const;
@@ -446,8 +480,11 @@ private:
     double phase(BuildPhase which);
     // `written` is the element's DescriptorBinding::bufferWritten: a read-only element binds the
     // same way but is left out of the write set (no write-back, no pending-write note). `atomic`
-    // is its bufferAtomic (see GuestBufferMemory::AddWritable).
-    std::size_t addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic);
+    // is its bufferAtomic (see GuestBufferMemory::AddWritable). `read` and `covers` are its
+    // bufferRead and bufferCovers (null: none), for the write-back elision of a written element.
+    std::size_t addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read = true, const std::vector<ShaderRecompiler::BufferStoreCover>* covers = nullptr);
+    // Guest ranges of the storage images this build stores to (GuestBufferMemory::SetOtherWrites).
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writtenImageRanges() const;
     std::size_t addDataBuffer(std::span<const std::uint32_t> words);
     // Stage A: the layout entry of an image binding (samplers are taken at once, the sampler cache
     // locks itself); stage B looks the sampled textures and storage images up (resolveImageBinding).
@@ -514,6 +551,13 @@ private:
     std::vector<std::size_t> addressTextureSlots;
     std::vector<std::pair<std::size_t, VkDescriptorImageInfo>> movedImageViews;
     bool rebindSpeculatedImages(std::span<const SpeculatedImage> images);
+    // The descriptor writes buildComplete made into `_set` (a set without an address table: never
+    // rewritten afterwards), with their info arrays, for PrepareDrawBindings (live `draw_set_writes`,
+    // after upstream boykopovar/AnyPS5 #1334 by TibixDev): a per-draw set is written whole from these,
+    // the snapshot elements swapped in, instead of copied from `_set` and then patched.
+    std::vector<AddressWrite> setWrites;
+    std::vector<VkDescriptorBufferInfo> setBuffers;
+    std::vector<VkDescriptorImageInfo> setImages;
     std::vector<std::shared_ptr<Buffer>> addressData;
     void reportDescriptorCaches() const;
     // What a sampled texture was proved current against when the build (or the last full Revalidate)
@@ -694,16 +738,51 @@ private:
 // teardown before its descriptor caches go.
 class ResourceCache {
 public:
+    ResourceCache() = default;
+    // Clears the stamps of the entries' objects (a Handle into a destroyed cache proves nothing).
+    ~ResourceCache();
+    ResourceCache(const ResourceCache&) = delete;
+    ResourceCache& operator=(const ResourceCache&) = delete;
     using Key = std::vector<std::uint32_t>;
+    // The index's hash of a key (FNV-1a over its words). Find and Peek compute it before taking
+    // the cache mutex; a caller that already has it (a draw speculation hashes its key on the prep
+    // thread, live `spec_key_hash`) passes it, which must be HashKey(key).
+    static std::size_t HashKey(const Key& key) noexcept;
     std::shared_ptr<ShaderResources> Find(const Key& key);
+    std::shared_ptr<ShaderResources> Find(const Key& key, std::size_t hash);
     std::shared_ptr<ShaderResources> Peek(const Key& key) const;
+    std::shared_ptr<ShaderResources> Peek(const Key& key, std::size_t hash) const;
     // `evicted`, when given, receives the objects the insert displaces (the entry replaced under the
     // key, the ones over the bound) instead of their being destroyed here: a caller under the GPU
     // mutex hands them to the recorder so the destruction runs off the lock (VulkanDevice::dispatch).
     void Insert(const Key& key, std::shared_ptr<ShaderResources> resources, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
     // With `object`, erases the entry only while it still holds that object (a replacement made
-    // meanwhile by another worker stays).
-    void Remove(const Key& key, const ShaderResources* object = nullptr);
+    // meanwhile by another worker stays). `removed`, when given, receives the erased entry's object
+    // instead of its being released here (see Insert's `evicted`).
+    void Remove(const Key& key, const ShaderResources* object = nullptr, std::shared_ptr<ShaderResources>* removed = nullptr);
+    // An entry: the key, the object and the stamp of its insert (members named as the pair the
+    // list held before).
+    struct Entry {
+        Entry(const Key& key, std::shared_ptr<ShaderResources> resources, std::uint64_t stamp) : first(key), second(std::move(resources)), stamp(stamp) {}
+        Key first;
+        std::shared_ptr<ShaderResources> second;
+        std::uint64_t stamp;
+    };
+    using Entries = std::list<Entry>;
+    // One entry as Peek found it (live `spec_entry_stamp`): the list position and the stamp the
+    // entry got at its insert (unique per insert, process-wide). While the entry's object still
+    // carries that stamp the entry is in the cache, unmoved in content, and the position is valid.
+    struct Handle {
+        const ResourceCache* cache = nullptr;
+        Entries::iterator entry{};
+        std::uint64_t stamp = 0;
+    };
+    std::shared_ptr<ShaderResources> Peek(const Key& key, std::size_t hash, Handle& handle) const;
+    // Find's answer for the entry `handle` names, without hashing or comparing the key: true, with
+    // the entry moved to the front of the LRU as Find would, while `object` (the entry's object at
+    // the peek) still carries the handle's stamp; false (nothing changed) otherwise, and the caller
+    // looks the key up as before. O(1) under the mutex.
+    bool TouchStamped(const Handle& handle, const ShaderResources& object);
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);
@@ -716,16 +795,31 @@ public:
 private:
     void erase(const Key& key);
     void noteMiss(const Key& key);
-    struct KeyHash {
-        std::size_t operator()(const Key& key) const noexcept {
-            std::uint64_t hash = 14695981039346656037ull;
-            for (const auto word : key) hash = (hash ^ word) * 1099511628211ull;
-            return static_cast<std::size_t>(hash);
-        }
+    // A key with its hash already computed: the index looks it up without hashing again
+    // (heterogeneous lookup; equality still compares every word).
+    struct HashedKey {
+        const Key* key;
+        std::size_t hash;
     };
+    struct KeyHash {
+        using is_transparent = void;
+        std::size_t operator()(const Key& key) const noexcept { return HashKey(key); }
+        std::size_t operator()(const HashedKey& key) const noexcept { return key.hash; }
+    };
+    struct KeyEqual {
+        using is_transparent = void;
+        bool operator()(const Key& left, const Key& right) const noexcept { return left == right; }
+        bool operator()(const HashedKey& left, const Key& right) const noexcept { return *left.key == right; }
+        bool operator()(const Key& left, const HashedKey& right) const noexcept { return left == *right.key; }
+    };
+    // Stamps the object of a new entry (under `mutex`), and clears the stamp of an entry leaving
+    // the cache while the object still carries it (an object inserted again elsewhere carries the
+    // later stamp, which stays).
+    static std::uint64_t stampEntry(ShaderResources& object);
+    static void unstampEntry(const Entry& entry);
     mutable std::mutex mutex;
-    std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
-    std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
+    Entries entries;
+    std::unordered_map<Key, decltype(entries)::iterator, KeyHash, KeyEqual> index;
 };
 
 // The process-wide cache the device and the draw path share (keys name the device; a device clears

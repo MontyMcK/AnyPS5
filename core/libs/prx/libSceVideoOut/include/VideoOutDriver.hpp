@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceVideoOut/include/DisplayWindow.hpp"
 #include "prx/libSceVideoOut/include/BufferReuseTracker.hpp"
+#include "prx/libSceVideoOut/include/HostHdrProbe.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 
 #include "SDL.h"
@@ -80,6 +81,11 @@ static constexpr int VIDEO_OUT_BUFFER_INDEX_BLANK = -1;
 
 static constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_DEFAULT = 0x0000000000000001ULL;
 static constexpr uint64_t VIDEO_OUT_OUTPUT_MODE_119_88HZ = 0x000000000000000FULL;
+
+// sceVideoOutGetOutputStatus: dynamicRange 1 SDR, 2 HDR; flags bit 0 set while the output is HDR.
+static constexpr uint32_t VIDEO_OUT_DYNAMIC_RANGE_SDR = 1;
+static constexpr uint32_t VIDEO_OUT_DYNAMIC_RANGE_HDR = 2;
+static constexpr uint64_t VIDEO_OUT_OUTPUT_STATUS_FLAG_HDR = 1;
 
 static constexpr uint64_t VIDEO_OUT_REFRESH_RATE_59_94HZ = 3;
 static constexpr uint64_t VIDEO_OUT_REFRESH_RATE_119_88HZ = 13;
@@ -208,6 +214,9 @@ private:
     void vblankEnd();
     void processFlip(FlipRequest& req);
     void triggerEvents(VideoOutConfig& cfg, int eventKind, void* triggerData);
+    // The host's HDR output changed (AgcDriverHostHdr_nid_postfix): every open port's output mode
+    // event fires, so the title reads sceVideoOutGetOutputStatus again.
+    void outputModeChanged();
 
     std::mutex mutex;
     std::mutex shutdownMutex;
@@ -217,6 +226,11 @@ private:
     std::shared_ptr<FlipQueue> flipQueue = std::make_shared<FlipQueue>();
 
     DisplayWindow window;
+    // Presenter thread only: polled each loop and right after the window is made, so the first flip
+    // already sees the monitor's HDR mode.
+    HostHdrProbe hdrProbe;
+    // The host HDR generation the open ports were last told about (read before the presenter starts).
+    std::uint64_t hdrGeneration = 0;
 
     std::jthread presentThread;
     std::jthread vblankThread;

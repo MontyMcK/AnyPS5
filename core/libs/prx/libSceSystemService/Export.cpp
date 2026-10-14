@@ -6,6 +6,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceSystemService/SystemService.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostHdrStatus.hpp"
 
 extern "C" {
 
@@ -35,6 +36,13 @@ int APS5_VABI sceSystemServiceGetDisplaySafeAreaInfo(SystemServiceDisplaySafeAre
 int APS5_VABI sceSystemServiceGetHdrToneMapLuminance(SystemServiceHdrToneMapLuminance* luminance) {
  if (luminance == nullptr) {
   return SYSTEM_SERVICE_ERROR_PARAMETER;
+ }
+ const auto hdr = AgcDriverHostHdr_nid_postfix();
+ if (hdr.available) {
+  luminance->max_full_frame_tone_map_luminance = hdr.display.maxFullFrameLuminance;
+  luminance->max_tone_map_luminance = hdr.display.maxLuminance;
+  luminance->min_tone_map_luminance = hdr.display.minLuminance;
+  return SYSTEM_SERVICE_OK;
  }
  constexpr float SdrReferenceWhiteNits = 100.0f;
  luminance->max_full_frame_tone_map_luminance = SdrReferenceWhiteNits;

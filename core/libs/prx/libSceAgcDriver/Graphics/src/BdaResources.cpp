@@ -408,6 +408,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         }
     }
     const auto& tableRanges = joining ? joined : ranges;
+    Require(ShaderRecompiler::BdaAbi::RangesOrdered(tableRanges.data(), tableRanges.size()), "BDA table ranges are not ascending and disjoint");
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
     const auto window = BdaBucketShape(tableRanges, BdaBucketLimit(), dense);

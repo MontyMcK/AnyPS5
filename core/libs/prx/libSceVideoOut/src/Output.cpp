@@ -14,6 +14,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
 #include "prx/libkernel/Automation/include/Automation.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostHdrStatus.hpp"
 
 static int validateOutputConfig(int handle, uint64_t mode, const VideoOutOutputOptions* options, void* reservedPtr, uint64_t reserved) {
     if (!VideoOutDriver::Get().IsOpen(handle)) {
@@ -151,9 +152,12 @@ int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* statu
     // APS5_VIDEO_OUT_1080P=1 (experiment): report a 1080p output whatever the buffers are.
     static const bool force1080 = std::getenv("APS5_VIDEO_OUT_1080P") != nullptr;
     status->resolution = !force1080 && (cfg->width >= 3840 || cfg->height >= 2160) ? 2u : 1u;
-    status->dynamicRange = 1;
+    // The output is HDR while the host can show HDR10 (the monitor in HDR mode, an HDR10 swapchain on
+    // the window's surface), as a console's output follows its HDR display.
+    const bool hdr = AgcDriverHostHdr_nid_postfix().available;
+    status->dynamicRange = hdr ? VIDEO_OUT_DYNAMIC_RANGE_HDR : VIDEO_OUT_DYNAMIC_RANGE_SDR;
     status->refreshRate = (cfg->outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? VIDEO_OUT_REFRESH_RATE_119_88HZ : VIDEO_OUT_REFRESH_RATE_59_94HZ;
-    status->flags = 0;
+    status->flags = hdr ? VIDEO_OUT_OUTPUT_STATUS_FLAG_HDR : 0;
     status->reserved[0] = 0;
     status->reserved[1] = 0;
     status->reserved[2] = 0;
@@ -202,7 +206,13 @@ int APS5_VABI sceVideoOutIsOutputSupported(int handle, uint64_t mode, const Vide
     if (result != 0) {
         return result;
     }
-    return mode == VIDEO_OUT_OUTPUT_MODE_DEFAULT ? 1 : 0;
+    // APS5_VIDEO_OUT_120HZ=1 (experiment): report a 119.88 Hz capable display too, so titles offer
+    // their 120 Hz modes (which may render at a lower internal resolution).
+    static const bool allow120 = std::getenv("APS5_VIDEO_OUT_120HZ") != nullptr;
+    const int supported = mode == VIDEO_OUT_OUTPUT_MODE_DEFAULT || (allow120 && mode == VIDEO_OUT_OUTPUT_MODE_119_88HZ) ? 1 : 0;
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 16) std::fprintf(stderr, "[videoout] IsOutputSupported mode 0x%llx -> %d\n", static_cast<unsigned long long>(mode), supported);
+    return supported;
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }

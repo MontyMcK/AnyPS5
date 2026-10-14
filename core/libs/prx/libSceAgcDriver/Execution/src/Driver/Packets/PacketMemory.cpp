@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/CpuTimeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include <cstdio>
 #include <algorithm>
@@ -9,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/ReplayProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -17,6 +19,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include <array>
+#include <optional>
+#include <string_view>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -31,6 +37,7 @@ void NoteEopDelay(std::uint32_t queue, std::chrono::steady_clock::time_point sta
     static auto last = std::chrono::steady_clock::now();
     const auto now = std::chrono::steady_clock::now();
     const auto ms = std::chrono::duration<double, std::milli>(now - start).count();
+    if (AgcDriver::Graphics::CpuTimeline::Active()) AgcDriver::Graphics::CpuTimeline::Event("eop", start, now, queue, static_cast<std::uint64_t>(ms * 1000));
     static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (traceGpu) AgcDriver::ProfilePrint_nid_no_patch("[gpu] %.1f eop queue=0x%x after %.2f ms\n", AgcDriver::DriverDetail::TraceMs(), queue, ms);
     std::lock_guard lock(mutex);
@@ -50,6 +57,74 @@ void NoteEopDelay(std::uint32_t queue, std::chrono::steady_clock::time_point sta
 }
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// Live `dma_known` (env APS5_DMA_KNOWN=1): a DMA_DATA memory-to-memory copy of up to 64 KiB whose
+// source has pending GPU writes takes its bytes from the recorded label stores over them
+// (Recorder::KnownSourceBytes) instead of reading the source through the flush hook, which submits
+// and waits for the producing batch (the [hooksync] 'DMA_DATA' entries). Exact as `label_known`:
+// the table's value is what the recorded store leaves, and nothing recorded after it writes the
+// dword. Live `dma_known_verify` reads the source the usual way as well and counts mismatches
+// ([dma-known] line), keeping the waited bytes.
+struct DmaKnownCounters {
+    std::atomic<std::uint64_t> candidates{0}, served{0}, unknown{0}, queued{0}, deferred{0}, results{0}, verified{0}, mismatched{0};
+};
+
+DmaKnownCounters& DmaKnown() {
+    static DmaKnownCounters counters;
+    return counters;
+}
+
+bool DmaKnownEnabled() {
+    static const bool configured = [] {
+        const char* text = std::getenv("APS5_DMA_KNOWN");
+        return text != nullptr && std::string_view(text) != "0";
+    }();
+    return Graphics::LiveFlag("dma_known", configured);
+}
+
+void ReportDmaKnown() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    static std::atomic<std::int64_t> last{0};
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto previous = last.load(std::memory_order_relaxed);
+    if (now - previous < 10'000'000'000ll || !last.compare_exchange_strong(previous, now)) return;
+    auto& c = DmaKnown();
+    AgcDriver::ProfilePrint_nid_no_patch("[dma-known] DMA_DATA sources over pending GPU writes (cumulative): %llu, served from recorded label stores %llu; refused: dword without a known value %llu, this queue's labels not recorded yet %llu/%llu, unit-shadow or storage-image results %llu; verify: %llu checked, %llu mismatched\n", static_cast<unsigned long long>(c.candidates.load()), static_cast<unsigned long long>(c.served.load()), static_cast<unsigned long long>(c.unknown.load()), static_cast<unsigned long long>(c.queued.load()), static_cast<unsigned long long>(c.deferred.load()), static_cast<unsigned long long>(c.results.load()), static_cast<unsigned long long>(c.verified.load()), static_cast<unsigned long long>(c.mismatched.load()));
+}
+
+}
+
+std::optional<Pm4::StoreWrite> Driver::knownDmaSource(std::span<const std::uint32_t> packet, std::uint32_t opcode) {
+    constexpr std::size_t gpuStoreLimit = 65536;
+    // The replay probe records the reads a packet makes (GuestMemory::Read): it keeps the usual path.
+    if (opcode != 0x50 || !DmaKnownEnabled() || ReplayProbe::Enabled()) return std::nullopt;
+    const auto copy = Pm4::DecodeMemoryCopy(packet);
+    if (!copy.has_value() || copy->bytes > gpuStoreLimit || copy->destination % 4 != 0 || copy->bytes % 4 != 0 || copy->source % 4 != 0) return std::nullopt;
+    if (!Graphics::Recorder::SnapshotWriteOverlaps(copy->source, copy->bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(copy->source), copy->bytes)) return std::nullopt;
+    auto& counters = DmaKnown();
+    counters.candidates.fetch_add(1, std::memory_order_relaxed);
+    ReportDmaKnown();
+    // This worker's labels decoded but not recorded yet precede the copy in queue order.
+    if (!deferredLabels().labels.empty()) {
+        counters.deferred.fetch_add(1, std::memory_order_relaxed);
+        return std::nullopt;
+    }
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{copy->source, copy->source + copy->bytes}}};
+    if (Graphics::AnyShadowedOverlaps(range) || Graphics::StorageTexture::AnyPendingOverlaps(range)) {
+        counters.results.fetch_add(1, std::memory_order_relaxed);
+        return std::nullopt;
+    }
+    std::vector<std::byte> bytes(copy->bytes);
+    const auto outcome = Graphics::Recorder::KnownSourceBytes(copy->source, bytes);
+    if (outcome == Graphics::Recorder::KnownSource::Queued) counters.queued.fetch_add(1, std::memory_order_relaxed);
+    if (outcome == Graphics::Recorder::KnownSource::Unknown) counters.unknown.fetch_add(1, std::memory_order_relaxed);
+    if (outcome != Graphics::Recorder::KnownSource::Served) return std::nullopt;
+    counters.served.fetch_add(1, std::memory_order_relaxed);
+    return Pm4::StoreWrite{copy->destination, {}, std::move(bytes)};
+}
 
 bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
@@ -92,7 +167,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             if (reason == 0 || reason == 5 || reason == 6) {
                 const auto queueId = submission.queue;
                 interruptDeferred = localDevice->AfterRecordedWork([queueId, start = std::chrono::steady_clock::now()] { NoteEopDelay(queueId, start); AgcDriverDeliverEopInterrupt(queueId); }, submission.queue == 0);
-                if (interruptDeferred && workOpen) localDevice->SubmitRecorded(submission.queue == 0);
+                if (interruptDeferred && workOpen) localDevice->SubmitRecorded(submission.queue == 0, Graphics::Recorder::SubmitReason::Eop);
                 wroteOnGpu = true;
             } else if (reason == 1) {
                 wroteOnGpu = true;
@@ -167,7 +242,21 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (!drainAll && !cpuStores && !copiedGds && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
-        if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {
+        auto resolved = knownDmaSource(packet, opcode);
+        if (!resolved.has_value()) {
+            resolved = Pm4::ResolveStore(packet, queue, gpuStoreLimit);
+        } else if (Graphics::LiveFlag("dma_known_verify", false)) {
+            // The usual read (it waits for the producer); its bytes are kept either way.
+            auto waited = Pm4::ResolveStore(packet, queue, gpuStoreLimit);
+            DmaKnown().verified.fetch_add(1, std::memory_order_relaxed);
+            if (!waited.has_value() || waited->Bytes().size() != resolved->Bytes().size() || std::memcmp(waited->Bytes().data(), resolved->Bytes().data(), waited->Bytes().size()) != 0) {
+                DmaKnown().mismatched.fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<int> told{0};
+                if (told.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[dma-known] verify mismatch: queue 0x%x DMA_DATA to 0x%llx, %zu bytes\n", submission.queue, static_cast<unsigned long long>(resolved->address), resolved->Bytes().size());
+            }
+            resolved = std::move(waited);
+        }
+        if (const auto& store = resolved) {
             const auto bytes = store->Bytes();
             if (bytes.empty()) {
 
@@ -425,7 +514,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
         bool deferred = false;
         if (localDevice != nullptr && (reason == 0 || reason == 5 || reason == 6)) {
             deferred = localDevice->AfterRecordedWork([queue, start = std::chrono::steady_clock::now()] { NoteEopDelay(queue, start); AgcDriverDeliverEopInterrupt(queue); }, queue == 0);
-            if (deferred && workOpen) localDevice->SubmitRecorded(queue == 0);
+            if (deferred && workOpen) localDevice->SubmitRecorded(queue == 0, Graphics::Recorder::SubmitReason::Eop);
         }
         if (!deferred) AgcDriverDeliverEopInterrupt(queue);
     }
@@ -445,7 +534,7 @@ void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
     if (Graphics::CommitTrimEnabled() && !pending.has_value() && (batchCap() == 0 || Graphics::Recorder::RecordedWorkSinceSubmit() < batchCap())) return;
     const bool due = pending.has_value() && std::chrono::steady_clock::now() - *pending >= labelFlushDeadline();
     const bool capped = batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap();
-    if (due || capped) localDevice->SubmitRecorded(true);
+    if (due || capped) localDevice->SubmitRecorded(true, due ? Graphics::Recorder::SubmitReason::LabelDeadline : Graphics::Recorder::SubmitReason::BatchCap);
 }
 
 }

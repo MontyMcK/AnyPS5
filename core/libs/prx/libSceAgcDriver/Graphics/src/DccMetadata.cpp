@@ -278,6 +278,18 @@ void StoreUncompressedOnCpu(std::uint64_t begin, std::size_t count) {
 
 }
 
+void NoteKeysFillOnGpuAt(std::uint64_t begin, std::size_t count, DccKeys keys, std::uint64_t note) {
+    ForkTrap("dcc key fill memo");
+    ForkQuiesce("dcc key fill memo");
+    static const bool disabled = std::getenv("APS5_NO_KEYS_FILL_MEMO") != nullptr;
+    if (disabled || count == 0 || note == 0) return;
+    auto& memo = Memo();
+    std::lock_guard lock(memo.mutex);
+    const auto end = begin + count;
+    std::erase_if(memo.entries, [&](const GpuKeyStore& store) { return begin < store.end && store.begin < end; });
+    if (MemoRecorder(memo) != nullptr) memo.entries.push_back({begin, end, keys, note});
+}
+
 void NoteKeysFillOnGpu(std::uint64_t begin, std::size_t count, DccKeys keys) {
     ForkTrap("dcc key fill memo");
     ForkQuiesce("dcc key fill memo");
@@ -346,6 +358,19 @@ std::optional<DccKeys> PendingStoreKeys(Recorder& recorder, std::uint64_t begin,
     }
     t_memoMiss = MemoMiss::Answered;
     return keys;
+}
+
+// Live `dcc_settled_fills` (env APS5_DCC_SETTLED_FILLS): whether every recorded write still over the
+// key range is a GPU fill (a key store or a buffer fill: vkCmdFillBuffer into the import, no copy-back
+// or completion store) of a batch that has finished, the open batch holding none of them. The keys
+// in memory are then final, so a key read needs no wait (the memo dropped its entry once the
+// store's batch signaled, while the batch stays in flight until it is reaped).
+bool SettledFillsOnly(Recorder& recorder, std::uint64_t metaAddress, std::size_t count) {
+    static const bool requested = std::getenv("APS5_DCC_SETTLED_FILLS") != nullptr;
+    if (!LiveFlag("dcc_settled_fills", requested)) return false;
+    if (!recorder.PendingWriteSettled(metaAddress, count) || AnyShadowedOverlaps(metaAddress, count) || recorder.PendingLabelIn(metaAddress, count)) return false;
+    const auto writes = recorder.PendingWritesOver(metaAddress, count);
+    return !writes.empty() && std::all_of(writes.begin(), writes.end(), [](const Recorder::PendingWrite& write) { return write.value >= 0; });
 }
 
 // APS5_TRACE_DCC_SYNC=1: the first 60 key reads that wait, with the pending writes over their range
@@ -596,6 +621,10 @@ DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count) {
     if (metaAddress != 0 && count != 0 && GuestMemory::GpuMutex().HeldByThisThread()) {
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count)) {
             if (const auto keys = PendingStoreKeys(*recorder, metaAddress, count)) return *keys;
+            if (SettledFillsOnly(*recorder, metaAddress, count)) {
+                bool memoized = false;
+                return readDccKeys(metaAddress, count, memoized);
+            }
             Recorder::CountSync(2);
             TraceKeySync(*recorder, 0, metaAddress, count);
             const auto started = std::chrono::steady_clock::now();
@@ -825,6 +854,7 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || !recorder->PendingWriteOverlaps(metaAddress, count) || PendingStoreKeys(*recorder, metaAddress, count).has_value()) return std::nullopt;
     if (PendingFillsLeaveUncompressed(*recorder, resource, count)) return DccKeys::Uncompressed;
+    if (SettledFillsOnly(*recorder, metaAddress, count)) return std::nullopt;
     Recorder::CountSync(2);
     TraceKeySync(*recorder, 1, metaAddress, count);
     const auto started = std::chrono::steady_clock::now();

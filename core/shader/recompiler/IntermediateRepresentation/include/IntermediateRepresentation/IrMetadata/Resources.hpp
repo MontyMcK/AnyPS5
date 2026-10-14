@@ -5,6 +5,8 @@
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
 #include "IntermediateRepresentation/IrOpcode.hpp"
 #include "RdnaDecoder/RdnaInstruction.hpp"
+#include "BufferStoreCover.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <vector>
@@ -26,6 +28,10 @@ struct BufferResource {
     std::uint32_t formattedReadMask = 0;
     bool scalar = false;
     std::uint8_t typedAlignment = 1;
+    // Raw stores through this resource that every invocation of a compute dispatch makes (at most
+    // MaxStoreCovers, see BufferStoreCover); empty when none is proved.
+    static constexpr std::size_t MaxStoreCovers = 4;
+    std::vector<BufferStoreCover> covers;
 
     bool operator==(const BufferResource& other) const = default;
 };

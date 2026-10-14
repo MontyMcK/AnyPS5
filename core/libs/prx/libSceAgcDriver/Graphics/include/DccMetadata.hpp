@@ -88,6 +88,10 @@ DccKeyProofCounts KeyProofCounts();
 // A surface's texels as a read sees them: the guest bytes, or the clear value of fast-cleared keys.
 void ReadTextureSurface(const GuestTextureResource& resource, DccKeys keys, std::span<std::byte> bytes);
 void NoteKeysFillOnGpu(std::uint64_t begin, std::size_t count, DccKeys keys);
+// NoteKeysFillOnGpu for a writer whose note covers more than [begin, begin + count) (a dispatch's
+// whole written buffer): `note` is that writer's write note, the newest over the range (the caller
+// checked), which PendingStoreKeys then requires to still be the newest.
+void NoteKeysFillOnGpuAt(std::uint64_t begin, std::size_t count, DccKeys keys, std::uint64_t note);
 std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, std::uint64_t guestBytes);
 
 }

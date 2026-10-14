@@ -2,6 +2,7 @@
 #define AGCDRIVER_GRAPHICS_DEFERREDVULKAN_HPP
 
 #include <vulkan/vulkan.h>
+#include <cstdint>
 
 namespace AgcDriver::Graphics {
 
@@ -16,6 +17,12 @@ namespace AgcDriver::Graphics {
 PFN_vkVoidFunction DeferredVulkanEntry(const char* name, PFN_vkVoidFunction real);
 // Waits until the recorder thread made every call streamed so far (no-op when disabled).
 void DrainDeferredVulkan();
+// The stream position of the newest streamed call (0 when disabled). Read by the thread that just
+// streamed a call (producers hold the GPU mutex, one at a time), it is that call's ticket:
+// DeferredVulkanExecuted(ticket) then says the recorder thread made the call and returned from it
+// (Recorder::FenceNoDrain: a batch's vkQueueSubmit no longer touches its fence or command buffer).
+std::uint64_t DeferredVulkanTicket();
+bool DeferredVulkanExecuted(std::uint64_t ticket);
 bool DeferredVulkanEnabled();
 
 }

@@ -83,6 +83,22 @@ struct DrawEntryCounters {
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
+// Keys the draw cache has seen once (upstream #5216): a key gets its entry at its second sight, so
+// draws whose user data changes every frame stop paying for variant copies and an insert that
+// evicts a live entry. Four-way buckets, a full bucket replaces its oldest key.
+class DrawKeySightings {
+public:
+    static constexpr std::size_t Ways = 4;
+    explicit DrawKeySightings(std::size_t keys);
+    bool SeenBefore(std::uint64_t key);
+
+private:
+    std::vector<std::uint64_t> keys;
+    std::vector<std::uint8_t> filled;
+    std::vector<std::uint8_t> next;
+    std::size_t bucketMask = 0;
+};
+
 enum class DrawVerdict { Drawn, Nothing, Rejected };
 
 struct StageCapture {
@@ -90,6 +106,14 @@ struct StageCapture {
     std::vector<ShaderRecompiler::MemoryRegion> regions;
     std::uint64_t forgetSerial = 0;
     std::uint32_t pushOffset = 0;
+};
+
+// A draw stage's shape reuse (DrawShapeReuse.cpp): the rebuilt capture and its result.
+struct DrawShapeReuse {
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
+    bool refreshed = false;
+    bool descriptorRefreshed = false;
 };
 
 }

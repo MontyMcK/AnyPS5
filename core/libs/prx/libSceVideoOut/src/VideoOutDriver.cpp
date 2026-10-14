@@ -19,6 +19,7 @@
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
 #include "prx/libSceVideoOut/include/AutomationCapture.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostHdrStatus.hpp"
 #if APS5_ENABLE_TIMING_LOG
 #include "prx/libSceVideoOut/include/FrameTimingLog.hpp"
 #endif
@@ -212,6 +213,8 @@ VideoOutDriver::VideoOutDriver() {
     }
     try {
         AgcDriverWaitIdle_nid_postfix();
+        hdrProbe.ProbeBeforeWindow();
+        hdrGeneration = AgcDriverHostHdr_nid_postfix().generation;
         presentThread = std::jthread([this](std::stop_token token) { presentLoop(token); });
         vblankThread = std::jthread([this](std::stop_token token) { vblankLoop(token); });
         LibcRegisterShutdown_nid_postfix([] { VideoOutDriver::Get().Shutdown(); });
@@ -373,6 +376,16 @@ void VideoOutDriver::triggerEvents(VideoOutConfig& cfg, int eventKind, void* tri
     }
 }
 
+void VideoOutDriver::outputModeChanged() {
+    std::lock_guard lock(mutex);
+    for (const auto& cfg : contexts) {
+        if (!cfg) continue;
+        std::lock_guard cfgLock(cfg->mutex);
+        if (!cfg->opened || cfg->closing || cfg->failure) continue;
+        triggerEvents(*cfg, VIDEO_OUT_EVENT_SET_MODE, reinterpret_cast<void*>(cfg->outputMode));
+    }
+}
+
 void VideoOutDriver::vblankEnd() {
     std::lock_guard lock(mutex);
     for (const auto& cfg : contexts) {
@@ -407,6 +420,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     }
     require(req.width != 0 && req.height != 0 && req.width <= static_cast<uint32_t>(std::numeric_limits<int>::max()) && req.height <= static_cast<uint32_t>(std::numeric_limits<int>::max()), "invalid window dimensions");
     window.Ensure(req.width, req.height);
+    hdrProbe.Poll(window.NativeHandle());
     unsigned extensionCount = 0;
     if (!SDL_Vulkan_GetInstanceExtensions(window.Handle(), &extensionCount, nullptr)) throw std::runtime_error(std::string("SDL_Vulkan_GetInstanceExtensions failed: ") + SDL_GetError());
     std::vector<const char*> extensions(extensionCount);
@@ -530,6 +544,11 @@ void VideoOutDriver::presentLoop(std::stop_token token) {
                 }
             }
             padInput.Update();
+            if (window.Handle() != nullptr) hdrProbe.Poll(window.NativeHandle());
+            if (const auto hdr = AgcDriverHostHdr_nid_postfix(); hdr.generation != hdrGeneration) {
+                hdrGeneration = hdr.generation;
+                outputModeChanged();
+            }
             if (current) {
                 require(current->timing != nullptr, "missing presentation timing");
                 const auto dequeued = AgcDriver::FrameTiming::Clock::now();
@@ -584,6 +603,7 @@ void VideoOutDriver::presentLoop(std::stop_token token) {
         }
     }
     AgcDriverShutdown_nid_postfix();
+    hdrProbe.Release();
     window.Destroy();
 }
 

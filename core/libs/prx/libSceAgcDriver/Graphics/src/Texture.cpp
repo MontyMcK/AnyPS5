@@ -3443,6 +3443,119 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
     return discarded;
 }
 
+namespace {
+
+// Whether [begin, end) lies wholly inside one of the sorted, disjoint `ranges`.
+bool insideRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t begin, std::uint64_t end) {
+    const auto found = std::upper_bound(ranges.begin(), ranges.end(), begin, [](std::uint64_t value, const auto& range) { return value < range.first; });
+    if (found == ranges.begin()) return false;
+    const auto& range = *std::prev(found);
+    return range.first <= begin && end <= range.second;
+}
+
+bool overlapsRanges(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t begin, std::uint64_t end) {
+    return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.first < end && begin < range.second; });
+}
+
+}
+
+bool StorageTexture::CoveredUnits(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> covered, std::vector<std::pair<std::uint64_t, std::uint64_t>>& units) {
+    units.clear();
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    // An image another thread is storing right now (listed by its FlushPending, not yet stored)
+    // would land its results after the dispatch: nothing is elided over it.
+    for (const auto* texture : pending.flushing) {
+        if (overlapsRanges(covered, texture->descriptor.baseAddress, texture->descriptor.baseAddress + texture->guestBytes)) return false;
+    }
+    if (!pending.textures.MayOverlap(address, bytes)) return true;
+    const auto* exempt = refreshing;
+    // The pending units over the region: the ones wholly inside the covered bytes (candidates),
+    // and every other one (another image's unit sticking out of the region or only partly covered).
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> candidates;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> others;
+    for (const auto* texture : pending.textures) {
+        if (!texture->overlaps(address, bytes)) continue;
+        bool anyCovered = false;
+        for (std::uint32_t unit = 0; unit < texture->trackedLayers && !anyCovered; ++unit) {
+            if (texture->layerPending[unit] && overlapsRanges(covered, texture->layerBegin(unit), texture->layerBegin(unit) + texture->layerBytes(unit))) anyCovered = true;
+        }
+        // Results shared with an alias, an image under validation, or one whose write-back stores
+        // its DCC keys with every unit keep the plain flush.
+        const bool whole = texture->descriptor.dccAddress != 0 && texture->uploadedKeys != DccKeys::Uncompressed;
+        if (anyCovered && (texture == exempt || LayerAliasExempted(texture) || texture->lent || whole || !texture->borrowedFrom.expired() || !texture->layerBorrows.empty() || texture->layerPending.size() < texture->trackedLayers)) return false;
+        for (std::uint32_t unit = 0; unit < texture->trackedLayers && unit < texture->layerPending.size(); ++unit) {
+            if (!texture->layerPending[unit]) continue;
+            const auto begin = texture->layerBegin(unit);
+            const auto end = begin + texture->layerBytes(unit);
+            if (end <= address || address + bytes <= begin) continue;
+            if (anyCovered && address <= begin && end <= address + bytes && insideRanges(covered, begin, end)) candidates.emplace_back(begin, end);
+            else others.emplace_back(begin, end);
+        }
+    }
+    // A candidate overlapped by any other pending unit is stored instead: the flush of the gaps
+    // then stores that other unit too, which no drop would ever reach.
+    for (const auto& range : candidates) {
+        if (!overlapsRanges(others, range.first, range.second)) units.push_back(range);
+    }
+    std::sort(units.begin(), units.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    for (const auto& range : units) {
+        if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+        else merged.push_back(range);
+    }
+    units = std::move(merged);
+    return true;
+}
+
+std::pair<std::size_t, std::uint64_t> StorageTexture::DropCoveredUnits(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    std::pair<std::size_t, std::uint64_t> dropped{0, 0};
+    if (ranges.empty()) return dropped;
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    const auto first = ranges.front().first;
+    const auto span = static_cast<std::size_t>(ranges.back().second - first);
+    // Clears the texture's pending units wholly inside the ranges; whether any was.
+    const auto drop = [&](StorageTexture* texture) {
+        if (!texture->overlaps(first, span) || texture->layerPending.size() < texture->trackedLayers) return false;
+        bool any = false;
+        for (std::uint32_t unit = 0; unit < texture->trackedLayers; ++unit) {
+            const auto begin = texture->layerBegin(unit);
+            const auto end = begin + texture->layerBytes(unit);
+            if (!texture->layerPending[unit] || !insideRanges(ranges, begin, end)) continue;
+            texture->layerPending[unit] = false;
+            ++dropped.first;
+            dropped.second += end - begin;
+            unitsDropped.fetch_add(1, std::memory_order_relaxed);
+            any = true;
+        }
+        // The dropped units hold results guest memory never received: the next use takes them from
+        // memory (the dispatch's bytes), never from a matching `original`.
+        if (any) texture->originalValid = false;
+        return any;
+    };
+    // An image another thread's FlushPending took off the list since the elision decided (it waits
+    // for the GPU mutex this thread holds, then stores the units still pending): its covered units
+    // are cleared too, so that store, recorded after the dispatch, leaves the dispatch's bytes.
+    bool anyDropped = false;
+    for (auto* texture : pending.flushing) anyDropped = drop(texture) || anyDropped;
+    if (pending.textures.MayOverlap(first, span)) {
+        for (auto it = pending.textures.begin(); it != pending.textures.end();) {
+            auto* texture = *it;
+            const bool any = drop(texture);
+            anyDropped = anyDropped || any;
+            if (any && !texture->anyLayerPending()) {
+                texture->dirty = false;
+                it = pending.textures.erase(it);
+                continue;
+            }
+            ++it;
+        }
+    }
+    if (anyDropped) BumpPendingSerial();
+    return dropped;
+}
+
 StorageTexture::FillCoverage StorageTexture::ClassifyFill(std::uint64_t address, std::size_t bytes) {
     FillCoverage coverage;
     auto& live = Live();

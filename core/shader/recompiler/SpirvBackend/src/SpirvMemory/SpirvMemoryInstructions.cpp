@@ -202,9 +202,32 @@ std::uint32_t GuestAddress(SpirvValueEmitContext& ctx, const IrValue& inst, cons
     return AddBdaImmediate(ctx, inst, address, immediate);
 }
 
+// The lane offset GuestAddressBase adds to the base of an address read (masked to dwords for a
+// scalar read), and the immediate: as GuestAddress adds it (`masked`: also masked for a scalar
+// read), or as LoadBdaWide passes mem.offset to EmitBdaDwordReads.
+std::pair<std::uint32_t, std::int32_t> GuestAddressParts(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, bool masked) {
+    auto low = ctx.Arg(inst, 1);
+    auto immediate = static_cast<std::int32_t>(mem.offset);
+    if (mem.kind == ResourceKind::ScalarAddress) {
+        low = Binary(ctx.state, spv::OpBitwiseAnd, TypeU32(ctx.state), low, ConstantU32(ctx.state, ~3u));
+        if (masked) immediate = static_cast<std::int32_t>(static_cast<std::uint32_t>(immediate) & ~3u);
+    }
+    return {low, immediate};
+}
+
+// The anchor of a read that can take it (see EmitAnchoredBdaRead), or null.
+const SpirvEmitterState::BdaAnchor* ReadAnchor(const SpirvEmitterState& state, const IrValue& inst) {
+    return state.bdaProbeFunction != 0 ? FindBdaAnchor(state, inst) : nullptr;
+}
+
 std::uint32_t LoadBda(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, std::uint32_t bits) {
     return EmitValueOrZeroIfCondition(ctx.state, ActiveArgument(ctx, inst), [&]() {
-        return EmitBdaRead(ctx, inst, GuestAddress(ctx, inst, mem), bits);
+        const auto* anchor = ReadAnchor(ctx.state, inst);
+        if (anchor == nullptr) return EmitBdaRead(ctx, inst, GuestAddress(ctx, inst, mem), bits);
+        const auto [low, immediate] = GuestAddressParts(ctx, inst, mem, true);
+        return EmitAnchoredBdaRead(ctx.state, inst, *anchor, low, immediate, bits, 1u, 1u, [&] {
+            return std::array<std::uint32_t, 4>{EmitBdaRead(ctx, inst, GuestAddress(ctx, inst, mem), bits)};
+        })[0];
     });
 }
 
@@ -358,7 +381,13 @@ void LoadAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t 
 std::uint32_t LoadBdaWide(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, std::uint32_t components) {
     auto& state = ctx.state;
     return EmitValueOrDefaultIfCondition(state, ActiveArgument(ctx, inst), TypeU32Composite(state, components), ConstantU32CompositeZero(state, components), [&]() {
-        return ConstructU32Composite(state, components, EmitBdaDwordReads(ctx, inst, GuestAddressBase(ctx, inst, mem), mem.offset, components));
+        const auto* anchor = ReadAnchor(state, inst);
+        const auto used = UsedBdaReadDwords(inst, components);
+        if (anchor == nullptr || used == 0u) return ConstructU32Composite(state, components, EmitBdaDwordReads(ctx, inst, GuestAddressBase(ctx, inst, mem), mem.offset, components));
+        const auto [low, immediate] = GuestAddressParts(ctx, inst, mem, false);
+        return ConstructU32Composite(state, components, EmitAnchoredBdaRead(state, inst, *anchor, low, immediate, 32u, components, used, [&] {
+            return EmitBdaDwordReads(ctx, inst, GuestAddressBase(ctx, inst, mem), mem.offset, components);
+        }));
     });
 }
 

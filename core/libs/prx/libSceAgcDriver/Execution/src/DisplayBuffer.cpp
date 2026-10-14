@@ -20,15 +20,6 @@ void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(reason);
 }
 
-// Bit 56 selects the 10-bit (A2B10G10R10) variant of the format.
-constexpr std::uint64_t PixelFormatUnormBit = 0x0100000000000000ull;
-constexpr std::uint64_t PixelFormatB8G8R8A8 = 0x8000000000000000ull;
-constexpr std::uint64_t PixelFormatR8G8B8A8 = 0x8000000022000000ull;
-
-std::uint64_t baseFormat(std::uint64_t pixelFormat) {
-    return pixelFormat & ~PixelFormatUnormBit;
-}
-
 std::uint32_t tileOffset(std::uint32_t x, std::uint32_t y) {
     return ((y << 4u) & 0x0070u) ^ ((y << 5u) & 0x0f00u) ^ ((y << 9u) & 0x1000u) ^ ((y << 8u) & 0x4000u) ^ ((x << 2u) & 0x000cu) ^ ((x << 5u) & 0x0380u) ^ ((x << 4u) & 0x0400u) ^ ((x << 6u) & 0x0800u) ^ ((x << 9u) & 0xa000u);
 }
@@ -90,7 +81,7 @@ void traceDisplayKeys(const DisplayBuffer& buffer, const std::uint8_t* keys, std
 
 std::size_t DisplayBufferSize(const DisplayBuffer& buffer) {
     require(buffer.width != 0 && buffer.height != 0 && buffer.width <= 16384 && buffer.height <= 16384, "VideoOut: invalid display buffer dimensions");
-    if (baseFormat(buffer.pixelFormat) != PixelFormatB8G8R8A8 && baseFormat(buffer.pixelFormat) != PixelFormatR8G8B8A8) {
+    if (!DisplayFormatSupported(buffer.pixelFormat)) {
         char message[96];
         std::snprintf(message, sizeof(message), "VideoOut: unsupported display pixel format 0x%016llx", static_cast<unsigned long long>(buffer.pixelFormat));
         throw std::runtime_error(message);
@@ -108,15 +99,31 @@ std::size_t DisplayBufferSize(const DisplayBuffer& buffer) {
     return static_cast<std::size_t>(size);
 }
 
+std::vector<std::byte> DisplayBufferTexels(const DisplayBuffer& buffer, std::span<const std::byte> source) {
+    require(source.size() == DisplayBufferSize(buffer), "VideoOut: invalid display buffer size");
+    std::vector<std::byte> texels(static_cast<std::size_t>(buffer.width) * buffer.height * 4);
+    const auto blocksPerRow = (buffer.width + 127u) / 128u;
+    const auto pitch = buffer.pitchInPixel == 0 ? buffer.width : buffer.pitchInPixel;
+    for (std::uint32_t y = 0; y < buffer.height; ++y) {
+        for (std::uint32_t x = 0; x < buffer.width; ++x) {
+            const auto tiled = buffer.tilingMode == 1 ? (static_cast<std::size_t>(y) * pitch + x) * 4u
+                : (static_cast<std::size_t>(y / 128u) * blocksPerRow + x / 128u) * 65536u + tileOffset(x, y);
+            std::memcpy(texels.data() + (static_cast<std::size_t>(y) * buffer.width + x) * 4, source.data() + tiled, 4);
+        }
+    }
+    return texels;
+}
+
 std::vector<std::byte> DecodeDisplayBuffer(const DisplayBuffer& buffer, std::span<const std::byte> source) {
     PerformanceTimer timing("DisplayBuffer.Decode");
     require(source.size() == DisplayBufferSize(buffer), "VideoOut: invalid display buffer size");
     std::vector<std::byte> pixels(static_cast<std::size_t>(buffer.width) * buffer.height * 4);
     const auto blocksPerRow = (buffer.width + 127u) / 128u;
-    const bool rgba = baseFormat(buffer.pixelFormat) == PixelFormatR8G8B8A8;
-    // Bit 56 marks the 10-bit variant: A2B10G10R10 with red in the low bits (the scanout draws render
-    // COLOR_2_10_10_10 into it). Presented as 8-bit BGRA by dropping the low two bits of each channel.
-    const bool tenBit = (buffer.pixelFormat & PixelFormatUnormBit) != 0;
+    const bool rgba = DisplayRedLow(buffer.pixelFormat);
+    // Bit 56 marks the 10-bit variant (blue in the low bits, or red for the 0x22 component order; the
+    // scanout draws render COLOR_2_10_10_10 into it). Presented as 8-bit BGRA by dropping the low two
+    // bits of each channel.
+    const bool tenBit = DisplayTenBit(buffer.pixelFormat);
     timing.Mark("validate_allocate");
     for (std::uint32_t y = 0; y < buffer.height; ++y) {
         for (std::uint32_t x = 0; x < buffer.width; ++x) {
@@ -131,7 +138,7 @@ std::vector<std::byte> DecodeDisplayBuffer(const DisplayBuffer& buffer, std::spa
     return pixels;
 }
 
-std::array<std::byte, 4> DisplayBufferClearPixel(const DisplayBuffer& buffer, Graphics::DccKeys keys) {
+std::array<std::byte, 4> DisplayBufferClearTexel(const DisplayBuffer& buffer, Graphics::DccKeys keys) {
     static_cast<void>(DisplayBufferSize(buffer));
     require(buffer.dccAddress != 0, "VideoOut: a display buffer without DCC metadata has no fast-clear value");
     std::array<std::byte, 4> texel{};
@@ -148,8 +155,13 @@ std::array<std::byte, 4> DisplayBufferClearPixel(const DisplayBuffer& buffer, Gr
         std::snprintf(message, sizeof(message), "VideoOut: display buffer 0x%llx (format 0x%016llx) reads %s DCC keys at 0x%llx: only uncompressed keys or a uniform clear code that the display format encodes can be presented", static_cast<unsigned long long>(buffer.address), static_cast<unsigned long long>(buffer.pixelFormat), Graphics::DccKeysName(keys), static_cast<unsigned long long>(buffer.dccAddress));
         throw std::runtime_error(message);
     }
+    return texel;
+}
+
+std::array<std::byte, 4> DisplayBufferClearPixel(const DisplayBuffer& buffer, Graphics::DccKeys keys) {
+    const auto texel = DisplayBufferClearTexel(buffer, keys);
     std::array<std::byte, 4> pixel{};
-    decodeTexel(texel.data(), pixel.data(), baseFormat(buffer.pixelFormat) == PixelFormatR8G8B8A8, (buffer.pixelFormat & PixelFormatUnormBit) != 0);
+    decodeTexel(texel.data(), pixel.data(), DisplayRedLow(buffer.pixelFormat), DisplayTenBit(buffer.pixelFormat));
     return pixel;
 }
 
@@ -193,6 +205,14 @@ std::vector<std::byte> ReadDisplayBuffer(const DisplayBuffer& buffer) {
     GuestMemory::CheckRange(reinterpret_cast<const void*>(buffer.address), size, 65536);
     const auto* source = reinterpret_cast<const std::byte*>(buffer.address);
     return DecodeDisplayBuffer(buffer, {source, size});
+}
+
+std::vector<std::byte> ReadDisplayBufferTexels(const DisplayBuffer& buffer) {
+    const auto size = DisplayBufferSize(buffer);
+    GuestMemory::FlushGpuWrites(buffer.address, size);
+    GuestMemory::CheckRange(reinterpret_cast<const void*>(buffer.address), size, 65536);
+    const auto* source = reinterpret_cast<const std::byte*>(buffer.address);
+    return DisplayBufferTexels(buffer, {source, size});
 }
 
 }

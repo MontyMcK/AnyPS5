@@ -34,6 +34,18 @@ struct Range {
     std::uint32_t reserved;
 };
 
+// The table's ranges ascend by begin and do not overlap (each begins at or after the previous
+// one's end, and none ends before it begins), and the bucket index is built from them. The shader
+// lookups rely on it: the hint, the lookup cache and the anchors (SpirvBdaRead.cpp) reuse a range
+// for every address inside it, which is the range a search would select only in such a table.
+inline bool RangesOrdered(const Range* ranges, std::size_t count) {
+    for (std::size_t index = 0; index < count; ++index) {
+        if (ranges[index].end < ranges[index].begin) return false;
+        if (index != 0 && ranges[index].begin < ranges[index - 1].end) return false;
+    }
+    return true;
+}
+
 enum class FaultState : std::uint32_t { Empty, Writing, Ready };
 enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor };
 

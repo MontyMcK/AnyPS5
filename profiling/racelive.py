@@ -10,7 +10,7 @@ A window that a race end falls into is dropped; when the race ends the next one 
 pressed once the pre-race screen is back), so measurement continues across races. After every block
 the running paired difference B - A is printed with its standard error, so the run can be stopped as
 soon as the answer is clear. The live-flags file is restored at the end."""
-import argparse, json, math, os, sys, time
+import argparse, json, math, os, subprocess, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import aps5auto  # noqa: E402
@@ -55,6 +55,7 @@ def vrr_events(path):
 
 class Session:
     def __init__(self, tag, between):
+        self.tag = tag
         self.game = aps5auto.connect(tag)
         self.events_path = self.game.status()['events']
         self.between = between
@@ -91,24 +92,31 @@ class Session:
         time.sleep(self.between)
         # Intros (a track flyover) advance per frame at ~1 FPS and take minutes unless skipped, so
         # Cross is pressed again every 30 s.
-        for attempt in range(12):
+        # The intro flyover often ignores the pad while left clicks get through, and the post-race
+        # menu also offers "Play Music Replay" (no race start): every try clicks the window's centre
+        # (skips an intro), then Start (the pre-race menu's leftmost button; no Left presses, they
+        # move the focus off Start), then presses Cross. Tries repeat every ~12 s (the clicks bring the window to
+        # the front).
+        click = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'click.ps1')
+        for attempt in range(40):
             since = self.game.cursor()
-            # After a race the pre-race menu also offers "Play Music Replay" (a replay, no race
-            # start); Left moves the focus back to Start, the leftmost button. Odd attempts skip an
-            # intro first (Cross), even ones press Left before Start.
-            if attempt % 2 == 1:
-                for _ in range(3):
-                    self.game.press('left', polls=3, frames=2, ms=300)
+            if self.tag:
+                subprocess.run(['pwsh', '-NoProfile', '-File', click, '-Tag', self.tag, '-X', '960', '-Y', '540'], capture_output=True, timeout=30)
+                time.sleep(2.0)
+            if self.tag:
+                for _ in range(2):
+                    subprocess.run(['pwsh', '-NoProfile', '-File', click, '-Tag', self.tag, '-X', '530', '-Y', '944'], capture_output=True, timeout=30)
+                    time.sleep(1.0)
             self.game.press('cross', polls=6, frames=4, ms=3000)
             try:
-                self.game.wait_for('vrr', where=lambda e: e.get('op') == 'peg', since=since, timeout=30)
+                self.game.wait_for('vrr', where=lambda e: e.get('op') == 'peg', since=since, timeout=12)
                 # The event log on disk can trail the pipe; a window must not see this peg land.
                 deadline = time.monotonic() + 15
                 while not self.in_race() and time.monotonic() < deadline:
                     time.sleep(0.5)
                 return
             except TimeoutError:
-                print('no race start after press %d' % (attempt + 1), flush=True)
+                print('no race start after try %d' % (attempt + 1), flush=True)
         raise RuntimeError('the race does not start')
 
     def presents(self):

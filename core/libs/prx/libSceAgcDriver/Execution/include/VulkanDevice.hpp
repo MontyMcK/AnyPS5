@@ -9,6 +9,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <array>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -22,6 +24,7 @@ struct DrawSpeculation;
 struct DrawPrebuild;
 }
 
+class PresentationScaler;
 // Stage A of a dispatch's resource build (see VulkanDevice::PrepareDispatch); opaque to callers.
 struct PreparedDispatch;
 // The unlocked pre-checks of a recipe hit (see VulkanDevice::PrepareRecipe); opaque to callers.
@@ -36,6 +39,9 @@ public:
     VulkanDevice(const VulkanDevice&) = delete;
     VulkanDevice& operator=(const VulkanDevice&) = delete;
     std::string DeviceName() const;
+    // APS5_GPU_TIMELINE with calibrated timestamps: the GPU time (timestamp ns) of a steady-clock
+    // point taken now; false without the extension.
+    bool CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const;
     ShaderRecompiler::SpirvTarget Target() const;
     ShaderRecompiler::SpirvTarget ComputeTarget(std::uint32_t waveSize) const;
     // Distinguishes this device from every earlier one in the process (a memo keyed by the device
@@ -57,13 +63,14 @@ public:
     // that). A reap runs completion actions, and a write-back can wait for a later batch under the
     // mutex through the flush hook, so a thread submitting on another queue's behalf (a WAIT_REG_MEM
     // poller, a compute worker's between-packet flush) passes false: it must only submit, never wait.
-    void SubmitRecorded(bool reapFirst = true);
+    // `reason` is the batch's Recorder::SubmitReason ([submits] line); Other names the caller's site.
+    void SubmitRecorded(bool reapFirst = true, Graphics::Recorder::SubmitReason reason = Graphics::Recorder::SubmitReason::Other);
     // Unlocked drain: SubmitAndEpoch (under the mutex) returns the serial covering every recorded
     // batch (0: nothing in flight); WaitRecorded(serial) waits for it WITHOUT the mutex (the caller
     // holds a shared_ptr to this device); ReapRecorded(serial) (under the mutex) runs the completions
     // of the batches up to it. CanWaitUnlocked is false without timeline semaphores: use WaitIdle.
     bool CanWaitUnlocked() const;
-    std::uint64_t SubmitAndEpoch();
+    std::uint64_t SubmitAndEpoch(Graphics::Recorder::SubmitReason reason = Graphics::Recorder::SubmitReason::Drain);
     void WaitRecorded(std::uint64_t serial);
     void ReapRecorded(std::uint64_t serial);
     // Completes the batches that already finished (non-blocking); under the mutex.
@@ -200,6 +207,13 @@ public:
     bool PresentClear(std::uint32_t width, std::uint32_t height, bool opaque);
     void PresentPixels(std::uint32_t width, std::uint32_t height, std::span<const std::byte> pixels);
     bool PresentDisplayBuffer(const DisplayBuffer& buffer);
+    // Before a flip's AcquireImage: makes the swapchain HDR10 (a 10-bit format in
+    // VK_COLOR_SPACE_HDR10_ST2084_EXT) when `buffer` is an HDR10 display buffer and the host offers HDR
+    // output (AgcDriverHostHdr_nid_postfix), and SDR (BGRA8 sRGB-nonlinear, as before) for any other
+    // display buffer. A clear keeps the current swapchain. An HDR10 buffer without HDR output, or one
+    // whose HDR10 swapchain cannot be made, is presented through the SDR swapchain unconverted and
+    // the reason is reported once per host monitor change.
+    void SelectDynamicRange(const DisplayBuffer* buffer);
     double FinishPresent();
     void QueuePresent();
     // At the flip packet (under the mutex): the recorder's submissions so far and, under
@@ -214,6 +228,15 @@ public:
     struct PresentStatistics {
         std::uint64_t presents, gpuUnread, batchesAheadOfBlit, batchesAfterFlip, readsChecked, readsOverwritten;
         double gpuBusyMs, gpuGapMs, lastSubmitAfterFlipMs, blitSubmitAfterFlipMs;
+        // The [submits] line: per stamped batch, the GPU idle gap before it (from the end of the
+        // stamped batch before it, across presents; gaps over 1 s left out), by the batch's submit
+        // reason; split by whether the GPU had nothing queued at its submit (starved: it waited
+        // for this submit) or idled at a submission boundary with work queued; and the gaps of
+        // 5 ms or more by reason.
+        std::array<double, Graphics::Recorder::SubmitReasonCount> idleMsByReason;
+        std::array<double, Graphics::Recorder::SubmitReasonCount> longIdleMsByReason;
+        std::array<std::uint64_t, Graphics::Recorder::SubmitReasonCount> longGapsByReason;
+        double starvedIdleMs, queuedIdleMs;
     };
     static PresentStatistics PresentCounts();
     // Stage A of a dispatch's resource build, run WITHOUT GuestMemory::GpuMutex before Dispatch or
@@ -290,6 +313,7 @@ public:
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
     std::shared_ptr<Graphics::DrawSpeculation> SpeculateDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots) const;
     std::shared_ptr<Graphics::DrawPrebuild> PrebuildDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, bool keyed) const;
+    void SpeculatePipeline(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders, Graphics::DrawSpeculation& speculation, const std::shared_ptr<Graphics::DrawPrebuild>& prebuilt) const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
     Graphics::Context DrawContext() const;
     bool ApplyForkedDraw(const Graphics::Context& context, std::span<const Graphics::CompiledShader> shaders, Graphics::ForkedDraw& forked, const Graphics::ForkStamp& stamp, const std::function<void()>* quiesce = nullptr);
@@ -323,8 +347,18 @@ private:
     void decideIndirect(RecordedDispatch& record, IndirectOutcome& outcome, char* groupsText);
     // The tail of a dispatch's device call from the open batch's command buffer to the completion
     // registration: keeps, the template data refresh, barriers, bind, push, dispatch, marks.
+    void countAsyncEligibility(const RecordedDispatch& record, const Graphics::ShaderResources& resources);
     void recordDispatch(RecordedDispatch& record);
-    bool present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels, const DisplayBuffer* display = nullptr, const std::shared_ptr<Graphics::StorageTexture>& resident = nullptr, VkFilter residentFilter = VK_FILTER_LINEAR, bool dumpFrame = false, bool residentConvert = false, const VkClearColorValue* uniform = nullptr);
+    // `passthrough`: the pixels, the display buffer or the converted resident image carry the display
+    // buffer's 10-bit HDR10 texels unchanged into the HDR10 swapchain (see SelectDynamicRange).
+    bool present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels, const DisplayBuffer* display = nullptr, const std::shared_ptr<Graphics::StorageTexture>& resident = nullptr, VkFilter residentFilter = VK_FILTER_LINEAR, bool dumpFrame = false, bool residentConvert = false, const VkClearColorValue* uniform = nullptr, bool passthrough = false);
+    void refreshSurfaceFormats();
+    // False (and extent 0) when the surface cannot take a swapchain now; throws when creation failed.
+    bool recreateSwapchain(VkSurfaceFormatKHR format, VkExtent2D extent);
+    void recreateSdrSwapchain(VkExtent2D extent);
+    void setHdrMetadata();
+    PresentationScaler* activeScaler(bool passthrough, std::uint64_t pixelFormat);
+    bool passthroughFor(const DisplayBuffer& buffer) const;
     struct State;
     std::unique_ptr<State> state;
     std::uint64_t serial;

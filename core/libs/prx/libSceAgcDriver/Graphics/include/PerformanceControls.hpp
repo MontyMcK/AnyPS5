@@ -56,6 +56,10 @@ bool ForkStreamEnabled();
 bool ForkStreamWaitEnabled();
 bool ForkStreamLazyEnabled();
 bool CommitHoldEnabled();
+// Live `parallel_commit` (env APS5_PARALLEL_COMMIT), stage P1 of the parallel committer: pass runs
+// (Execution/include/Driver/Draw/PassRun.hpp). APS5_VERIFY_PARALLEL_COMMIT=1 checks each run.
+bool ParallelCommitEnabled();
+bool VerifyParallelCommit();
 bool CommitTrimEnabled();
 bool VerifyForks();
 bool ReplayProbeEnabled();

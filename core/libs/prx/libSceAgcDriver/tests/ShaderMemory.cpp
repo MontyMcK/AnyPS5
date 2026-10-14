@@ -20,6 +20,7 @@
 #include <initializer_list>
 #include <iostream>
 #include <map>
+#include <set>
 #include <future>
 #include <memory>
 #include <stdexcept>
@@ -93,6 +94,164 @@ void verifyRegisterSources() {
     secondVector.SetRegister({RegisterBank::Vector, 1});
     require(!EquivalentValue(plan, &firstVector, &secondVector), "different vector registers were merged");
     require(!EquivalentValue(plan, &samplerRegister, &firstVector), "different register types were merged");
+}
+
+void verifyMayEvaluate() {
+    using namespace ShaderRecompiler;
+    IrResourcePlan plan;
+    std::vector<std::unique_ptr<IrValue>> values;
+    const auto make = [&](IrOpcode opcode, IrType type, std::initializer_list<IrValue*> arguments = {}) -> IrValue& {
+        values.push_back(std::make_unique<IrValue>(opcode, type, static_cast<std::uint32_t>(values.size())));
+        for (auto* argument : arguments) values.back()->AddArgument(argument);
+        return *values.back();
+    };
+    const auto constant = [&](std::uint32_t value) -> IrValue& {
+        auto& leaf = make(IrOpcode::Void, IrType::U32);
+        leaf.SetImmediateU32(value);
+        return leaf;
+    };
+    auto& scalar = make(IrOpcode::Void, IrType::ScalarReg);
+    scalar.SetRegister({RegisterBank::Scalar, 0});
+    auto& vector = make(IrOpcode::Void, IrType::VectorReg);
+    vector.SetRegister({RegisterBank::Vector, 0});
+    auto& input = make(IrOpcode::GetUserData, IrType::U32, {&scalar});
+    auto& lane = make(IrOpcode::GetRegister, IrType::U32, {&vector});
+    auto& uniform = make(IrOpcode::IEqual32, IrType::Bool, {&input, &constant(4)});
+    auto& varying = make(IrOpcode::IEqual32, IrType::Bool, {&input, &lane});
+    auto& select = make(IrOpcode::SelectU32, IrType::U32, {&uniform, &constant(1), &lane});
+    auto& unevaluated = make(IrOpcode::FPAdd32, IrType::F32, {&input, &input});
+    auto& invariant = make(IrOpcode::Phi, IrType::Bool);
+    invariant.AddArgument(&uniform);
+    invariant.AddArgument(&uniform);
+    auto& divergent = make(IrOpcode::Phi, IrType::Bool);
+    divergent.AddArgument(&uniform);
+    divergent.AddArgument(&varying);
+    auto& counter = make(IrOpcode::Phi, IrType::U32);
+    auto& next = make(IrOpcode::CompositeExtractU32x2, IrType::U32, {&make(IrOpcode::IAddCarry32, IrType::U32x2, {&counter, &constant(1)}), &constant(0)});
+    counter.AddArgument(&constant(0));
+    counter.AddArgument(&next);
+    auto& latch = make(IrOpcode::ULessThan32, IrType::Bool, {&next, &constant(4)});
+    auto& sum = make(IrOpcode::CompositeExtractU32x2, IrType::U32, {&make(IrOpcode::IAddCarry32, IrType::U32x2, {&input, &constant(1)}), &constant(0)});
+    std::array<std::uint32_t, 1> data{4};
+    SrtRuntime runtime{data};
+    for (const auto& [value, expected, name] : std::array<std::tuple<IrValue*, bool, const char*>, 11>{{
+             {&constant(3), true, "a constant"},
+             {&input, true, "user data"},
+             {&uniform, true, "a comparison of user data"},
+             {&lane, false, "a vector register read"},
+             {&varying, false, "a comparison with a vector register"},
+             {&select, false, "a select with a vector register arm"},
+             {&unevaluated, false, "an opcode the evaluator does not evaluate"},
+             {&invariant, true, "a phi whose operands agree"},
+             {&divergent, false, "a phi whose operands differ"},
+             {&latch, false, "a scalar loop counter's latch condition"},
+             {&sum, true, "the low word of a carry add of user data"},
+         }}) {
+        require(Detail::Evaluator::MayEvaluate(plan, value) == expected, (std::string("MayEvaluate misjudged ") + name).c_str());
+        Detail::Evaluator evaluator(plan, runtime);
+        std::uint32_t result = 0;
+        require(evaluator.Evaluate(Detail::IrNode(value), result) == expected, (std::string("MayEvaluate disagreed with the evaluator on ") + name).c_str());
+    }
+    const std::array<IrOpcode, 9> takenAsEvaluable{IrOpcode::Identity, IrOpcode::Phi, IrOpcode::Void, IrOpcode::GetUserData, IrOpcode::GetShaderBase, IrOpcode::ReadFirstLane, IrOpcode::ReadConst, IrOpcode::LoadAddressU32, IrOpcode::ReadConstBuffer};
+    for (std::uint16_t raw = 0; raw < static_cast<std::uint16_t>(IrOpcode::Count); ++raw) {
+        const auto opcode = static_cast<IrOpcode>(raw);
+        if (std::ranges::find(takenAsEvaluable, opcode) != takenAsEvaluable.end()) continue;
+        auto& value = make(opcode, IrType::U32, {&constant(0), &constant(0), &constant(0), &constant(0)});
+        Detail::Evaluator evaluator(plan, runtime);
+        std::uint32_t result = 0;
+        require(Detail::Evaluator::MayEvaluate(plan, &value) == evaluator.Evaluate(Detail::IrNode(&value), result), (std::string("MayEvaluate disagreed with the evaluator on ") + std::string(IrOpcodeName(opcode)) + " over constants").c_str());
+    }
+}
+
+// The latch condition of a scalar loop counter that starts at an SRT word can never be evaluated
+// (no runtime makes its phi invariant), so ExtractPlan stores it as no condition and does not copy
+// its cone, while a comparison of user data stays. The word, which only the dropped condition
+// reads, stays a pure flat slot, and the walk materializes what it does without the conditions. The
+// conditions are put into the program's resource plan by hand, in the shape the upstream
+// control-flow planning gives them.
+void verifyDroppedConditions() {
+    using namespace ShaderRecompiler;
+    std::array<std::uint32_t, 4> output{};
+    const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    alignas(16) std::array<std::uint32_t, 32> srt{};
+    srt[0] = static_cast<std::uint32_t>(outputAddress);
+    srt[1] = static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu);
+    srt[2] = 16u;
+    srt[3] = 0xfacu;
+    srt[16] = 1u;
+    const auto srtAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(srt.data()));
+    const std::array<std::uint32_t, 2> userData{static_cast<std::uint32_t>(srtAddress), static_cast<std::uint32_t>(srtAddress >> 32u)};
+    const std::vector<std::uint32_t> code{
+        0xf4000a00u, 0xfa000040u, // s_load_dword s40, s[0:1], 0x40
+        0xf4080100u, 0xfa000000u, // s_load_dwordx4 s[4:7], s[0:1], 0x0
+        0xbf8cc07fu,              // s_waitcnt lgkmcnt(0)
+        0x80288128u,              // loop: s_add_u32 s40, s40, 1
+        0xbf0a8428u,              // s_cmp_lt_u32 s40, 4
+        0xbf85fffdu,              // s_cbranch_scc1 loop
+        0xe0700000u, 0x80010000u, // buffer_store_dword v0, off, s[4:7], 0
+        0xbf810000u,              // s_endpgm
+    };
+    const std::array<std::uint32_t, 4> capabilities{29u, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    RecompileRequest request{};
+    request.shader = {ShaderStage::Compute, 0x22000u, code, 0, {}};
+    request.context.waveSize = 32u;
+    request.context.userDataBaseRegister = 0;
+    request.context.userData = userData;
+    request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+    request.target.vulkanVersion = 0x00401000u;
+    request.target.spirvVersion = 0x00010300u;
+    request.target.subgroupSize = 32;
+    request.target.supportedCapabilities = capabilities;
+    request.target.supportedExtensions = extensions;
+    request.target.bdaAbiVersion = BdaAbi::Version;
+    request.target.fragmentShaderBarycentricEnabled = false;
+    request.layout.pushConstantSizeBytes = 128;
+    auto program = PrepareResourceProgram(request);
+    constexpr ResourceMaterializer materializer;
+    const auto unconditional = materializer.ExtractPlan(program);
+    std::uint32_t slot = 0;
+    while (slot < unconditional.pureFlatSlots.size() && unconditional.pureFlatSlots[slot] == 0u) ++slot;
+    require(slot < unconditional.pureFlatSlots.size(), "dropped conditions: the program has no pure flat slot to read");
+    std::vector<std::unique_ptr<IrValue>> values;
+    const auto make = [&](IrOpcode opcode, IrType type, std::initializer_list<IrValue*> arguments = {}) -> IrValue& {
+        values.push_back(std::make_unique<IrValue>(opcode, type, 0x100000u + static_cast<std::uint32_t>(values.size())));
+        for (auto* argument : arguments) values.back()->AddArgument(argument);
+        return *values.back();
+    };
+    const auto constant = [&](std::uint32_t value) -> IrValue& {
+        auto& leaf = make(IrOpcode::Void, IrType::U32);
+        leaf.SetImmediateU32(value);
+        return leaf;
+    };
+    auto& scalar = make(IrOpcode::Void, IrType::ScalarReg);
+    scalar.SetRegister({RegisterBank::Scalar, 0});
+    auto& start = make(IrOpcode::ReadConst, IrType::U32, {&make(IrOpcode::GetSrtResource, IrType::SrtResource), &constant(slot)});
+    auto& counter = make(IrOpcode::Phi, IrType::U32);
+    auto& next = make(IrOpcode::CompositeExtractU32x2, IrType::U32, {&make(IrOpcode::IAddCarry32, IrType::U32x2, {&counter, &constant(1)}), &constant(0)});
+    IrBlock entry(0x100000u);
+    IrBlock latch(0x100001u);
+    counter.AddPhiOperand(&entry, &start);
+    counter.AddPhiOperand(&latch, &next);
+    auto& loop = make(IrOpcode::ULessThan32, IrType::Bool, {&next, &constant(4)});
+    auto& uniform = make(IrOpcode::IEqual32, IrType::Bool, {&make(IrOpcode::GetUserData, IrType::U32, {&scalar}), &constant(4)});
+    auto& source = program.Resources();
+    source.controlFlow = {{&loop, {1u, 2u}, {}}, {&uniform, {2u, 2u}, {}}, {nullptr, {}, {}}};
+    require(!Detail::Evaluator::MayEvaluate(source, &loop) && Detail::Evaluator::MayEvaluate(source, &uniform), "dropped conditions: MayEvaluate misjudged the injected conditions");
+    const auto plan = materializer.ExtractPlan(program);
+    require(plan.controlFlow.size() == 3u && plan.controlFlow[0].condition == nullptr && plan.controlFlow[1].condition != nullptr && plan.controlFlow[2].condition == nullptr, "dropped conditions: the latch was kept or the user data comparison was dropped");
+    require(plan.controlFlow[0].successors == source.controlFlow[0].successors && plan.controlFlow[1].successors == source.controlFlow[1].successors, "dropped conditions: the blocks lost their successors");
+    require(std::none_of(plan.valueStorage.begin(), plan.valueStorage.end(), [](const IrValue& value) { return value.IsPhi() || value.Opcode() == IrOpcode::IAddCarry32; }), "dropped conditions: the latch's cone was copied");
+    require(plan.valueStorage.Size() < unconditional.valueStorage.Size() + 8u, "dropped conditions: the plan copied more than the user data comparison");
+    require(Detail::ComputePureFlatSlots(source)[slot] == 0u && plan.pureFlatSlots[slot] != 0u && plan.pureFlatSlots == unconditional.pureFlatSlots, "dropped conditions: the slot only the latch reads did not stay pure");
+    SrtRuntime runtime{userData, request.shader.codeAddress};
+    ResourceSnapshot fromPlan;
+    ResourceSnapshot fromUnconditional;
+    materializer.Materialize(plan, runtime, fromPlan);
+    materializer.Materialize(unconditional, runtime, fromUnconditional);
+    require(fromPlan.buffers == fromUnconditional.buffers && fromPlan.flattenedSrt == fromUnconditional.flattenedSrt && fromPlan.userData == fromUnconditional.userData, "dropped conditions: the plan materialized other resources");
+    require(!fromPlan.buffers.empty() && fromPlan.buffers[0].dwords[0] == srt[0], "dropped conditions: the output buffer was not materialized");
+    source.controlFlow.clear();
 }
 
 void verifyEvaluatedValues() {
@@ -1760,6 +1919,87 @@ void verifyBdaReadFallbackFunctions() {
     }
 }
 
+// Reads whose base is a user data register pair share one anchor when there are two or more:
+// main searches the table once for it, and every read keeps its lookup path (probe and byte
+// fallback) for the reads the anchor does not hold. A read through a VGPR address has no anchor.
+void verifyBdaAnchors() {
+    using namespace ShaderRecompiler;
+    const std::array<std::uint32_t, 3> capabilities{spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses, spv::CapabilityStorageBuffer8BitAccess};
+    const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
+    alignas(256) static std::array<std::uint32_t, 32> output{};
+    const auto outputAddress = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(output.data()));
+    const std::array<std::uint32_t, 8> userData{0x10000000u, 0u, 0u, 0u, static_cast<std::uint32_t>(outputAddress), static_cast<std::uint32_t>((outputAddress >> 32u) & 0xffffu), 128u, 0x01016facu};
+    // `scalarBase` loads: global_load_dword v[3 + i], v0, s[4:5] offset 4 * i + 4; then one
+    // global_load_dword v[3 + loads], v[1:2], off through the VGPR address of v_mov v1, s0 / v2, s1.
+    const auto compile = [&](std::uint32_t scalarBase) {
+        std::vector<std::uint32_t> code{0x7e020200u, 0x7e040201u};
+        for (std::uint32_t load = 0; load < scalarBase; ++load) {
+            code.push_back(0xdc308000u | (4u * load + 4u));
+            code.push_back(((3u + load) << 24u) | 0x00040000u);
+        }
+        code.push_back(0xdc308000u | 4u);
+        code.push_back(((3u + scalarBase) << 24u) | 0x007d0001u);
+        code.push_back(0xbf8c3f70u);
+        for (std::uint32_t load = 1; load <= scalarBase; ++load) code.push_back(0x4a060103u | ((3u + load) << 9u));
+        code.insert(code.end(), {0xe0700000u, 0x80010300u, 0xbf810000u});
+        RecompileRequest request{};
+        request.shader = {ShaderStage::Compute, 0x60000u, code, 0, {}};
+        request.context.waveSize = 32;
+        request.context.userDataBaseRegister = 0;
+        request.context.userData = userData;
+        request.context.compute = ShaderComputeStageInfo{{32u, 1u, 1u}, 0u, {false, false, false}, false, 1u};
+        request.target.vulkanVersion = 0x00401000u;
+        request.target.spirvVersion = 0x00010300u;
+        request.target.subgroupSize = 32;
+        request.target.bdaAbiVersion = BdaAbi::Version;
+        request.target.supportedCapabilities = capabilities;
+        request.target.supportedExtensions = extensions;
+        request.target.fragmentShaderBarycentricEnabled = false;
+        request.layout.pushConstantSizeBytes = 128;
+        request.useCache = false;
+        return Recompile(request).spirv;
+    };
+    for (const std::uint32_t loads : {0u, 1u, 2u, 4u}) {
+        const bool anchored = loads >= 2u;
+        const auto words = compile(loads);
+        std::map<std::uint32_t, std::string> names;
+        std::string function;
+        std::map<std::string, std::size_t> mainCalls;
+        std::size_t anchorFunctions = 0;
+        std::size_t mainBranchesBefore = 0;
+        std::set<std::uint32_t> privateVariables;
+        std::size_t probePrivateAccesses = 0;
+        for (std::size_t cursor = 5; cursor < words.size();) {
+            const auto length = words[cursor] >> 16u;
+            require(length != 0 && length <= words.size() - cursor, "BDA anchors: truncated SPIR-V instruction");
+            const auto op = words[cursor] & 0xffffu;
+            if (op == spv::OpName) names[words[cursor + 1]] = reinterpret_cast<const char*>(&words[cursor + 2]);
+            if (op == spv::OpFunction) {
+                function = names[words[cursor + 2]];
+                if (function == "bda_anchor_range") ++anchorFunctions;
+            }
+            if (op == spv::OpFunctionCall && function == "main") {
+                const auto& callee = names[words[cursor + 3]];
+                ++mainCalls[callee];
+                if (callee == "bda_anchor_range") require(mainCalls["probe_bda_pointer"] == 0u && mainCalls["get_bda_pointer"] == 0u, "BDA anchors: the anchor is searched after a read");
+            }
+            if (op == spv::OpBranchConditional && function == "main" && mainCalls["bda_anchor_range"] == 0u) ++mainBranchesBefore;
+            if (op == spv::OpVariable && words[cursor + 3] == spv::StorageClassPrivate) privateVariables.insert(words[cursor + 2]);
+            if (function == "probe_bda_pointer" && ((op == spv::OpLoad && privateVariables.contains(words[cursor + 3])) || (op == spv::OpStore && privateVariables.contains(words[cursor + 1])))) ++probePrivateAccesses;
+            cursor += length;
+        }
+        require(anchorFunctions == (anchored ? 1u : 0u), "BDA anchors: the anchor search is defined without anchored reads, or twice");
+        require(mainCalls["bda_anchor_range"] == (anchored ? 1u : 0u), "BDA anchors: reads of one user data base do not share one anchor");
+        // At most the branch to the elected lane that searches for the subgroup comes before it.
+        require(!anchored || mainBranchesBefore <= 1u, "BDA anchors: the anchor is not searched at the program's entry");
+        // The lookups of a program with anchors keep no state (cache, hint) in Private variables.
+        require(!anchored || probePrivateAccesses == 0u, "BDA anchors: the lookups of an anchored program keep Private state");
+        require(anchored || probePrivateAccesses != 0u, "BDA anchors: the lookups of a program without anchors lost their state");
+        // Every read, anchored or not, keeps one probe call for the spans the anchor does not hold.
+        require(mainCalls["probe_bda_pointer"] == loads + 1u, "BDA anchors: a read lost its lookup path");
+    }
+}
+
 void verifyFunctionLdsBound() {
     using namespace ShaderRecompiler;
     const auto build = [](const auto& body) {
@@ -1948,6 +2188,8 @@ int main(int argc, char** argv) {
         require(argc == 1, "unknown shader memory test arguments");
         verifyRegisterSources();
         verifyEvaluatedValues();
+        verifyMayEvaluate();
+        verifyDroppedConditions();
         verifyPureFlatSlots();
         verifyBindlessTable();
         verifyDescriptorPhis();
@@ -1967,6 +2209,7 @@ int main(int argc, char** argv) {
         verifyWaveUniformValues();
         verifyTwoLaneUniformValues();
         verifyBdaReadFallbackFunctions();
+        verifyBdaAnchors();
         verifyFunctionLdsBound();
 #if ANYPS5_ENABLE_SPIRV_TOOLS
         const std::vector<std::uint32_t> minimalSpirv{

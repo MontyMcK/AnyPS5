@@ -1103,6 +1103,7 @@ bool WaitForLeases() noexcept {
             if (recorder != nullptr && recorder == state.leaseRecorder && target > state.finishedLeaseSerial) {
                 // The open batch may be the target; FinishUpTo waits front to back up to it only.
                 Recorder::CountSync(4);
+                Recorder::AnnounceSubmit(Recorder::SubmitReason::Lease);
                 recorder->Submit();
                 recorder->FinishUpTo(target);
                 state.finishedLeaseSerial = target;
@@ -1983,9 +1984,16 @@ void GuestBufferMemory::addDescriptorRegion(std::uint64_t address, std::size_t b
     regionsSorted = false;
 }
 
-void GuestBufferMemory::AddWritable(std::uint64_t address, std::size_t bytes, bool atomic) {
+void GuestBufferMemory::AddWritable(std::uint64_t address, std::size_t bytes, bool atomic, const BufferElementUsage* usage) {
+    const auto count = regions.size();
     addDescriptorRegion(address, bytes, atomic);
     writes.emplace_back(address, address + bytes);
+    // The element's usage goes with its region (none was added inside a base region of the
+    // address space: those builds are never elided).
+    if (usage == nullptr || regions.size() == count) return;
+    auto& region = regions.back();
+    region.read = usage->read || atomic;
+    if (!region.read && !usage->covers.empty()) region.elements.push_back({address, usage->words, usage->covers});
 }
 
 void GuestBufferMemory::AddReadable(std::uint64_t address, std::size_t bytes) {
@@ -2290,6 +2298,8 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             }
             mergeBacked(previous, region);
             previous.atomic = previous.atomic || region.atomic;
+            previous.read = previous.read || region.read;
+            previous.elements.insert(previous.elements.end(), std::make_move_iterator(region.elements.begin()), std::make_move_iterator(region.elements.end()));
             // A range starting before the mirror (only possible after the swap) keeps its prefix; the
             // earlier merged region ends at or before it, so the merged list stays sorted.
             previous.begin = std::min(previous.begin, region.begin);
@@ -2411,6 +2421,12 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
 void GuestBufferMemory::UploadFinish(bool addressable) {
     Require(prepared && !uploaded, "guest memory upload was not prepared");
     uploaded = true;
+    BeginElisionUse();
+    uploadFinishing = true;
+    struct Finishing {
+        bool& flag;
+        ~Finishing() { flag = false; }
+    } finishing{uploadFinishing};
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto started = std::chrono::steady_clock::now();
     // Registered ranges to import from. Address-based shaders hold their lease until write-back;
@@ -2561,7 +2577,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             static const bool bdaFlush = std::getenv("APS5_BDA_FLUSH") != nullptr;
             static const bool traceRegions = std::getenv("APS5_TRACE_FLUSH") != nullptr;
             if (traceRegions && bytes >= 0x40000) std::fprintf(stderr, "[region] direct 0x%llx+0x%llx writable %d addressable %d hostBacked %d\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(bytes), region.writable ? 1 : 0, addressable ? 1 : 0, region.hostBacked ? 1 : 0);
-            if (!(addressable && region.hostBacked) || bdaFlush) StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "imported buffer region");
+            if (!(addressable && region.hostBacked) || bdaFlush) flushBoundRegion(region, "imported buffer region", addressable, false);
             continue;
         }
         if (copyOnGpu) {
@@ -2571,7 +2587,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
             // reconcile retires is handed to it (retireImport keeps nothing while the recorder is
             // idle) and outlives the copy.
             static_cast<void>(recorder->OpenBatch());
-            StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
+            flushBoundRegion(region, "copied buffer region", addressable, true);
             region.gpuCopy = true;
             gpuCopies.push_back(&region);
             continue;
@@ -2588,6 +2604,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     }
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
     takeHeapReferences();
+    armCanaries();
     if (!profile) return;
     const auto loopUs = microsecondsSince(loopStart);
     readUs.fetch_add(refreshUs, std::memory_order_relaxed);
@@ -3330,6 +3347,347 @@ HostImportsProof HostImportsIdentity(const Context& context) {
     const ForkGuard lock(state.mutex);
     if (importsStale(context, state)) return {};
     return {state.device, state.epoch, state.refreshedGeneration};
+}
+
+// The write-back elision by buffer usage (see StorageUsageElide in GuestBufferMemory.hpp).
+namespace {
+
+thread_local const ShaderRecompiler::DispatchGrid* currentGrid = nullptr;
+
+// The canary the verify mode fills into the elided units after their write-back.
+constexpr std::uint32_t ElideCanary = 0x9e3779b9u;
+
+enum ElideRefusal : std::size_t { RefusedRead, RefusedNoCovers, RefusedNoGrid, RefusedAddressable, RefusedOtherWrites, RefusedNotCovered, RefusedImages, RefusedNoUnits, RefusalCount };
+constexpr const char* ElideRefusalNames[RefusalCount] = {"read", "no covers", "no grid", "address-based", "image writes", "not covered", "images", "no whole units"};
+
+struct ElideStats {
+    std::atomic<std::uint64_t> regions{0};
+    std::atomic<std::uint64_t> planned{0};
+    std::atomic<std::uint64_t> droppedUnits{0};
+    std::atomic<std::uint64_t> droppedBytes{0};
+    std::array<std::atomic<std::uint64_t>, RefusalCount> refused{};
+    std::atomic<std::uint64_t> verifyRegions{0};
+    std::atomic<std::uint64_t> verifyBytes{0};
+    std::atomic<std::uint64_t> verifyReadBytes{0};
+    std::atomic<std::uint64_t> verifyCanaryWords{0};
+    std::atomic<std::uint64_t> verifyUnchecked{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+ElideStats& Elision() {
+    static ElideStats stats;
+    return stats;
+}
+
+void reportElision() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& stats = Elision();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = stats.lastReport.load();
+    if (last == 0) {
+        stats.lastReport.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !stats.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
+    const auto regions = take(stats.regions);
+    const auto planned = take(stats.planned);
+    const auto units = take(stats.droppedUnits);
+    const auto dropped = take(stats.droppedBytes);
+    std::string refused;
+    for (std::size_t why = 0; why < RefusalCount; ++why) {
+        const auto count = take(stats.refused[why]);
+        if (count == 0) continue;
+        char part[48];
+        std::snprintf(part, sizeof(part), "%s %s %llu", refused.empty() ? "" : ",", ElideRefusalNames[why], static_cast<unsigned long long>(count));
+        refused += part;
+    }
+    // The GPU cost of a MiB written back as the last [gputime] window measured it (APS5_PROFILE_GPU),
+    // else the map's measurement (5.21 ms for 72.9 MiB per frame).
+    const auto measured = Recorder::StorageWritebackMsPerMiB();
+    const double msPerMiB = measured > 0 ? measured : 5.21 / 72.9;
+    const double droppedMiB = static_cast<double>(dropped) / 1048576.0;
+    const auto presents = Recorder::Presents();
+    static std::atomic<std::uint64_t> lastPresents{0};
+    const auto frames = presents - lastPresents.exchange(presents, std::memory_order_relaxed);
+    const double perFrame = frames != 0 ? 1.0 / static_cast<double>(frames) : 0.0;
+    AgcDriver::ProfilePrint_nid_no_patch("[storage] usage elide (10 s, %s): %llu regions elided, %llu units / %.1f MiB not written back of %.1f MiB planned, ~%.1f ms GPU saved at %.4f ms/MiB %s (per present %.2f MiB, %.2f ms); refused:%s; verify: %llu regions, %.1f MiB checked, %llu bytes read under them, %llu canary words left (repaired), %llu unchecked\n",
+        StorageUsageVerify() ? "verify" : StorageUsageElide() ? "on" : "off", static_cast<unsigned long long>(regions), static_cast<unsigned long long>(units), droppedMiB, static_cast<double>(planned) / 1048576.0, droppedMiB * msPerMiB, msPerMiB, measured > 0 ? "measured" : "assumed",
+        droppedMiB * perFrame, droppedMiB * msPerMiB * perFrame, refused.empty() ? " none" : refused.c_str(),
+        static_cast<unsigned long long>(take(stats.verifyRegions)), static_cast<double>(take(stats.verifyBytes)) / 1048576.0, static_cast<unsigned long long>(take(stats.verifyReadBytes)), static_cast<unsigned long long>(take(stats.verifyCanaryWords)), static_cast<unsigned long long>(take(stats.verifyUnchecked)));
+}
+
+// Sorted and merged copies of `ranges` (empty ones left out).
+std::vector<std::pair<std::uint64_t, std::uint64_t>> mergedRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    std::sort(ranges.begin(), ranges.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    for (const auto& range : ranges) {
+        if (range.first >= range.second) continue;
+        if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+        else merged.push_back(range);
+    }
+    return merged;
+}
+
+}
+
+namespace {
+std::atomic<int> elideOverride{-1};
+std::atomic<int> verifyOverride{-1};
+}
+
+bool StorageUsageElide() {
+    if (const auto forced = elideOverride.load(std::memory_order_relaxed); forced >= 0) return forced != 0;
+    static const bool requested = std::getenv("APS5_STORAGE_USAGE_ELIDE") != nullptr;
+    return LiveFlag("storage_usage_elide", requested);
+}
+
+bool StorageUsageVerify() {
+    if (const auto forced = verifyOverride.load(std::memory_order_relaxed); forced >= 0) return forced != 0;
+    static const bool requested = std::getenv("APS5_STORAGE_USAGE_ELIDE_VERIFY") != nullptr;
+    return LiveFlag("storage_usage_elide_verify", requested);
+}
+
+void SetStorageUsageModes(std::optional<bool> elide, std::optional<bool> verify) {
+    elideOverride.store(elide.has_value() ? (*elide ? 1 : 0) : -1, std::memory_order_relaxed);
+    verifyOverride.store(verify.has_value() ? (*verify ? 1 : 0) : -1, std::memory_order_relaxed);
+}
+
+StorageUsageCounts CurrentStorageUsageCounts() {
+    auto& stats = Elision();
+    StorageUsageCounts counts;
+    counts.elidedRegions = stats.regions.load(std::memory_order_relaxed);
+    counts.droppedUnits = stats.droppedUnits.load(std::memory_order_relaxed);
+    counts.droppedBytes = stats.droppedBytes.load(std::memory_order_relaxed);
+    counts.verifyRegions = stats.verifyRegions.load(std::memory_order_relaxed);
+    counts.canaryWords = stats.verifyCanaryWords.load(std::memory_order_relaxed);
+    counts.readBytes = stats.verifyReadBytes.load(std::memory_order_relaxed);
+    for (const auto& refused : stats.refused) counts.refused += refused.load(std::memory_order_relaxed);
+    return counts;
+}
+
+const ShaderRecompiler::DispatchGrid* CurrentDispatchGrid() {
+    return currentGrid;
+}
+
+DispatchGridScope::DispatchGridScope(const ShaderRecompiler::DispatchGrid& grid) : grid(grid), previous(currentGrid) {
+    currentGrid = &this->grid;
+}
+
+DispatchGridScope::~DispatchGridScope() {
+    currentGrid = previous;
+}
+
+void GuestBufferMemory::BeginElisionUse() {
+    elided.clear();
+}
+
+void GuestBufferMemory::FlushBoundRange(std::uint64_t begin, std::uint64_t end, const char* reason) {
+    const auto found = std::find_if(regions.begin(), regions.end(), [&](const Region& region) { return region.begin == begin && region.end == end; });
+    if (found != regions.end()) {
+        flushBoundRegion(*found, reason, HoldsLease(), found->gpuCopy);
+        return;
+    }
+    StorageTexture::FlushPending(begin, static_cast<std::size_t>(end - begin), nullptr, reason);
+}
+
+void GuestBufferMemory::flushBoundRegion(const Region& region, const char* reason, bool addressable, bool copied) {
+    if (elideFlush(region, reason, addressable, copied)) return;
+    StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(region.end - region.begin), nullptr, reason);
+}
+
+bool GuestBufferMemory::elideFlush(const Region& region, const char* reason, bool addressable, bool copied) {
+    const bool verify = StorageUsageVerify();
+    if (!verify && !StorageUsageElide()) return false;
+    const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+    // Nothing pending over the region: the plain flush stores nothing (it may still publish unit
+    // shadows), and nothing is counted.
+    const std::pair<std::uint64_t, std::uint64_t> whole{region.begin, region.end};
+    if (!StorageTexture::AnyPendingOverlaps(std::span(&whole, 1))) return false;
+    auto& stats = Elision();
+    // Debug aid: APS5_TRACE_USAGE_ELIDE=1 names the first regions elided and refused (with why).
+    static const bool trace = std::getenv("APS5_TRACE_USAGE_ELIDE") != nullptr;
+    const auto refuse = [&](ElideRefusal why) {
+        stats.refused[why].fetch_add(1, std::memory_order_relaxed);
+        if (trace) {
+            static std::atomic<int> traced{0};
+            std::size_t covers = 0;
+            for (const auto& element : region.elements) covers += element.covers.size();
+            if (traced.fetch_add(1, std::memory_order_relaxed) < 400) std::fprintf(stderr, "[usage-elide] %s 0x%llx+0x%zx refused (%s): read %d atomic %d, %zu write-only elements with %zu covers, grid %s\n", reason, static_cast<unsigned long long>(region.begin), bytes, ElideRefusalNames[why], region.read ? 1 : 0, region.atomic ? 1 : 0, region.elements.size(), covers, CurrentDispatchGrid() != nullptr ? "set" : "none");
+        }
+        reportElision();
+        return false;
+    };
+    if (region.read || region.atomic) return refuse(RefusedRead);
+    if (region.elements.empty()) return refuse(RefusedNoCovers);
+    if (addressable || region.mirror != nullptr || region.sparse) return refuse(RefusedAddressable);
+    const auto* grid = CurrentDispatchGrid();
+    if (grid == nullptr) return refuse(RefusedNoGrid);
+    // The bytes the dispatch's stores overwrite, as guest ranges inside the region.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> covered;
+    for (const auto& element : region.elements) {
+        for (const auto& cover : element.covers) {
+            const auto range = ShaderRecompiler::CoveredBufferBytes(cover, *grid, std::span<const std::uint32_t, 4>(element.words));
+            if (!range.has_value()) continue;
+            const auto begin = std::max(region.begin, element.base + range->first);
+            const auto end = std::min(region.end, element.base + range->second);
+            if (begin < end) covered.emplace_back(begin, end);
+        }
+    }
+    covered = mergedRanges(std::move(covered));
+    if (covered.empty()) return refuse(RefusedNotCovered);
+    for (const auto& [begin, end] : otherWrites) {
+        if (begin < region.end && region.begin < end) return refuse(RefusedOtherWrites);
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> units;
+    if (!StorageTexture::CoveredUnits(region.begin, bytes, covered, units)) return refuse(RefusedImages);
+    if (units.empty()) return refuse(RefusedNoUnits);
+    std::uint64_t unitBytes = 0;
+    for (const auto& [begin, end] : units) unitBytes += end - begin;
+    if (verify) {
+        // The write-back as without the elision, then the checks: what the dispatch reads under the
+        // units (regions of this upload that may be read; none by construction), and a canary in
+        // the units, which the dispatch must overwrite whole (host-imported regions only). The
+        // import table's epoch is taken before the flush, whose reconcile may drop the import.
+        std::uint64_t importsEpochNow = 0;
+        {
+            auto& state = Imports();
+            std::lock_guard lock(state.mutex);
+            importsEpochNow = state.epoch;
+        }
+        StorageTexture::FlushPending(region.begin, bytes, nullptr, reason);
+        std::uint64_t readBytes = 0;
+        for (const auto& other : regions) {
+            if (!other.read) continue;
+            for (const auto& [begin, end] : units) {
+                const auto from = std::max(begin, other.begin);
+                const auto to = std::min(end, other.end);
+                if (from < to) readBytes += to - from;
+            }
+        }
+        stats.verifyRegions.fetch_add(1, std::memory_order_relaxed);
+        stats.verifyBytes.fetch_add(unitBytes, std::memory_order_relaxed);
+        stats.verifyReadBytes.fetch_add(readBytes, std::memory_order_relaxed);
+        if (readBytes != 0) std::fprintf(stderr, "[storage] usage elide verify: the dispatch reads %llu bytes under the units it would elide in 0x%llx+0x%zx\n", static_cast<unsigned long long>(readBytes), static_cast<unsigned long long>(region.begin), bytes);
+        // The canary goes in at the end of UploadFinish (armCanaries), after every region's import
+        // is confirmed and its GPU copies are recorded; a reused build's proof checks no canary.
+        const bool canary = uploadFinishing && !copied && region.direct != nullptr && !region.gpuCopy && region.begin >= region.direct->base;
+        for (const auto& [begin, end] : units) {
+            ElidedRange range{begin, end, {}, false, true};
+            range.wantsCanary = canary;
+            // The import serving the region was confirmed by UploadFinish just before this flush:
+            // the canary goes in only while no import was dropped since.
+            range.importsEpoch = importsEpochNow;
+            range.copied = copied;
+            if (!canary) stats.verifyUnchecked.fetch_add(1, std::memory_order_relaxed);
+            elided.push_back(std::move(range));
+        }
+        reportElision();
+        return true;
+    }
+    // Everything over the region but the units is stored as before; unit shadows over the units
+    // (stores that already happened) still reach the import ahead of the dispatch.
+    auto cursor = region.begin;
+    for (const auto& [begin, end] : units) {
+        if (cursor < begin) StorageTexture::FlushPending(cursor, static_cast<std::size_t>(begin - cursor), nullptr, reason);
+        static_cast<void>(StorageTexture::PublishShadowsOnly(begin, static_cast<std::size_t>(end - begin), PublishScope::Whole, reason));
+        cursor = end;
+        ElidedRange range{begin, end, {}, false, false};
+        range.copied = copied;
+        elided.push_back(std::move(range));
+    }
+    if (cursor < region.end) StorageTexture::FlushPending(cursor, static_cast<std::size_t>(region.end - cursor), nullptr, reason);
+    stats.regions.fetch_add(1, std::memory_order_relaxed);
+    stats.planned.fetch_add(unitBytes, std::memory_order_relaxed);
+    if (trace) {
+        static std::atomic<int> traced{0};
+        if (traced.fetch_add(1, std::memory_order_relaxed) < 200) std::fprintf(stderr, "[usage-elide] %s 0x%llx+0x%zx: %zu unit ranges, %.1f KiB not written back (grid %ux%ux%u of %ux%ux%u)\n", reason, static_cast<unsigned long long>(region.begin), bytes, units.size(), static_cast<double>(unitBytes) / 1024.0, grid->groups[0], grid->groups[1], grid->groups[2], grid->groupSize[0], grid->groupSize[1], grid->groupSize[2]);
+    }
+    return true;
+}
+
+void GuestBufferMemory::armCanaries() {
+    if (std::none_of(elided.begin(), elided.end(), [](const ElidedRange& range) { return range.wantsCanary; })) return;
+    auto* recorder = Recorder::Active();
+    // The write-backs must have landed before their bytes are kept for the repair.
+    if (recorder != nullptr) recorder->Sync();
+    for (auto& range : elided) {
+        if (!range.wantsCanary) continue;
+        range.wantsCanary = false;
+        const auto* region = owner(range.begin);
+        bool importLive = false;
+        {
+            // A dropped import (a later flush's reconcile) may be kept only by the batch the Sync
+            // above completed: its buffer is not written then.
+            auto& state = Imports();
+            std::lock_guard lock(state.mutex);
+            importLive = state.epoch == range.importsEpoch;
+        }
+        const bool usable = importLive && recorder != nullptr && region != nullptr && region->direct != nullptr && !region->gpuCopy && range.begin >= region->direct->base && range.end <= region->end && range.end - region->direct->base <= region->direct->bytes && (range.end - range.begin) % 4u == 0u && (range.begin - region->direct->base) % 4u == 0u;
+        if (!usable || !GuestMemory::Accessible(reinterpret_cast<const void*>(range.begin), static_cast<std::size_t>(range.end - range.begin), true)) {
+            Elision().verifyUnchecked.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        const auto* source = reinterpret_cast<const std::byte*>(range.begin);
+        range.stored.assign(source, source + (range.end - range.begin));
+        range.canary = true;
+        const auto commands = recorder->Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, region->direct->buffer, range.begin - region->direct->base, range.end - range.begin, ElideCanary);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    }
+}
+
+void GuestBufferMemory::DropElided(bool copied) {
+    if (elided.empty()) return;
+    // This call's ranges; the other kind waits for its own call.
+    std::vector<ElidedRange> taken;
+    for (auto it = elided.begin(); it != elided.end();) {
+        if (it->copied != copied) {
+            ++it;
+            continue;
+        }
+        taken.push_back(std::move(*it));
+        it = elided.erase(it);
+    }
+    if (taken.empty()) return;
+    auto& stats = Elision();
+    // Units the elision skipped (not verify ranges, whose units were stored): dropped now that the
+    // dispatch overwriting them is recorded.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    for (const auto& range : taken) {
+        if (!range.verify) ranges.emplace_back(range.begin, range.end);
+    }
+    if (!ranges.empty()) {
+        ranges = mergedRanges(std::move(ranges));
+        const auto [units, bytes] = StorageTexture::DropCoveredUnits(ranges);
+        stats.droppedUnits.fetch_add(units, std::memory_order_relaxed);
+        stats.droppedBytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+    // Verify ranges: the dispatch must have overwritten every canary word. A word still holding it
+    // was not stored by the dispatch, where the elision would have lost the image's results: it is
+    // repaired from the write-back's bytes. (A dispatch storing the canary value itself would be
+    // reported and repaired too: a debug mode's false alarm, at 1 in 2^32 per word.)
+    if (std::any_of(taken.begin(), taken.end(), [](const ElidedRange& range) { return range.canary; })) {
+        if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->Sync();
+        for (const auto& range : taken) {
+            if (!range.canary) continue;
+            auto* words = reinterpret_cast<std::uint32_t*>(range.begin);
+            const auto count = static_cast<std::size_t>((range.end - range.begin) / 4u);
+            std::size_t left = 0;
+            for (std::size_t index = 0; index < count; ++index) {
+                if (words[index] != ElideCanary) continue;
+                std::memcpy(&words[index], range.stored.data() + index * 4u, 4u);
+                ++left;
+            }
+            if (left == 0) continue;
+            GuestMemory::MarkWritten(range.begin, static_cast<std::size_t>(range.end - range.begin));
+            stats.verifyCanaryWords.fetch_add(left, std::memory_order_relaxed);
+            std::fprintf(stderr, "[storage] usage elide verify: %zu of %zu words of 0x%llx+0x%llx kept the canary after the dispatch (repaired): its store cover claimed bytes the dispatch did not write\n", left, count, static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end - range.begin));
+        }
+    }
+    reportElision();
 }
 
 }

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/CpuTimeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -104,7 +105,7 @@ void Driver::execute(const Submission& submission) {
             if (const auto localDevice = device.Load()) {
                 recordDeferredLabels(localDevice.get(), submission.queue);
                 if (suspendDrain) localDevice->WaitIdle();
-                else localDevice->SubmitRecorded(submission.queue == 0);
+                else localDevice->SubmitRecorded(submission.queue == 0, Graphics::Recorder::SubmitReason::Suspend);
             }
             ++costs.suspends;
             if (profile) costs.suspendNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
@@ -350,7 +351,7 @@ void Driver::execute(const Submission& submission) {
                 flipMark(0);
                 const auto localDevice = device.Load();
 
-                if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
+                if (!recordLabelsForPacket(localDevice.get(), submission.queue) && localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0, Graphics::Recorder::SubmitReason::Flip);
                 flipMark(1);
                 if (localDevice != nullptr) localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
                 flipMark(2);
@@ -372,6 +373,7 @@ void Driver::execute(const Submission& submission) {
                 }
             } flipReport{flipSplit, flipMs, flipStart};
             ++flipsCounted;
+            if (Graphics::CpuTimeline::Active()) Graphics::CpuTimeline::Event("flip", flipStart, std::chrono::steady_clock::now(), submission.queue, batchesAtFlip);
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;
 
@@ -504,7 +506,7 @@ void Driver::execute(const Submission& submission) {
         const auto localDevice = device.Load();
 
         recordDeferredLabels(localDevice.get(), submission.queue);
-        if (localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0);
+        if (localDevice != nullptr) localDevice->SubmitRecorded(submission.queue == 0, Graphics::Recorder::SubmitReason::SubmissionEnd);
     }
     endTiming.Finish();
     if (submission.rewindTail != nullptr) executeRewindTail(submission);

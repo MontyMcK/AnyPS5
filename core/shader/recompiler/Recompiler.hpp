@@ -3,6 +3,7 @@
 
 #include "RuntimeAbi.hpp"
 #include "PipelineSpecialization.hpp"
+#include "BufferStoreCover.hpp"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -366,6 +367,14 @@ struct DescriptorBinding {
     // skip the write-back and the pending-write note for the element; an element beyond the vector
     // (a producer that does not fill it) must be treated as written.
     std::vector<bool> bufferWritten;
+    // Guest buffer elements the shader loads from or updates atomically through this V#, one entry
+    // per element of a GuestBuffers binding, empty otherwise. A false entry is proved: the element
+    // is never read (it may still be stored to). An element beyond the vector must be treated as read.
+    std::vector<bool> bufferRead;
+    // Per element of a GuestBuffers binding (empty otherwise, or an empty list for an element): raw
+    // stores every invocation of a compute dispatch makes through the V# (BufferStoreCover). A driver
+    // evaluates them for a dispatch with CoveredBufferBytes: bytes the dispatch is proved to write.
+    std::vector<std::vector<BufferStoreCover>> bufferCovers;
     std::vector<bool> samplerUnnormalized;
     std::vector<bool> imageUnnormalized;
     std::vector<std::uint64_t> imageSamplers;

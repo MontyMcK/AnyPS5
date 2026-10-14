@@ -45,6 +45,25 @@ void EmitBdaClockReport(SpirvEmitterState& state);
 // Whether `inst` reads through a scalar memory instruction (its address is wave-uniform).
 bool ScalarBdaAccess(const IrProgram& program, const IrValue& inst);
 std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, bool subtract);
+// Anchors (SpirvEmitterState::BdaAnchor): CollectBdaAnchors lists the user data register pairs that
+// reads use as their base (after the lookups are defined), EmitBdaAnchors finds their ranges at the
+// program's entry, FindBdaAnchor returns the anchor of a read (null when it has none or the
+// anchors are off).
+void CollectBdaAnchors(SpirvEmitterState& state);
+void DefineBdaAnchorFunction(SpirvEmitterState& state);
+void EmitBdaAnchors(SpirvEmitterState& state);
+// The range holding `base` (u64) into `anchor`. `base` must be the same in every invocation of the
+// subgroup: with subgroup ballots the subgroup's elected lane searches for all.
+void EmitBdaAnchorRange(SpirvEmitterState& state, SpirvEmitterState::BdaAnchor& anchor, std::uint32_t base);
+const SpirvEmitterState::BdaAnchor* FindBdaAnchor(const SpirvEmitterState& state, const IrValue& inst);
+// A read at base + zext(low) + immediate, base being the anchor's: of `bits` 8 or 16 (the value
+// in [0]), or 32: the `used` dwords of `dwords` (0 for the others). Where the anchor holds the
+// read (and, for dwords, its device address is 4-aligned) one branch leads to the loads; elsewhere
+// `lookup` emits the read through the lookups, which checks the address arithmetic and records the
+// faults, exactly as without the anchor.
+std::array<std::uint32_t, 4> EmitAnchoredBdaRead(SpirvEmitterState& state, const IrValue& inst, const SpirvEmitterState::BdaAnchor& anchor, std::uint32_t low, std::int32_t immediate, std::uint32_t bits, std::uint32_t dwords, std::uint32_t used, const std::function<std::array<std::uint32_t, 4>()>& lookup);
+// The dwords of a wide read the program extracts (see EmitBdaDwordReads).
+std::uint32_t UsedBdaReadDwords(const IrValue& inst, std::uint32_t dwords);
 std::uint32_t AddBdaImmediate(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::int32_t immediate);
 
 }

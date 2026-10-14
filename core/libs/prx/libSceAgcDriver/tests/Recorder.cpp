@@ -3,7 +3,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/CpuTimeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DeferredVulkan.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawSpeculation.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -37,12 +40,16 @@
 #include <atomic>
 #include <cmath>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -353,6 +360,240 @@ void afterRecordedWorkTests(const Device& device, Recorder& recorder) {
     recorder.Sync();
     Require(ran == std::vector<int>{1, 2, 3} && Recorder::PendingCompletionLabels() == 0 && recorder.Idle(), "actions behind recorded work did not run once each, in order");
     Require(seen == 1, "an action ran before the completion label recorded ahead of it");
+}
+
+// Submit reasons: an announced reason names exactly the next Submit (and is consumed by one with
+// nothing open), a sync takes the reason of its CountSync source, SubmitIfStarved counts as a
+// starve submit, and the completion ring carries the reason. With APS5_PROFILE_SUBMITS=1 a batch
+// submitted to an idle GPU is flagged starved.
+void submitReasonTests(const Device& device, Recorder& recorder) {
+    using Reason = Recorder::SubmitReason;
+    recorder.Sync();
+    device.WaitQueue();
+    const auto delta = [](const Recorder::SubmitStatistics& before, Reason reason) {
+        const auto now = Recorder::SubmitCounts();
+        return now.batches[static_cast<std::size_t>(reason)] - before.batches[static_cast<std::size_t>(reason)];
+    };
+    const auto lastReason = [&](std::uint64_t serial) {
+        recorder.Sync();
+        std::size_t missing = 0;
+        const auto batches = recorder.CompletedBatches(serial - 1, serial, missing);
+        Require(missing == 0 && batches.size() == 1, "submit reasons: a finished batch has no completion record");
+        return batches.front();
+    };
+    auto before = Recorder::SubmitCounts();
+    Recorder::AnnounceSubmit(Reason::Eop);
+    recorder.NotePendingWrite(0x70000, 0x100);
+    auto serial = recorder.Submissions() + 1;
+    recorder.Submit();
+    Require(delta(before, Reason::Eop) == 1 && lastReason(serial).reason == Reason::Eop, "an announced submit reason was not counted for its batch");
+    // An announcement consumed by a Submit with nothing open does not name the next batch.
+    before = Recorder::SubmitCounts();
+    Recorder::AnnounceSubmit(Reason::Flip);
+    recorder.Submit();
+    recorder.NotePendingWrite(0x70000, 0x100);
+    serial = recorder.Submissions() + 1;
+    recorder.Submit();
+    Require(delta(before, Reason::Flip) == 0 && delta(before, Reason::Other) == 1 && lastReason(serial).reason == Reason::Other, "an announcement outlived the empty submit that consumed it");
+    // A sync names its submit after its source.
+    before = Recorder::SubmitCounts();
+    recorder.NotePendingWrite(0x70000, 0x100);
+    serial = recorder.Submissions() + 1;
+    Recorder::CountSync(1);
+    recorder.Sync();
+    Require(delta(before, Reason::SyncPendingWrite) == 1 && lastReason(serial).reason == Reason::SyncPendingWrite, "a pending-write sync's submit was not named after its source");
+    // SubmitIfStarved: below the minimum nothing goes, at it a starve submit (the GPU is idle).
+    before = Recorder::SubmitCounts();
+    recorder.NotePendingWrite(0x70000, 0x100);
+    for (int i = 0; i < 3; ++i) Recorder::CountRecordedWork();
+    Require(!recorder.SubmitIfStarved(4) && recorder.Recording(), "a starve submit went below the minimum work");
+    Recorder::CountRecordedWork();
+    serial = recorder.Submissions() + 1;
+    const bool aged = Recorder::StarveAge().count() != 0;
+    Require(recorder.SubmitIfStarved(4, aged), "an idle GPU with the minimum work recorded got no starve submit");
+    const auto starved = lastReason(serial);
+    Require(delta(before, Reason::Starve) == 1 && starved.reason == Reason::Starve, "a starve submit was not counted as one");
+    if (Recorder::SubmitProfiled()) Require(starved.starved, "a batch submitted to an idle GPU was not flagged starved");
+    std::cout << "submit reasons passed (starved flags " << (Recorder::SubmitProfiled() ? "checked" : "off") << ")\n";
+}
+
+// Live `starve_age` (APS5_STARVE_AGE_US): a starve submit of a young batch waits for its age unless
+// the caller goes idle (ignoreAge) or the batch holds four times the minimum work.
+void starveAgeTests(const Device& device, Recorder& recorder) {
+    const auto age = Recorder::StarveAge();
+    Require(age >= std::chrono::milliseconds(50), "starve age tests need APS5_STARVE_AGE_US >= 50000");
+    recorder.Sync();
+    device.WaitQueue();
+    recorder.NotePendingWrite(0x71000, 0x100);
+    for (int i = 0; i < 4; ++i) Recorder::CountRecordedWork();
+    const auto holds = Recorder::StarveAgeHolds();
+    Require(!recorder.SubmitIfStarved(4) && recorder.Recording() && Recorder::StarveAgeHolds() == holds + 1, "a young batch was starve-submitted before its age");
+    Require(recorder.SubmitIfStarved(4, true) && !recorder.Recording(), "a caller going idle did not get its young batch submitted");
+    recorder.Sync();
+    recorder.NotePendingWrite(0x71000, 0x100);
+    for (int i = 0; i < 16; ++i) Recorder::CountRecordedWork();
+    Require(recorder.SubmitIfStarved(4) && !recorder.Recording(), "a young batch with four times the minimum work was held");
+    recorder.Sync();
+    recorder.NotePendingWrite(0x71000, 0x100);
+    for (int i = 0; i < 4; ++i) Recorder::CountRecordedWork();
+    while (std::chrono::steady_clock::now() - recorder.OpenedAt() < age) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    Require(recorder.SubmitIfStarved(4) && !recorder.Recording(), "a batch past its age got no starve submit");
+    recorder.Sync();
+    std::cout << "starve age passed (" << age.count() << " us)\n";
+}
+
+// Live `fence_nodrain` with the recorder thread: finished batches reset their fences without
+// draining the stream, and the reused fences and command buffers keep working (stores land, every
+// batch completes in order).
+void fenceNoDrainTests(const Device& device, Recorder& recorder) {
+    Require(Recorder::FenceNoDrain(), "fence reset tests need APS5_FENCE_NO_DRAIN=1");
+    alignas(64) static std::uint32_t words[64] = {};
+    const auto context = device.GetContext();
+    Buffer target(context, sizeof(words), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    recorder.Sync();
+    const auto resets = Recorder::UndrainedFenceResets();
+    const auto first = recorder.Submissions() + 1;
+    // Retired by Reap alone (no fence wait, which would drain the stream itself): every reset is
+    // the undrained one once the stream returned from the batch's submit.
+    for (std::uint32_t round = 0; round < 16; ++round) {
+        const std::uint32_t value = round + 1;
+        recorder.RecordStore(target.Handle(), round * 4, std::as_bytes(std::span(&value, 1)), 0x72000 + round * 4);
+        recorder.Submit();
+    }
+    device.WaitQueue();
+    Require(recorder.Reap(), "finished batches were left in flight by a reap");
+    if (AgcDriver::Graphics::DeferredVulkanEnabled()) Require(Recorder::UndrainedFenceResets() >= resets + 16, "a reaped batch's fence reset drained the stream");
+    // The reused fences and command buffers: stores land and every batch completes.
+    for (std::uint32_t round = 16; round < 48; ++round) {
+        const std::uint32_t value = round + 1;
+        recorder.RecordStore(target.Handle(), (round % 64) * 4, std::as_bytes(std::span(&value, 1)), 0x72000 + (round % 64) * 4);
+        recorder.Submit();
+        if (round % 3 == 2) recorder.Reap();
+    }
+    recorder.Sync();
+    const auto last = recorder.Submissions();
+    std::size_t missing = 0;
+    const auto batches = recorder.CompletedBatches(first - 1, last, missing);
+    Require(missing == 0 && batches.size() == last - first + 1, "a batch with an undrained fence reset left no completion record");
+    const auto bytes = target.Bytes();
+    for (std::uint32_t round = 0; round < 48; ++round) {
+        std::uint32_t stored = 0;
+        std::memcpy(&stored, bytes.data() + (round % 64) * 4, 4);
+        Require(stored == round + 1, "a store recorded into a reused batch did not land");
+    }
+    if (AgcDriver::Graphics::DeferredVulkanEnabled()) Require(Recorder::UndrainedFenceResets() > resets, "no fence was reset without a stream drain");
+    std::cout << "fence resets without a stream drain passed (" << Recorder::UndrainedFenceResets() - resets << " undrained)\n";
+}
+
+// Recorder::KnownSourceBytes (driver `dma_known`): recorded label stores answer the dwords they
+// cover, uncovered dwords come from memory, and any other pending writer refuses.
+void knownSourceTests(Recorder& recorder) {
+    using Known = Recorder::KnownSource;
+    alignas(64) static std::uint32_t memory[8] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u, 0, 0, 0, 0};
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    recorder.Sync();
+    std::array<std::byte, 16> out{};
+    Require(Recorder::KnownSourceBytes(base, out) == Known::NotPending, "a range nothing writes was not reported as such");
+    Require(Recorder::KnownSourceBytes(base + 2, std::span(out).first(4)) == Known::Unaligned, "an unaligned source was accepted");
+    const std::uint32_t label = 0xabcd0001u;
+    recorder.NoteLabel(base + 4, std::as_bytes(std::span(&label, 1)), 1, 0);
+    Require(Recorder::KnownSourceBytes(base, out) == Known::Served, "a source covered by a recorded label was not served");
+    std::uint32_t words[4] = {};
+    std::memcpy(words, out.data(), sizeof(words));
+    Require(words[0] == 0x11111111u && words[1] == label && words[2] == 0x33333333u && words[3] == 0x44444444u, "a served source has the wrong bytes");
+    Require(memory[1] == 0x22222222u, "serving a known source stored to memory");
+    // A non-label writer over an uncovered dword, and one over the label's dword after it.
+    recorder.NotePendingWrite(base + 8, 4);
+    Require(Recorder::KnownSourceBytes(base, out) == Known::Unknown, "a non-label pending writer was answered from memory");
+    Require(Recorder::KnownSourceBytes(base, std::span(out).first(8)) == Known::Served, "a source left of a non-label writer was refused");
+    recorder.NotePendingWrite(base + 4, 4);
+    Require(Recorder::KnownSourceBytes(base + 4, std::span(out).first(4)) == Known::Unknown, "a label written over by a later writer was served");
+    recorder.Sync();
+    Require(Recorder::KnownSourceBytes(base, out) == Known::NotPending, "a finished batch still covers the source");
+    // This thread's queued (not yet recorded) label precedes a read on its queue.
+    recorder.NoteLabel(base + 16, std::as_bytes(std::span(&label, 1)), 2, 0);
+    Recorder::NoteQueuedLabel(base + 20, std::as_bytes(std::span(&label, 1)), 3, AgcDriver::GuestMemory::GpuLockThreadTag());
+    Require(Recorder::KnownSourceBytes(base + 16, std::span(out).first(8)) == Known::Queued, "a source over this thread's queued label was served");
+    Recorder::ForgetQueuedLabels();
+    recorder.Sync();
+    // A label whose value lands only through a completion, and a wide label over the source.
+    recorder.NotePendingWrite(base + 28, 4);
+    recorder.AfterCompletions(base + 16, std::as_bytes(std::span(&label, 1)), 4, 0, false);
+    Require(Recorder::KnownSourceBytes(base + 16, std::span(out).first(4)) == Known::Unknown, "a label behind a completion was served");
+    recorder.Sync();
+    std::array<std::byte, 128> wide{};
+    recorder.NoteLabel(base, wide, 5, 0);
+    Require(Recorder::KnownSourceBytes(base, std::span(out).first(8)) == Known::Unknown, "a source under a wide label was served");
+    recorder.Sync();
+    std::cout << "known DMA sources passed\n";
+}
+
+// cpu-timeline.txt (APS5_GPU_TIMELINE): submits and batches land with their reason, and events are
+// moved into the calibration's GPU domain. Run from a scratch directory (the file is written in
+// the working directory).
+void cpuTimelineTests(const Device& device, Recorder& recorder) {
+    Require(CpuTimeline::Window().second != 0, "timeline tests need APS5_GPU_TIMELINE");
+    const auto directory = std::filesystem::temp_directory_path() / ("aps5-cpu-timeline-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(directory);
+    const auto previous = std::filesystem::current_path();
+    std::filesystem::current_path(directory);
+    constexpr double offset = 1.0e12;
+    CpuTimeline::SetCalibration([](double& gpuNs, CpuTimeline::Clock::time_point& cpu) {
+        cpu = CpuTimeline::Clock::now();
+        gpuNs = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(cpu.time_since_epoch()).count()) + offset;
+        return true;
+    });
+    while (!CpuTimeline::Active()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    recorder.Sync();
+    device.WaitQueue();
+    CpuTimeline::Instant("probe", 7, 8, "text");
+    Recorder::AnnounceSubmit(Recorder::SubmitReason::Flip);
+    recorder.NotePendingWrite(0x73000, 0x100);
+    const auto serial = recorder.Submissions() + 1;
+    recorder.Submit();
+    recorder.Sync();
+    const auto point = CpuTimeline::Clock::now();
+    const auto mapped = CpuTimeline::FileTime(point);
+    const auto raw = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(point.time_since_epoch()).count());
+    Require(std::abs(mapped - raw - offset) < 1.0e6, "a CPU time was not moved into the calibration's domain");
+    CpuTimeline::SetCalibration({});
+    CpuTimeline::Flush();
+    std::ifstream file(directory / "cpu-timeline.txt");
+    Require(static_cast<bool>(file), "cpu-timeline.txt was not written");
+    std::string line;
+    bool calibration = false, probe = false, submit = false, batch = false;
+    const auto serialText = " " + std::to_string(serial) + " ";
+    while (std::getline(file, line)) {
+        calibration = calibration || line.rfind("# calibration gpu_ns", 0) == 0;
+        probe = probe || (line.find(" probe ") != std::string::npos && line.find(" 7 8 text") != std::string::npos);
+        submit = submit || (line.find(" submit ") != std::string::npos && line.find(serialText) != std::string::npos && line.find("flip") != std::string::npos);
+        batch = batch || (line.find(" batch ") != std::string::npos && line.find(serialText) != std::string::npos && line.find("flip/") != std::string::npos);
+    }
+    Require(calibration && probe && submit, "cpu-timeline.txt lacks the calibration, an event or the submit");
+    if (!batch) {
+        std::ifstream again(directory / "cpu-timeline.txt");
+        while (std::getline(again, line)) std::cerr << line << '\n';
+    }
+    Require(batch || !Recorder::BatchStampsEnabled(), "cpu-timeline.txt lacks the stamped batch");
+    file.close();
+    // The window's end closes the file at the next event (Active stays true until then).
+    const auto last = CpuTimeline::Window().second;
+    if (last - CpuTimeline::Clock::now().time_since_epoch().count() < 10'000'000'000ll) {
+        while (CpuTimeline::Clock::now().time_since_epoch().count() < last + 1'100'000'000ll) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        Require(CpuTimeline::Active(), "the open file did not keep the timeline active past the window");
+        CpuTimeline::Instant("late");
+        Require(!CpuTimeline::Active(), "the file was not closed after the window");
+        std::ifstream closed(directory / "cpu-timeline.txt");
+        std::string tail;
+        bool late = false;
+        while (std::getline(closed, tail)) late = late || tail.find(" late ") != std::string::npos;
+        Require(!late, "an event after the window was written");
+        std::cout << "cpu timeline window end closed the file\n";
+    }
+    std::filesystem::current_path(previous);
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+    std::cout << "cpu timeline passed\n";
 }
 
 void batchStampTests(Recorder& recorder) {
@@ -3280,6 +3521,723 @@ void pipelineCacheTests(const Device& device, bool benchmark) {
     std::cout << "Pipeline cache key and retained lifetime tests passed\n";
 }
 
+// The committer paths behind live `spec_key_hash`, `spec_pipeline` and `spec_own_pending`: the
+// resource cache's lookup with a precomputed hash, the pipeline store's peek and take, and the
+// pending verdict of a speculated proof.
+void commitPathTests(const Device& device) {
+    std::lock_guard gpu(GpuMutex());
+    const auto& context = device.GetContext();
+    struct Cleanup {
+        VkDevice device;
+        ~Cleanup() { ClearCachedPipelines(device); }
+    } cleanup{context.device};
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.variantId = 11;
+    fragment.variantId = 12;
+    vertex.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_vert_SPV), std::end(TRIANGLE_vert_SPV));
+    fragment.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_frag_SPV), std::end(TRIANGLE_frag_SPV));
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    State state{};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.hasColorTarget = true;
+    state.color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    state.colors.push_back(state.color);
+    state.blend.colorWriteMask = 15;
+    state.blends.push_back(state.blend);
+    auto resources = std::make_shared<ShaderResources>(context, shaders, state.color, 0, 0);
+    auto other = std::make_shared<ShaderResources>(context, shaders, state.color, 0, 0);
+
+    // Resource cache: a lookup with the key's hash answers as the plain one, absent and removed
+    // keys find nothing.
+    ResourceCache cache;
+    const ResourceCache::Key first{0xffffffffu, 1u, 2u, 3u, 4u, 5u};
+    const ResourceCache::Key second{0xffffffffu, 1u, 2u, 3u, 4u, 6u};
+    Require(ResourceCache::HashKey(first) != ResourceCache::HashKey(second), "fixture keys collide");
+    cache.Insert(first, resources);
+    cache.Insert(second, other);
+    Require(cache.Find(first, ResourceCache::HashKey(first)) == resources && cache.Find(first) == resources, "a hashed resource cache lookup missed its key");
+    Require(cache.Peek(second, ResourceCache::HashKey(second)) == other && cache.Peek(second) == other, "a hashed resource cache peek missed its key");
+    const ResourceCache::Key absent{0xffffffffu, 9u};
+    Require(cache.Find(absent, ResourceCache::HashKey(absent)) == nullptr && cache.Peek(absent, ResourceCache::HashKey(absent)) == nullptr, "a hashed lookup found an absent key");
+    cache.Remove(first);
+    Require(cache.Find(first, ResourceCache::HashKey(first)) == nullptr, "a hashed lookup found a removed key");
+
+    // Pipeline store: a peek has no side effects and finds only what CachedPipeline cached; a take
+    // returns CachedPipeline's answer while the entry stands, and nothing for other resources or
+    // once the entry is gone.
+    VertexInputLayout input;
+    Require(PeekCachedPipeline(context, state, input, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL).pipeline.expired(), "a peek found an uncached pipeline");
+    Require(PeekCachedPipeline(context, state, input, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL).pipeline.expired(), "a peek cached the pipeline it missed");
+    const auto cached = CachedPipeline(context, state, input, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+    Require(cached != nullptr, "the pipeline fixture did not build");
+    const auto peek = PeekCachedPipeline(context, state, input, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+    Require(peek.pipeline.lock() == cached && peek.resources == resources.get() && peek.device == context.device, "a peek missed a cached pipeline");
+    Require(TakePeekedPipeline(context, peek, *resources) == cached, "a take lost a standing peek");
+    Require(TakePeekedPipeline(context, peek, *other) == nullptr, "a take served other resources");
+    auto changed = state;
+    changed.cullMode = VK_CULL_MODE_BACK_BIT;
+    Require(PeekCachedPipeline(context, changed, input, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL).pipeline.expired(), "a peek ignored changed raster state");
+    Require(PeekCachedPipeline(context, state, input, *resources, shaders, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL).pipeline.expired(), "a peek ignored the attachment layout");
+    ClearCachedPipelines(context.device);
+    Require(TakePeekedPipeline(context, peek, *resources) == nullptr, "a take served a cleared entry");
+    const auto rebuilt = CachedPipeline(context, state, input, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+    Require(rebuilt != cached && TakePeekedPipeline(context, peek, *resources) == nullptr, "a take served a replaced entry");
+    Require(TakePeekedPipeline(context, PeekCachedPipeline(context, state, input, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL), *resources) == rebuilt, "a fresh peek missed the replacement");
+    vertex.variantId = 0;
+    Require(PeekCachedPipeline(context, state, input, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL).pipeline.expired(), "a peek served a private configuration");
+    vertex.variantId = 11;
+
+    // Pending verdicts: one query per surface; the own-source rule accepts only a view whose own
+    // image is what FindPending names.
+    using Verdict = ShaderResources::PendingVerdict;
+    using Surface = ShaderResources::ProofSpeculation::Surface;
+    const auto* own = reinterpret_cast<const StorageTexture*>(std::uintptr_t{0x1000});
+    const auto* foreign = reinterpret_cast<const StorageTexture*>(std::uintptr_t{0x2000});
+    const std::vector<Surface> surfaces{{0x10000, 0x1000, own, 1, 0, false}, {0x20000, 0x1000, nullptr, 1, 1, false}, {0x30000, 0x1000, foreign, 1, 0, true}};
+    std::vector<StorageTexture::PendingQuery> scan{{0x10000, 0x11000, own, nullptr, false, nullptr}, {0x20000, 0x21000, nullptr, nullptr, false, nullptr}, {0x30000, 0x31000, foreign, nullptr, false, nullptr}};
+    Require(ShaderResources::SpeculatedPendingVerdict(surfaces, scan, false) == Verdict::Clear, "a scan without overlaps refused");
+    scan[0].overlaps = true;
+    scan[0].found = own;
+    Require(ShaderResources::SpeculatedPendingVerdict(surfaces, scan, false) == Verdict::OwnSource, "an own-source overlap passed with the rule off");
+    Require(ShaderResources::SpeculatedPendingVerdict(surfaces, scan, true) == Verdict::Clear, "an own-source overlap refused with the rule on");
+    scan[0].found = foreign;
+    Require(ShaderResources::SpeculatedPendingVerdict(surfaces, scan, true) == Verdict::ForeignView, "a view under a foreign image passed");
+    scan[0].found = nullptr;
+    Require(ShaderResources::SpeculatedPendingVerdict(surfaces, scan, true) == Verdict::ForeignView, "a view without a named image passed");
+    scan[0].found = own;
+    scan[1].overlaps = true;
+    Require(ShaderResources::SpeculatedPendingVerdict(surfaces, scan, true) == Verdict::Snapshot, "a snapshot under pending results passed");
+    scan[1].overlaps = false;
+    scan[2].overlaps = true;
+    scan[2].found = foreign;
+    Require(ShaderResources::SpeculatedPendingVerdict(surfaces, scan, true) == Verdict::Storage, "a storage image under foreign results passed");
+    Require(ShaderResources::SpeculatedPendingVerdict(std::span<const Surface>(surfaces).first(1), scan, true) == Verdict::Snapshot, "a query without its surface passed");
+
+    // Recipes: without the switch every draw builds one, as before.
+    if (std::getenv("APS5_LIVE_FLAGS") != nullptr) {
+        std::cout << "recipe gate not tested: APS5_LIVE_FLAGS may override recipe_on_hit\n";
+    } else if (std::getenv("APS5_RECIPE_ON_HIT") == nullptr) {
+        static_cast<void>(TakeDrawRecipeSkips());
+        Require(DrawRecipeWanted(false) && DrawRecipeWanted(true) && TakeDrawRecipeSkips() == 0, "recipes were skipped with recipe_on_hit off");
+    } else {
+        static_cast<void>(TakeDrawRecipeSkips());
+        Require(!DrawRecipeWanted(false) && DrawRecipeWanted(true) && TakeDrawRecipeSkips() == 1, "recipe_on_hit did not skip exactly the missed keys' recipes");
+    }
+    std::cout << "Committer path tests (hashed cache lookups, pipeline peeks, pending verdicts, recipe gate) passed\n";
+}
+
+// Resource cache entry stamps (live `spec_entry_stamp`): a handle from Peek proves its entry while
+// the entry stands and moves it to the LRU front as Find does; a removal, an eviction, a replacement
+// under the key, a clear or an insert of the object elsewhere ends it.
+void entryStampTests(const Device& device) {
+    std::lock_guard gpu(GpuMutex());
+    const auto& context = device.GetContext();
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.variantId = 21;
+    fragment.variantId = 22;
+    vertex.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_vert_SPV), std::end(TRIANGLE_vert_SPV));
+    fragment.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_frag_SPV), std::end(TRIANGLE_frag_SPV));
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    ColorTarget color{};
+    color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    auto first = std::make_shared<ShaderResources>(context, shaders, color, 0, 0);
+    auto second = std::make_shared<ShaderResources>(context, shaders, color, 0, 0);
+    ResourceCache cache;
+    ResourceCache other;
+    const ResourceCache::Key a{0xffffffffu, 1u, 2u, 3u, 4u, 5u};
+    const ResourceCache::Key b{0xffffffffu, 1u, 2u, 3u, 4u, 6u};
+    const auto hashA = ResourceCache::HashKey(a);
+    cache.Insert(a, first);
+    cache.Insert(b, second);
+    ResourceCache::Handle handle;
+    Require(cache.Peek(a, hashA, handle) == first && handle.stamp != 0 && handle.cache == &cache, "a peek with a handle missed its entry");
+    ResourceCache::Handle absent;
+    Require(cache.Peek(ResourceCache::Key{0xffffffffu, 9u}, ResourceCache::HashKey(ResourceCache::Key{0xffffffffu, 9u}), absent) == nullptr && absent.stamp == 0, "a peek of an absent key handed out a stamp");
+    Require(!cache.TouchStamped(absent, *first), "an empty handle proved an entry");
+    Require(cache.TouchStamped(handle, *first), "a standing entry's handle did not prove it");
+    Require(!cache.TouchStamped(handle, *second), "a handle proved another object");
+    Require(!other.TouchStamped(handle, *first), "another cache accepted a handle");
+    // The touch moves the entry to the LRU front as Find does: with capacity pressure the other
+    // entry goes first. (Checked through the order Size-bounded eviction would follow is internal;
+    // here: a find after the touch still answers, and the stamp survives a Find of the same key.)
+    Require(cache.Find(a, hashA) == first && cache.TouchStamped(handle, *first), "a Find ended a standing handle");
+    // Removal ends it; Remove hands the object back when asked.
+    std::shared_ptr<ShaderResources> removed;
+    cache.Remove(a, nullptr, &removed);
+    Require(removed == first && !cache.TouchStamped(handle, *first), "a removed entry's handle still proved it");
+    // A new insert under the key is a new entry with a new stamp.
+    cache.Insert(a, first);
+    Require(!cache.TouchStamped(handle, *first), "a re-inserted key accepted the old entry's handle");
+    ResourceCache::Handle fresh;
+    Require(cache.Peek(a, hashA, fresh) == first && fresh.stamp != handle.stamp && cache.TouchStamped(fresh, *first), "a re-inserted entry's handle did not prove it");
+    // An insert of the same object under another cache moves its stamp: the old handle is refused
+    // (the caller looks the key up), and removing that other entry does not clear this one's.
+    other.Insert(b, first);
+    Require(!cache.TouchStamped(fresh, *first), "a handle survived its object's insert elsewhere");
+    Require(cache.Find(a, hashA) == first, "the entry was lost to an insert elsewhere");
+    other.Clear();
+    Require(first->cacheStamp.load() == 0 || !cache.TouchStamped(fresh, *first), "a stale handle proved an entry after a clear elsewhere");
+    // A replacement under the key (Insert of another object) ends the handle and stamps the new one.
+    cache.Insert(a, first);
+    ResourceCache::Handle replacedHandle;
+    Require(cache.Peek(a, hashA, replacedHandle) == first, "a peek missed the re-inserted entry");
+    std::vector<std::shared_ptr<ShaderResources>> evicted;
+    cache.Insert(a, second, &evicted);
+    Require(evicted.size() == 1 && evicted.front() == first && !cache.TouchStamped(replacedHandle, *first), "a replaced entry's handle still proved it");
+    Require(first->cacheStamp.load() == 0, "a replaced entry's object kept its stamp");
+    // A clear ends every handle.
+    ResourceCache::Handle cleared;
+    Require(cache.Peek(a, hashA, cleared) == second && cache.TouchStamped(cleared, *second), "a peek missed the replacement");
+    cache.Clear();
+    Require(!cache.TouchStamped(cleared, *second) && second->cacheStamp.load() == 0, "a cleared cache's handle still proved its entry");
+    std::cout << "Resource cache entry stamp tests passed\n";
+}
+
+// bind_elide (needs APS5_BIND_ELIDE=1): the binds a pass already holds are skipped, everything else
+// recorded, checked against a capturing function table (the command buffers are never submitted:
+// the table records instead of calling Vulkan).
+struct CapturedBinds {
+    std::uint64_t pipelines = 0, sets = 0, pushes = 0, vertex = 0, index = 0, bias = 0, bounds = 0, viewports = 0;
+    static inline CapturedBinds* active = nullptr;
+};
+
+void bindElideTests(const Device& device) {
+    Require(BindElision(), "bind elision tests require APS5_BIND_ELIDE=1");
+    std::lock_guard gpu(GpuMutex());
+    const auto& base = device.GetContext();
+    CapturedBinds captured;
+    CapturedBinds::active = &captured;
+    struct Reset {
+        ~Reset() { CapturedBinds::active = nullptr; }
+    } reset;
+    DeviceFunctions functions{};
+    if (base.functions != nullptr) functions = *base.functions;
+    functions.cmdBindPipeline = [](VkCommandBuffer, VkPipelineBindPoint, VkPipeline) { ++CapturedBinds::active->pipelines; };
+    functions.cmdBindDescriptorSets = [](VkCommandBuffer, VkPipelineBindPoint, VkPipelineLayout, std::uint32_t, std::uint32_t, const VkDescriptorSet*, std::uint32_t, const std::uint32_t*) { ++CapturedBinds::active->sets; };
+    functions.cmdPushConstants = [](VkCommandBuffer, VkPipelineLayout, VkShaderStageFlags, std::uint32_t, std::uint32_t, const void*) { ++CapturedBinds::active->pushes; };
+    functions.cmdBindVertexBuffers = [](VkCommandBuffer, std::uint32_t, std::uint32_t, const VkBuffer*, const VkDeviceSize*) { ++CapturedBinds::active->vertex; };
+    functions.cmdBindIndexBuffer = [](VkCommandBuffer, VkBuffer, VkDeviceSize, VkIndexType) { ++CapturedBinds::active->index; };
+    functions.cmdSetDepthBias = [](VkCommandBuffer, float, float, float) { ++CapturedBinds::active->bias; };
+    functions.cmdSetDepthBounds = [](VkCommandBuffer, float, float) { ++CapturedBinds::active->bounds; };
+    functions.cmdSetViewport = [](VkCommandBuffer, std::uint32_t, std::uint32_t, const VkViewport*) { ++CapturedBinds::active->viewports; };
+    functions.cmdSetScissor = [](VkCommandBuffer, std::uint32_t, std::uint32_t, const VkRect2D*) {};
+    auto context = base;
+    context.functions = &functions;
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.variantId = 31;
+    fragment.variantId = 32;
+    vertex.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_vert_SPV), std::end(TRIANGLE_vert_SPV));
+    fragment.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_frag_SPV), std::end(TRIANGLE_frag_SPV));
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    State state{};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.hasColorTarget = true;
+    state.color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    state.colors.push_back(state.color);
+    state.blend.colorWriteMask = 15;
+    state.blends.push_back(state.blend);
+    state.viewport = {0, 0, 64, 64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.depth = DepthTarget{0, 0, {64, 64}, VK_FORMAT_D32_SFLOAT, 1.0f, 0};
+    state.depthTest = true;
+    auto resources = std::make_shared<ShaderResources>(context, shaders, state.color, 0, 0);
+    VertexInputLayout input;
+    Pipeline pipeline(context, state, input, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+    auto biased = state;
+    biased.depthBias = true;
+    biased.depthBiasConstant = 1.0f;
+    Pipeline biasPipeline(context, biased, input, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+    const auto commandsA = reinterpret_cast<VkCommandBuffer>(std::uintptr_t{0x1000});
+    const auto commandsB = reinterpret_cast<VkCommandBuffer>(std::uintptr_t{0x2000});
+    const auto setX = reinterpret_cast<VkDescriptorSet>(std::uintptr_t{0x3000});
+    const auto setY = reinterpret_cast<VkDescriptorSet>(std::uintptr_t{0x4000});
+    const auto bufferX = reinterpret_cast<VkBuffer>(std::uintptr_t{0x5000});
+    const auto bufferY = reinterpret_cast<VkBuffer>(std::uintptr_t{0x6000});
+    std::array<std::byte, PipelinePushConstantBytes> push{};
+    push[0] = std::byte{1};
+    const std::array<VkBuffer, 2> vertexBuffers{bufferX, bufferY};
+    std::array<VkDeviceSize, 2> vertexOffsets{0, 16};
+    const auto expect = [&](std::uint64_t sets, std::uint64_t pushes, std::uint64_t vertexBinds, std::uint64_t indexBinds, const char* what) {
+        if (captured.sets != sets || captured.pushes != pushes || captured.vertex != vertexBinds || captured.index != indexBinds)
+            throw std::runtime_error(std::string("bind elision: ") + what + ": sets " + std::to_string(captured.sets) + " pushes " + std::to_string(captured.pushes) + " vertex " + std::to_string(captured.vertex) + " index " + std::to_string(captured.index));
+    };
+    const auto draw = [&](VkCommandBuffer commands, const Pipeline& with, VkDescriptorSet set, bool indexed, VkDeviceSize indexOffset) {
+        with.Continue(commands, state);
+        with.BindSet(commands, set);
+        with.PushConstants(commands, VK_SHADER_STAGE_VERTEX_BIT, push);
+        BindDrawBuffers(context, commands, vertexBuffers, vertexOffsets, indexed, bufferX, indexOffset, VK_INDEX_TYPE_UINT16);
+    };
+    // The first draw into a buffer records every bind; an identical one records none.
+    draw(commandsA, pipeline, setX, true, 0);
+    expect(1, 1, 1, 1, "first draw");
+    draw(commandsA, pipeline, setX, true, 0);
+    expect(1, 1, 1, 1, "identical draw");
+    // Each differing piece is recorded on its own.
+    draw(commandsA, pipeline, setY, true, 0);
+    expect(2, 1, 1, 1, "another set");
+    push[4] = std::byte{9};
+    draw(commandsA, pipeline, setY, true, 0);
+    expect(2, 2, 1, 1, "other push constants");
+    vertexOffsets[1] = 32;
+    draw(commandsA, pipeline, setY, true, 0);
+    expect(2, 2, 2, 1, "another vertex offset");
+    draw(commandsA, pipeline, setY, true, 64);
+    expect(2, 2, 2, 2, "another index offset");
+    // A draw without indices binds no index buffer; the next indexed draw finds it still bound.
+    draw(commandsA, pipeline, setY, false, 0);
+    draw(commandsA, pipeline, setY, true, 64);
+    expect(2, 2, 2, 2, "an unindexed draw between");
+    // Push constants of other stages are pushed (and replace the tracked block).
+    pipeline.PushConstants(commandsA, VK_SHADER_STAGE_FRAGMENT_BIT, push);
+    expect(2, 3, 2, 2, "other push stages");
+    pipeline.PushConstants(commandsA, VK_SHADER_STAGE_VERTEX_BIT, push);
+    expect(2, 4, 2, 2, "the vertex stage again after the fragment push");
+    // A pipeline of another layout rebinds the set and pushes again.
+    draw(commandsA, biasPipeline, setY, true, 64);
+    const bool sameLayout = biasPipeline.Layout() == pipeline.Layout();
+    expect(sameLayout ? 2 : 3, sameLayout ? 4 : 5, 2, 2, "another pipeline layout");
+    // Another command buffer starts from nothing tracked; so does a pass begun anew (Begin resets
+    // through the same path as a buffer switch), checked by coming back to buffer A.
+    const auto before = captured;
+    draw(commandsB, pipeline, setY, true, 64);
+    expect(before.sets + 1, before.pushes + 1, before.vertex + 1, before.index + 1, "another command buffer");
+    draw(commandsA, pipeline, setY, true, 64);
+    expect(before.sets + 2, before.pushes + 2, before.vertex + 2, before.index + 2, "back to the first buffer");
+    // Depth bias: set once per value while the pipelines bound keep it dynamic; a pipeline without
+    // it forgets the value.
+    const auto biasBefore = captured.bias;
+    biasPipeline.Continue(commandsA, biased);
+    biasPipeline.Continue(commandsA, biased);
+    Require(captured.bias == biasBefore + 1, "an unchanged depth bias was set again");
+    auto rebiased = biased;
+    rebiased.depthBiasConstant = 2.0f;
+    biasPipeline.Continue(commandsA, rebiased);
+    Require(captured.bias == biasBefore + 2, "a changed depth bias was skipped");
+    pipeline.Continue(commandsA, state);
+    biasPipeline.Continue(commandsA, rebiased);
+    Require(captured.bias == biasBefore + 3, "a depth bias after a pipeline without it was skipped");
+    const auto counts = TakeBindCounts();
+    Require(counts.skipped[0] != 0 && counts.skipped[1] != 0 && counts.skipped[2] != 0 && counts.skipped[3] != 0 && counts.skipped[4] != 0, "the bind counters missed skipped binds");
+    std::cout << "Bind elision tests passed\n";
+}
+
+// draw_set_writes (needs APS5_DRAW_SET_WRITES=1; after upstream #1334): a per-draw descriptor set is
+// written whole in one update without descriptor copies, every descriptor equal to the template's
+// but the snapshot elements.
+struct SetWriteContents {
+    std::map<std::pair<std::uint32_t, std::uint32_t>, VkDescriptorBufferInfo> buffers;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, VkDescriptorImageInfo> images;
+};
+struct SetWriteCapture {
+    std::vector<SetWriteContents> calls;
+    std::uint32_t copies = 0;
+    PFN_vkUpdateDescriptorSets update = nullptr;
+    static inline SetWriteCapture* active = nullptr;
+};
+
+void drawSetWriteTests(const Device& device, Recorder& recorder) {
+    Require(ShaderResources::DrawSetWrites(), "draw set write tests require APS5_DRAW_SET_WRITES=1");
+    using Contents = SetWriteContents;
+    using Capture = SetWriteCapture;
+    Capture capture;
+    auto context = device.GetContext();
+    capture.update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
+    Capture::active = &capture;
+    struct Reset {
+        ~Reset() { Capture::active = nullptr; }
+    } reset;
+    DeviceFunctions functions{};
+    if (context.functions != nullptr) functions = *context.functions;
+    functions.updateDescriptorSets = [](VkDevice device, std::uint32_t count, const VkWriteDescriptorSet* writes, std::uint32_t copyCount, const VkCopyDescriptorSet* copies) {
+        Contents contents;
+        for (std::uint32_t i = 0; i < count; ++i) {
+            const auto& write = writes[i];
+            for (std::uint32_t element = 0; element < write.descriptorCount; ++element) {
+                const auto key = std::pair{write.dstBinding, write.dstArrayElement + element};
+                if (write.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER) contents.buffers[key] = write.pBufferInfo[element];
+                else contents.images[key] = write.pImageInfo[element];
+            }
+        }
+        Capture::active->calls.push_back(std::move(contents));
+        Capture::active->copies += copyCount;
+        Capture::active->update(device, count, writes, copyCount, copies);
+    };
+    context.functions = &functions;
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        Recorder snapshots(context);
+        snapshots.Activate();
+        ShaderRecompiler::RecompileResult program;
+        ShaderRecompiler::DescriptorBinding data{};
+        data.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        data.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+        data.binding = 2;
+        data.count = 1;
+        data.guestDescriptor = {1, 2, 3, 4};
+        program.bindings.push_back(data);
+        data.binding = 7;
+        program.bindings.push_back(data);
+        ShaderRecompiler::DescriptorBinding sampler{};
+        sampler.kind = ShaderRecompiler::DescriptorKind::Sampler;
+        sampler.role = ShaderRecompiler::DescriptorRole::GuestSamplers;
+        sampler.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers);
+        sampler.count = 2;
+        sampler.guestDescriptor.resize(8);
+        sampler.samplerDepthCompare = {false, false};
+        program.bindings.push_back(sampler);
+        const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        ShaderResources resources(context, shader);
+        Require(capture.calls.size() == 1, "building resources did not write one descriptor set");
+        const auto original = capture.calls.front();
+        Require(original.buffers.size() == 2 && original.images.size() == 2, "the descriptor fixture lacks its buffers and sampler array");
+        for (std::size_t allocation = 0; allocation < 2; ++allocation) {
+            const ShaderResources::MovedBuffer moved{allocation, 0, 16, {5, 6, 7, 8}};
+            const auto draw = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
+            Require(draw != nullptr && draw->snapshots.size() == 1, "moved shader data made no draw snapshot");
+            Require(capture.calls.size() == allocation + 2 && capture.copies == 0, "the draw set was copied or needed several updates");
+            const auto& actual = capture.calls.back();
+            Require(actual.buffers.size() == original.buffers.size() && actual.images.size() == original.images.size(), "the draw set update left descriptors out");
+            const auto& snapshot = draw->snapshots.front();
+            for (const auto& [key, before] : original.buffers) {
+                const auto after = actual.buffers.at(key);
+                const bool swapped = key.first == (allocation == 0 ? 2u : 7u);
+                Require(swapped ? (after.buffer == snapshot.buffer->Handle() && after.offset == snapshot.offset && after.range == snapshot.bytes) : (after.buffer == before.buffer && after.offset == before.offset && after.range == before.range), "the draw set holds the wrong buffer descriptor");
+            }
+            for (const auto& [key, before] : original.images) {
+                const auto after = actual.images.at(key);
+                Require(after.sampler == before.sampler && after.imageView == before.imageView && after.imageLayout == before.imageLayout, "the draw set changed an image descriptor");
+            }
+        }
+        snapshots.Sync();
+    }
+    recorder.Activate();
+    std::cout << "Draw set write tests passed\n";
+}
+
+// --benchmark-commit [draws]: the committer's per-draw phases (APS5_PROFILE_DRAW) of speculated,
+// planned draws continuing one pass (the speculated-draw fixture), and the cost of the raw binds
+// bind_elide skips. Run it once per switch setting to compare.
+void commitBenchmark(const Device& device, Recorder& recorder, std::size_t count) {
+    std::thread establishThreadedProcess([] {});
+    establishThreadedProcess.join();
+    Require(std::getenv("APS5_PROFILE_DRAW") != nullptr && DrawPlansEnabled(), "the commit benchmark requires APS5_PROFILE_DRAW and APS5_DRAW_PLAN");
+    constexpr std::uint32_t side = 64;
+    constexpr std::size_t bytes = side * side * 4;
+    void* block = AllocateWatched(bytes, 65536);
+    Require(block != nullptr, "cannot allocate the benchmark target");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Cleanup {
+        Recorder& recorder;
+        VkDevice device;
+        void* block;
+        ~Cleanup() {
+            recorder.Sync();
+            ClearCachedPipelines(device);
+            ClearCachedTextures(device);
+            { GuestAllocations::Mutation mutation; mutation.Remove(block); }
+            ReleaseWatched(block, bytes);
+        }
+    } cleanup{recorder, device.GetContext().device, block};
+    auto context = device.GetContext();
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.variantId = 0x73700011;
+    fragment.variantId = 0x73700012;
+    vertex.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_vert_SPV), std::end(TRIANGLE_vert_SPV));
+    fragment.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_frag_SPV), std::end(TRIANGLE_frag_SPV));
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    State state{};
+    state.stages.path = ShaderPath::Vertex;
+    state.hasColorTarget = true;
+    state.renderExtent = {side, side};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, static_cast<float>(side), static_cast<float>(side), -static_cast<float>(side), 0, 1};
+    state.scissor = {{0, 0}, {side, side}};
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
+    state.color = {reinterpret_cast<std::uintptr_t>(block), {side, side}, VK_FORMAT_R8G8B8A8_UNORM, bytes};
+    state.colors = {state.color};
+    const AgcDriver::Pm4::DrawParameters draw{0, 3, 0, 1, 0, false};
+    std::size_t accepted = 0;
+    double drawUs = 0;
+    const auto render = [&](bool timed) {
+        auto speculation = SpeculateDrawResources(context, state, draw, shaders, {});
+        auto prebuilt = PrebuildDraw(context, state, draw, shaders, speculation == nullptr);
+        if (speculation != nullptr) SpeculateDrawPipeline(context, state, shaders, *speculation, prebuilt);
+        static_cast<void>(TakeCommitSpeculationOutcome());
+        const auto start = std::chrono::steady_clock::now();
+        {
+            const SpeculationScope speculationScope(std::move(speculation));
+            const DrawPrebuildScope prebuildScope(std::move(prebuilt));
+            Draw(context, state, draw, shaders);
+        }
+        if (timed) drawUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+        if (TakeCommitSpeculationOutcome() == 1 && timed) ++accepted;
+    };
+    // The committer follows a queue's collect epoch (bumped at its ordering points): within one,
+    // a continued pass's targets are memoised (MemoizedTarget). One ordering point per 512 draws,
+    // as a submission start would be.
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    for (unsigned warm = 0; warm < 16; ++warm) render(false);
+    recorder.Sync();
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    static_cast<void>(TakeDrawPhaseTotals());
+    for (std::size_t index = 0; index < count; ++index) {
+        render(true);
+        if (index % 512 == 511) {
+            recorder.Submit();
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+        }
+    }
+    const auto totals = TakeDrawPhaseTotals();
+    recorder.Sync();
+    std::printf("[commit-bench] %zu draws (%zu speculation-accepted), %.2f us per Draw call; phases (us per draw):", count, accepted, drawUs / static_cast<double>(count));
+    double sum = 0;
+    for (const auto& [name, us] : totals.phases) {
+        const auto per = totals.draws != 0 ? us / static_cast<double>(totals.draws) : 0.0;
+        sum += per;
+        if (per >= 0.005) std::printf(" %s %.2f", name, per);
+    }
+    std::printf("; sum %.2f over %llu profiled draws\n", sum, static_cast<unsigned long long>(totals.draws));
+
+    // The raw binds a skipped bind saves (the device's own command costs, outside any pass).
+    const auto& base = device.GetContext();
+    VkCommandBuffer commands = VK_NULL_HANDLE;
+    VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocation.commandPool = base.pool;
+    allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocation.commandBufferCount = 1;
+    Check(base.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(base.device, &allocation, &commands), "vkAllocateCommandBuffers benchmark");
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    Check(base.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands, &begin), "vkBeginCommandBuffer benchmark");
+    auto resources = std::make_shared<ShaderResources>(context, shaders, state.color, 0, 0);
+    const auto pipeline = CachedPipeline(context, state, VertexInputLayout{}, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+    Buffer vertexBuffer(base, 4096, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    std::array<std::byte, PipelinePushConstantBytes> push{};
+    constexpr std::size_t repeats = 20000;
+    const auto timeIt = [&](auto&& body) {
+        const auto start = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < repeats; ++i) body(i);
+        return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / repeats;
+    };
+    const auto pushFn = base.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants");
+    const auto vertexFn = base.Function<PFN_vkCmdBindVertexBuffers>("vkCmdBindVertexBuffers");
+    const auto indexFn = base.Function<PFN_vkCmdBindIndexBuffer>("vkCmdBindIndexBuffer");
+    const auto handle = vertexBuffer.Handle();
+    const std::array<VkBuffer, 4> handles{handle, handle, handle, handle};
+    const std::array<VkDeviceSize, 4> offsets{0, 64, 128, 192};
+    const auto pushUs = timeIt([&](std::size_t i) { push[0] = static_cast<std::byte>(i); pushFn(commands, pipeline->Layout(), VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, PipelinePushConstantBytes, push.data()); });
+    const auto vertexUs = timeIt([&](std::size_t) { vertexFn(commands, 0, 4, handles.data(), offsets.data()); });
+    const auto indexUs = timeIt([&](std::size_t i) { indexFn(commands, handle, (i & 1u) * 64u, VK_INDEX_TYPE_UINT16); });
+    const auto trackedUs = timeIt([&](std::size_t) { BindDrawBuffers(base, VK_NULL_HANDLE, {}, {}, false, VK_NULL_HANDLE, 0, VK_INDEX_TYPE_UINT16); });
+    base.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands);
+    base.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(base.device, base.pool, 1, &commands);
+    std::printf("[commit-bench] raw binds (us each): push constants %.3f, 4 vertex buffers %.3f, index buffer %.3f; tracker lock and compare %.3f\n", pushUs, vertexUs, indexUs, trackedUs);
+}
+
+// --benchmark-draw-set: PrepareDrawBindings of a template with six data buffers and a 16-sampler
+// array, one buffer moved (a per-draw set each call): copy-then-patch, or written whole with
+// APS5_DRAW_SET_WRITES=1.
+void drawSetBenchmark(const Device& device, Recorder& recorder) {
+    auto context = device.GetContext();
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        Recorder snapshots(context);
+        snapshots.Activate();
+        ShaderRecompiler::RecompileResult program;
+        for (std::uint32_t index = 0; index < 6; ++index) {
+            ShaderRecompiler::DescriptorBinding data{};
+            data.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+            data.role = ShaderRecompiler::DescriptorRole::FlattenedSrt;
+            data.binding = 2 + index;
+            data.count = 1;
+            data.guestDescriptor = {1 + index, 2, 3, 4};
+            program.bindings.push_back(data);
+        }
+        ShaderRecompiler::DescriptorBinding sampler{};
+        sampler.kind = ShaderRecompiler::DescriptorKind::Sampler;
+        sampler.role = ShaderRecompiler::DescriptorRole::GuestSamplers;
+        sampler.binding = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Samplers);
+        sampler.count = 16;
+        sampler.guestDescriptor.resize(4 * 16);
+        sampler.samplerDepthCompare.assign(16, false);
+        program.bindings.push_back(sampler);
+        const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        ShaderResources resources(context, shader);
+        const ShaderResources::MovedBuffer moved{0, 0, 16, {5, 6, 7, 8}};
+        constexpr std::size_t calls = 20000;
+        double us = 0;
+        for (std::size_t index = 0; index < calls; ++index) {
+            const auto start = std::chrono::steady_clock::now();
+            auto bindings = resources.PrepareDrawBindings(snapshots, std::span(&moved, 1));
+            us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+            Require(bindings != nullptr, "the draw set benchmark made no set");
+            if (index % 256 == 255) snapshots.Sync();
+        }
+        snapshots.Sync();
+        std::printf("[draw-set-bench] draw_set_writes %s: %.2f us per per-draw set (6 buffers, 16 samplers, 1 moved)\n", ShaderResources::DrawSetWrites() ? "on" : "off", us / calls);
+    }
+    recorder.Activate();
+}
+
+// --benchmark-cache: the committer's cache answer for a speculated key of `words` words while four
+// threads peek other keys (as prep threads do): Find with the prep thread's hash, against the
+// stamped touch (spec_entry_stamp).
+void cacheBenchmark(const Device& device) {
+    std::lock_guard gpu(GpuMutex());
+    const auto& context = device.GetContext();
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.variantId = 41;
+    fragment.variantId = 42;
+    vertex.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_vert_SPV), std::end(TRIANGLE_vert_SPV));
+    fragment.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_frag_SPV), std::end(TRIANGLE_frag_SPV));
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    ColorTarget color{};
+    color.format = VK_FORMAT_R8G8B8A8_UNORM;
+    std::vector<std::shared_ptr<ShaderResources>> objects;
+    for (std::size_t k = 0; k < 1000; ++k) objects.push_back(std::make_shared<ShaderResources>(context, shaders, color, 0, 0));
+    for (const std::size_t words : {64u, 400u, 1200u}) {
+        ResourceCache cache;
+        std::vector<ResourceCache::Key> keys;
+        for (std::uint32_t k = 0; k < 1000; ++k) {
+            ResourceCache::Key key(words);
+            for (std::size_t i = 0; i < words; ++i) key[i] = static_cast<std::uint32_t>(i * 2654435761u) ^ k;
+            key[0] = 0xffffffffu;
+            cache.Insert(key, objects[k]);
+            keys.push_back(std::move(key));
+        }
+        std::atomic<bool> stop{false};
+        std::vector<std::thread> peekers;
+        for (int t = 0; t < 4; ++t) {
+            peekers.emplace_back([&, t] {
+                std::size_t k = static_cast<std::size_t>(t) * 97u;
+                while (!stop.load(std::memory_order_relaxed)) {
+                    const auto& key = keys[k++ % keys.size()];
+                    static_cast<void>(cache.Peek(key, ResourceCache::HashKey(key)));
+                }
+            });
+        }
+        constexpr std::size_t lookups = 200000;
+        std::vector<std::size_t> hashes;
+        std::vector<ResourceCache::Handle> handles(keys.size());
+        for (std::size_t k = 0; k < keys.size(); ++k) {
+            hashes.push_back(ResourceCache::HashKey(keys[k]));
+            static_cast<void>(cache.Peek(keys[k], hashes[k], handles[k]));
+        }
+        auto start = std::chrono::steady_clock::now();
+        for (std::size_t i = 0; i < lookups; ++i) {
+            const auto k = (i * 7u) % keys.size();
+            Require(cache.Find(keys[k], hashes[k]) == objects[k], "the cache benchmark lost a key");
+        }
+        const auto findUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / lookups;
+        start = std::chrono::steady_clock::now();
+        std::size_t stamped = 0;
+        for (std::size_t i = 0; i < lookups; ++i) {
+            const auto k = (i * 7u) % keys.size();
+            stamped += cache.TouchStamped(handles[k], *objects[k]) ? 1u : 0u;
+        }
+        const auto touchUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / lookups;
+        stop.store(true);
+        for (auto& peeker : peekers) peeker.join();
+        std::printf("[cache-bench] %zu-word keys, 4 peeking threads: Find with hash %.3f us, stamped touch %.3f us (%zu stamped)\n", words, findUs, touchUs, stamped);
+    }
+}
+
+// moved_publish_check (needs APS5_DRAW_TOKENS=1 and APS5_MOVED_PUBLISH_CHECK=1; with
+// APS5_VERIFY_DRAW_TOKENS=1 every answer is compared with the full check): a moved buffer's token
+// proof that only a pending-write publish outdated is decided by the pending writes of its range.
+void movedPublishTests(const Device& device, Recorder& recorder) {
+    Require(DrawTokensEnabled() && (ShaderResources::MovedPublishCheck() || std::getenv("APS5_BENCHMARK_MOVED") != nullptr), "moved publish tests require APS5_DRAW_TOKENS=1 and APS5_MOVED_PUBLISH_CHECK=1");
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: moved publish checks not tested\n";
+        return;
+    }
+    constexpr std::size_t bytes = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the moved publish block");
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        ~Unregister() {
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, reinterpret_cast<std::uint64_t>(block), bytes);
+        }
+    } unregister{context, block};
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the test block refused: moved publish checks not tested\n";
+        return;
+    }
+    const auto words = [](std::uint64_t at, std::size_t size) { return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at >> 32u) & 0xffffu, static_cast<std::uint32_t>(size), 0x31000000u}; };
+    ShaderRecompiler::RecompileResult program;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    for (const auto word : words(address + 4096, 256)) binding.guestDescriptor.push_back(word);
+    binding.bufferWritten = {false};
+    program.bindings.push_back(binding);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    ShaderResources resources(context, compute);
+    // The element moved to another range of the block (a moved read-only buffer, no words).
+    const std::vector<ShaderResources::MovedBuffer> moved{{0, address + 8192, 256, {}}};
+    ShaderResources::MovedProof proof;
+    resources.SpeculateMovedFree(moved, proof);
+    Require(proof.tokens && proof.ranges.size() == 1, "the moved proof fixture made no token proof");
+    static_cast<void>(ShaderResources::TakeMovedPublishChecks());
+    Require(resources.MovedStillFree(moved, &recorder, &proof) && ShaderResources::TakeMovedPublishChecks() == 0, "an unchanged token proof was not accepted as before");
+    // A pending write elsewhere moves the publish generation: the range is checked alone.
+    recorder.NotePendingWrite(address + 32768, 64);
+    Require(Recorder::PublishGeneration() != proof.publish, "the fixture's pending write did not publish");
+    const auto expectedChecks = ShaderResources::MovedPublishCheck() ? 1u : 0u;
+    Require(resources.MovedStillFree(moved, &recorder, &proof) && ShaderResources::TakeMovedPublishChecks() == expectedChecks, "a publish elsewhere refused the moved range");
+    // --benchmark-moved (APS5_BENCHMARK_MOVED=1): the committer's moved check once only a publish
+    // outdated the proof: full check (switch off) against the publish-only check.
+    if (std::getenv("APS5_BENCHMARK_MOVED") != nullptr) {
+        std::vector<ShaderResources::MovedBuffer> four;
+        for (std::uint64_t k = 0; k < 4; ++k) four.push_back({0, address + 8192 + k * 1024, 256, {}});
+        ShaderResources::MovedProof fourProof;
+        resources.SpeculateMovedFree(four, fourProof);
+        recorder.NotePendingWrite(address + 40960, 64);
+        constexpr std::size_t calls = 20000;
+        const auto start = std::chrono::steady_clock::now();
+        std::size_t free = 0;
+        for (std::size_t i = 0; i < calls; ++i) free += resources.MovedStillFree(four, &recorder, &fourProof) ? 1u : 0u;
+        const auto us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count() / calls;
+        std::printf("[moved-bench] moved_publish_check %s: %.3f us per check of 4 moved ranges after a publish (%zu free)\n", ShaderResources::MovedPublishCheck() ? "on" : "off", us, free);
+        recorder.Sync();
+        return;
+    }
+    // One over the range refuses it, as the full check does.
+    recorder.NotePendingWrite(address + 8192 + 128, 16);
+    Require(!resources.MovedStillFree(moved, &recorder, &proof) && ShaderResources::TakeMovedPublishChecks() == 1, "a pending write over the moved range was accepted");
+    recorder.Sync();
+    // Settled, the writes leave the snapshot at the next publish; the proof's other serials hold.
+    std::cout << "Moved publish check tests passed\n";
+}
+
 void keysFillTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     if (base.hostImportAlignment == 0) {
@@ -3544,6 +4502,121 @@ void drawBarrierTests(const Device& device, Recorder& recorder, bool toggleLive 
     std::cout << "Alternating render-pass GPU readback passed, " << merged << " leading draw barriers merged\n";
 }
 
+// A recorded draw through the planned path with the prep thread's parts made here first
+// (SpeculateDrawResources, PrebuildDraw, SpeculateDrawPipeline): the committer must accept the
+// speculation, take its pipeline (APS5_VERIFY_DRAW_SPECULATION compares it with the store's) and
+// render exactly what the same draws render without any speculation.
+void speculatedDrawTests(const Device& device, Recorder& recorder) {
+    std::thread establishThreadedProcess([] {});
+    establishThreadedProcess.join();
+    Require(DrawPlansEnabled() && SpeculatedPipelines() && SpeculatedKeyHash() && VerifyDrawSpeculation(), "speculated draw tests require APS5_DRAW_PLAN, APS5_SPEC_PIPELINE, APS5_SPEC_KEY_HASH and APS5_VERIFY_DRAW_SPECULATION");
+    constexpr std::uint32_t side = 64;
+    constexpr std::size_t bytes = side * side * 4;
+    std::array<void*, 2> blocks{};
+    for (auto& block : blocks) {
+        block = AllocateWatched(bytes, 65536);
+        Require(block != nullptr, "cannot allocate speculated draw target");
+        auto* pixels = static_cast<std::uint8_t*>(block);
+        for (std::size_t i = 0; i < bytes; i += 4) {
+            pixels[i] = 16; pixels[i + 1] = 24; pixels[i + 2] = 40; pixels[i + 3] = 255;
+        }
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Cleanup {
+        Recorder& recorder;
+        VkDevice device;
+        std::array<void*, 2>& blocks;
+        ~Cleanup() {
+            recorder.Sync();
+            ClearCachedPipelines(device);
+            ClearCachedTextures(device);
+            for (auto* block : blocks) {
+                { GuestAllocations::Mutation mutation; mutation.Remove(block); }
+                ReleaseWatched(block, bytes);
+            }
+        }
+    } cleanup{recorder, device.GetContext().device, blocks};
+    auto context = device.GetContext();
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    ShaderRecompiler::RecompileResult vertex, fragment;
+    vertex.variantId = 0x73700001;
+    fragment.variantId = 0x73700002;
+    vertex.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_vert_SPV), std::end(TRIANGLE_vert_SPV));
+    fragment.spirv = std::vector<std::uint32_t>(std::begin(TRIANGLE_frag_SPV), std::end(TRIANGLE_frag_SPV));
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    State state{};
+    state.stages.path = ShaderPath::Vertex;
+    state.hasColorTarget = true;
+    state.renderExtent = {side, side};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, static_cast<float>(side), static_cast<float>(side), -static_cast<float>(side), 0, 1};
+    state.scissor = {{0, 0}, {side, side}};
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blend.blendEnable = VK_TRUE;
+    state.blend.srcColorBlendFactor = VK_BLEND_FACTOR_CONSTANT_COLOR;
+    state.blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    state.blend.colorBlendOp = VK_BLEND_OP_ADD;
+    state.blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ZERO;
+    state.blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    state.blend.alphaBlendOp = VK_BLEND_OP_ADD;
+    state.blendConstants.fill(0.125f);
+    state.blends = {state.blend};
+    const AgcDriver::Pm4::DrawParameters draw{0, 3, 0, 1, 0, false};
+    const auto target = [&](void* block) {
+        state.color = {reinterpret_cast<std::uintptr_t>(block), {side, side}, VK_FORMAT_R8G8B8A8_UNORM, bytes};
+        state.colors = {state.color};
+    };
+    std::size_t accepted = 0, peeked = 0;
+    const auto takenBefore = SpeculatedPipelinesTaken();
+    const auto stampedBefore = SpeculatedEntryStampsTaken();
+    const auto render = [&](void* block, bool speculate) {
+        target(block);
+        if (!speculate) {
+            Draw(context, state, draw, shaders);
+            return;
+        }
+        auto speculation = SpeculateDrawResources(context, state, draw, shaders, {});
+        auto prebuilt = PrebuildDraw(context, state, draw, shaders, speculation == nullptr);
+        if (speculation != nullptr) {
+            SpeculateDrawPipeline(context, state, shaders, *speculation, prebuilt);
+            if (!speculation->pipeline.pipeline.expired()) ++peeked;
+        }
+        static_cast<void>(TakeCommitSpeculationOutcome());
+        {
+            const SpeculationScope speculationScope(std::move(speculation));
+            const DrawPrebuildScope prebuildScope(std::move(prebuilt));
+            Draw(context, state, draw, shaders);
+        }
+        if (TakeCommitSpeculationOutcome() == 1) ++accepted;
+    };
+    // The first draws build and insert the template and the pipeline; later ones speculate.
+    for (unsigned pass = 0; pass < 4; ++pass) {
+        render(blocks[0], true);
+        render(blocks[1], false);
+    }
+    recorder.Sync();
+    for (auto* block : blocks) {
+        auto resident = StorageTexture::FindLive(reinterpret_cast<std::uint64_t>(block), bytes);
+        Require(resident != nullptr, "speculated draw target was not resident");
+        resident->WriteBack();
+    }
+    recorder.Sync();
+    Require(accepted != 0, "no speculated draw was accepted by the committer");
+    Require(peeked != 0, "no speculated draw peeked its pipeline");
+    Require(SpeculatedPipelinesTaken() - takenBefore == accepted, "the committer did not take every accepted draw's peeked pipeline");
+    // spec_entry_stamp: every accepted draw's cache entry was proven by its stamp (nothing evicts
+    // or replaces it here), else looked up as before.
+    Require(SpeculatedEntryStamps() ? SpeculatedEntryStampsTaken() - stampedBefore == accepted : SpeculatedEntryStampsTaken() == stampedBefore, "the committer's stamped cache entries disagree with spec_entry_stamp");
+    Require(std::memcmp(blocks[0], blocks[1], bytes) == 0, "speculated draws rendered other pixels than plain ones");
+    const auto* pixels = static_cast<const std::uint8_t*>(blocks[0]);
+    const auto center = (side / 2 * side + side / 2) * 4;
+    Require(pixels[center] > 30 && pixels[center + 1] > 30 && pixels[center + 2] > 30, "speculated draws did not draw the triangle");
+    std::cout << "Speculated draw tests passed (" << accepted << " accepted, " << peeked << " pipelines peeked)\n";
+}
+
 void uploadMemoryTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     const char* local = std::getenv("APS5_SHADER_DATA_DEVICE_LOCAL");
@@ -3584,6 +4657,299 @@ void uploadMemoryTests(const Device& device, Recorder& recorder) {
     }
     dataRefreshTests(device, recorder);
     std::cout << "Upload buffer CPU writes, GPU updates, reuse and memory-type fallback tests passed\n";
+}
+
+// The write-back elision by buffer usage (StorageUsageElide): a dispatch's guest buffer element over
+// a storage image with results pending. The dispatch is stood in for by a GPU fill of the bytes it
+// stores, recorded where the dispatch would be (after the resources' upload, before MarkGpuWrites).
+void usageElideTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: usage elision not tested\n";
+        return;
+    }
+    // 4 MiB: above the written-shadow window (APS5_WRITTEN_SHADOW_MAX_KIB), so the element is bound
+    // in place in the import, where the stand-in dispatch stores.
+    constexpr std::uint32_t side = 1024;
+    constexpr std::size_t bytes = side * side * 4;
+    constexpr std::size_t unit = 65536;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the usage elision block");
+    auto* texels = static_cast<std::uint8_t*>(block);
+    std::memset(texels, 0x55, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            SetStorageUsageModes(std::nullopt, std::nullopt);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    const auto* import = HostImportFor(base, address, bytes);
+    if (import == nullptr) {
+        std::cout << "host import of the usage elision block refused: usage elision not tested\n";
+        return;
+    }
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.baseAddress = address;
+    resource.width = side;
+    resource.height = side;
+    resource.mipCount = 1;
+    resource.tileMode = TextureTileMode::kR64KBX;
+    resource.dimension = TextureDimension::k2D;
+    resource.format = 56;
+    resource.dstSelX = 4;
+    resource.dstSelY = 5;
+    resource.dstSelZ = 6;
+    resource.dstSelW = 7;
+    Require(DescribeSurface(resource).guestBytes == bytes, "the usage elision surface has an unexpected size");
+    auto image = std::make_shared<StorageTexture>(context, detiler, resource, 0);
+    const VkImageSubresourceRange whole{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    const auto drawInto = [&](const std::shared_ptr<StorageTexture>& target, VkClearColorValue color) {
+        const auto commands = recorder.Commands();
+        recorder.Keep(target);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, target->Image(), VK_IMAGE_LAYOUT_GENERAL, &color, 1, &whole);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        target->MarkDirty();
+    };
+    const auto draw = [&] { drawInto(image, {{1.0f, 0.0f, 0.0f, 1.0f}}); };
+    constexpr std::uint32_t redWord = 0xff0000ffu;
+    constexpr std::uint32_t stored = 0x77777777u;
+    // Whether guest memory holds `word` in [begin, end) (offsets into the surface).
+    const auto memoryHolds = [&](std::size_t begin, std::size_t end, std::uint32_t word) {
+        for (auto offset = begin; offset < end; offset += 4) {
+            std::uint32_t value = 0;
+            std::memcpy(&value, texels + offset, 4);
+            if (value != word) return false;
+        }
+        return true;
+    };
+    // The image's own texels (read back from the GPU).
+    const auto imageHolds = [&](std::uint32_t word) {
+        Buffer readback(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {side, side, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        const auto pixels = readback.Bytes();
+        for (std::size_t offset = 0; offset < pixels.size(); offset += 4) {
+            std::uint32_t value = 0;
+            std::memcpy(&value, pixels.data() + offset, 4);
+            if (value != word) return false;
+        }
+        return true;
+    };
+    // The dispatch's stores: `word` over [begin, end) of the surface, by the GPU into the import.
+    const auto dispatchStores = [&](std::size_t begin, std::size_t end, std::uint32_t word) {
+        const auto commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, import->buffer, address + begin - import->base, end - begin, word);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    };
+    // A compute program with one guest buffer element over the surface, stored to (and read, or
+    // updated atomically, as asked) with the given store covers.
+    const auto program = [&](bool read, bool atomic, std::vector<ShaderRecompiler::BufferStoreCover> covers, std::size_t elementBegin = 0, std::size_t elementBytes = 0) {
+        ShaderRecompiler::RecompileResult result;
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+        binding.descriptorSet = 0;
+        binding.binding = 0;
+        binding.count = 1;
+        const auto elementAddress = address + elementBegin;
+        if (elementBytes == 0) elementBytes = bytes - elementBegin;
+        binding.guestDescriptor = {static_cast<std::uint32_t>(elementAddress), static_cast<std::uint32_t>(elementAddress >> 32u) & 0xffffu, static_cast<std::uint32_t>(elementBytes), 0x31016facu};
+        binding.bufferWritten = {true};
+        binding.bufferRead = {read};
+        binding.bufferAtomic = {atomic};
+        binding.bufferCovers = {std::move(covers)};
+        result.bindings.push_back(binding);
+        return result;
+    };
+    // Every invocation of 64-wide groups stores a dword at its global id times 4.
+    ShaderRecompiler::BufferStoreCover dense;
+    dense.offset.group = {256, 0, 0};
+    dense.offset.local = {4, 0, 0};
+    dense.bytes = 4;
+    const auto grid = [](std::uint32_t groups) { return ShaderRecompiler::DispatchGrid{{groups, 1, 1}, {64, 1, 1}}; };
+    const std::uint32_t allGroups = bytes / 256;
+    // One use: the build (its upload flushes, or elides), then whether the write-back reached guest
+    // memory before the dispatch, the dispatch's stores, and MarkGpuWrites.
+    const auto use = [&](const ShaderRecompiler::RecompileResult& compiled, const ShaderRecompiler::DispatchGrid* dispatchGrid, std::size_t storeBegin, std::size_t storeEnd, auto&& beforeDispatch) {
+        std::optional<DispatchGridScope> scope;
+        if (dispatchGrid != nullptr) scope.emplace(*dispatchGrid);
+        const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &compiled, 0};
+        ShaderResources resources(context, compute);
+        recorder.Sync();
+        beforeDispatch();
+        dispatchStores(storeBegin, storeEnd, stored);
+        resources.MarkGpuWrites(recorder);
+        recorder.Sync();
+    };
+    const auto pending = [&] { return StorageTexture::FlushPending(address, bytes, nullptr, "usage elision test"); };
+    // Elision on, a write-only element whose stores cover the surface: no write-back, the units are
+    // dropped after the dispatch, guest memory holds the dispatch's bytes and the image takes them.
+    SetStorageUsageModes(true, false);
+    {
+        draw();
+        const auto before = CurrentStorageUsageCounts();
+        const auto everything = grid(allGroups);
+        use(program(false, false, {dense}), &everything, 0, bytes, [&] { Require(memoryHolds(0, bytes, 0x55555555u), "usage elision: a write-only element covering the surface still took the write-back"); });
+        const auto after = CurrentStorageUsageCounts();
+        Require(after.elidedRegions == before.elidedRegions + 1 && after.droppedUnits == before.droppedUnits + bytes / unit && after.droppedBytes == before.droppedBytes + bytes, "usage elision: the covered units were not dropped");
+        Require(!pending(), "usage elision: results stayed pending under the dispatch's stores");
+        Require(memoryHolds(0, bytes, stored), "usage elision: guest memory does not hold the dispatch's stores");
+        static_cast<void>(image->Refresh());
+        Require(imageHolds(stored), "usage elision: the image did not take the dispatch's bytes after its dropped units");
+    }
+    // A reused build (the resource cache's Revalidate, whose proof flushes the regions bound in
+    // place): the same elision on its second use.
+    {
+        std::memset(texels, 0x55, bytes);
+        draw();
+        const auto everything = grid(allGroups);
+        const DispatchGridScope scope(everything);
+        const auto compiled = program(false, false, {dense});
+        const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &compiled, 0};
+        ShaderResources resources(context, compute);
+        recorder.Sync();
+        dispatchStores(0, bytes, stored);
+        resources.MarkGpuWrites(recorder);
+        recorder.Sync();
+        if (resources.Reusable()) {
+            draw();
+            const auto before = CurrentStorageUsageCounts();
+            Require(resources.Revalidate(compute), "usage elision: the reused build was refused");
+            recorder.Sync();
+            Require(memoryHolds(0, bytes, stored), "usage elision: the reused build's proof took the write-back");
+            dispatchStores(0, bytes, 0x66666666u);
+            resources.MarkGpuWrites(recorder);
+            recorder.Sync();
+            const auto after = CurrentStorageUsageCounts();
+            Require(after.droppedUnits == before.droppedUnits + bytes / unit, "usage elision: the reused build did not drop the covered units");
+            Require(!pending() && memoryHolds(0, bytes, 0x66666666u), "usage elision: the reused build left the wrong state");
+        } else {
+            std::cout << "usage elision: the build is not reusable here, its reuse not tested (completion " << resources.NeedsCompletion() << ", lease " << resources.HoldsLease() << ", copied writes " << resources.HasCopiedWrites() << ")\n";
+        }
+    }
+    // A read-write element: the write-back happens exactly as without the elision.
+    {
+        draw();
+        const auto everything = grid(allGroups);
+        use(program(true, false, {dense}), &everything, 0, bytes, [&] { Require(memoryHolds(0, bytes, redWord), "usage elision: a read-write element did not take the write-back"); });
+        Require(!pending() && memoryHolds(0, bytes, stored), "usage elision: the read-write use left the wrong state");
+    }
+    // An atomic element (read and written by the shader) is never elided.
+    {
+        draw();
+        const auto everything = grid(allGroups);
+        use(program(false, true, {dense}), &everything, 0, bytes, [&] { Require(memoryHolds(0, bytes, redWord), "usage elision: an atomic element did not take the write-back"); });
+    }
+    // No dispatch grid (a draw, an indirect dispatch): the covers cannot be evaluated.
+    {
+        draw();
+        use(program(false, false, {dense}), nullptr, 0, bytes, [&] { Require(memoryHolds(0, bytes, redWord), "usage elision: an element without a dispatch grid did not take the write-back"); });
+    }
+    // Partial writes: the stores cover two units and a little of the third. The two are skipped and
+    // dropped; the third and fourth are stored first, so the bytes the dispatch leaves keep the
+    // image's results.
+    {
+        std::memset(texels, 0x55, bytes);
+        draw();
+        const auto partialGroups = static_cast<std::uint32_t>(2 * unit / 256 + 1);
+        const auto partial = grid(partialGroups);
+        const auto end = static_cast<std::size_t>(partialGroups) * 256;
+        const auto before = CurrentStorageUsageCounts();
+        use(program(false, false, {dense}), &partial, 0, end, [&] {
+            Require(memoryHolds(0, 2 * unit, 0x55555555u), "usage elision: the covered units of a partial write took the write-back");
+            Require(memoryHolds(2 * unit, bytes, redWord), "usage elision: the units a partial write does not cover whole were not written back");
+        });
+        const auto after = CurrentStorageUsageCounts();
+        Require(after.droppedUnits == before.droppedUnits + 2, "usage elision: a partial write dropped the wrong units");
+        Require(!pending(), "usage elision: results stayed pending after a partial write");
+        Require(memoryHolds(0, end, stored) && memoryHolds(end, bytes, redWord), "usage elision: a partial write lost the image's results beyond the stores");
+    }
+    // Two aliasing images over the region: A (block units) wholly inside the covered bytes, B (one
+    // unit, linear) sticking out of the region's start over A's first half. A's units under B are
+    // stored with B (dropping them would leave B pending under the dispatch's stores), A's others
+    // are dropped, and B's bytes outside the region keep its results.
+    {
+        std::memset(texels, 0x55, bytes);
+        constexpr std::size_t mebibyte = 1u << 20u;
+        GuestTextureResource aliasA = resource;
+        aliasA.baseAddress = address + mebibyte;
+        aliasA.width = 512;
+        aliasA.height = 512;
+        GuestTextureResource aliasB = aliasA;
+        aliasB.baseAddress = address + mebibyte / 2;
+        aliasB.tileMode = TextureTileMode::kLinear;
+        Require(DescribeSurface(aliasA).guestBytes == mebibyte && DescribeSurface(aliasB).guestBytes == mebibyte, "the alias test surfaces have unexpected sizes");
+        auto imageA = std::make_shared<StorageTexture>(context, detiler, aliasA, 0);
+        auto imageB = std::make_shared<StorageTexture>(context, detiler, aliasB, 0);
+        drawInto(imageA, {{1.0f, 0.0f, 0.0f, 1.0f}});
+        drawInto(imageB, {{0.0f, 1.0f, 0.0f, 1.0f}});
+        constexpr std::uint32_t greenWord = 0xff00ff00u;
+        const auto region = grid(static_cast<std::uint32_t>(mebibyte / 256));
+        const auto before = CurrentStorageUsageCounts();
+        // The element spans 3 MiB (bound in place, above the written-shadow window); the grid's
+        // stores cover its first MiB, A's surface.
+        use(program(false, false, {dense}, mebibyte, 3 * mebibyte), &region, mebibyte, 2 * mebibyte, [&] {
+            Require(memoryHolds(mebibyte / 2, mebibyte, greenWord), "usage elision: the aliasing image sticking out of the region was not stored");
+            Require(memoryHolds(3 * mebibyte / 2, 2 * mebibyte, 0x55555555u), "usage elision: the units no other image overlaps took the write-back");
+        });
+        const auto after = CurrentStorageUsageCounts();
+        Require(after.droppedUnits == before.droppedUnits + mebibyte / 2 / unit, "usage elision: the alias case dropped the wrong units");
+        Require(!pending(), "usage elision: an image stayed pending under the dispatch's stores in the alias case");
+        Require(memoryHolds(mebibyte / 2, mebibyte, greenWord) && memoryHolds(mebibyte, 2 * mebibyte, stored), "usage elision: the alias case left the wrong bytes");
+        recorder.Sync();
+        imageA->Flush();
+        imageB->Flush();
+        recorder.Sync();
+    }
+    // Verify mode: the write-back still happens, a canary in the units the elision would skip must
+    // be overwritten by the dispatch; a dispatch that leaves part of it is caught and repaired.
+    SetStorageUsageModes(false, true);
+    {
+        draw();
+        const auto everything = grid(allGroups);
+        const auto before = CurrentStorageUsageCounts();
+        use(program(false, false, {dense}), &everything, 0, bytes, [&] { Require(memoryHolds(0, bytes, 0x9e3779b9u), "usage elision verify: the canary was not filled after the write-back"); });
+        auto after = CurrentStorageUsageCounts();
+        Require(after.verifyRegions == before.verifyRegions + 1 && after.canaryWords == before.canaryWords && after.readBytes == before.readBytes && after.droppedUnits == before.droppedUnits, "usage elision verify: a covering dispatch was reported");
+        Require(!pending() && memoryHolds(0, bytes, stored), "usage elision verify: the verified use left the wrong state");
+        draw();
+        use(program(false, false, {dense}), &everything, 0, bytes / 2, [] {});
+        const auto failed = CurrentStorageUsageCounts();
+        Require(failed.canaryWords == after.canaryWords + bytes / 2 / 4, "usage elision verify: a dispatch storing half the claimed bytes was not caught");
+        Require(memoryHolds(0, bytes / 2, stored) && memoryHolds(bytes / 2, bytes, redWord), "usage elision verify: the canary words were not repaired from the write-back");
+    }
+    SetStorageUsageModes(std::nullopt, std::nullopt);
+    recorder.Sync();
+    image->Flush();
+    recorder.Sync();
+    std::cout << "usage elision: write-only, reuse, read-write, atomic, no grid, partial write, alias and verify cases passed\n";
 }
 
 int main(int argc, char** argv) {
@@ -3659,6 +5025,19 @@ int main(int argc, char** argv) {
             pipelineCacheTests(device, std::string_view(argv[1]) == "--benchmark-pipeline-cache");
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--commit-paths-only") {
+            commitPathTests(device);
+            entryStampTests(device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-cache") {
+            cacheBenchmark(device);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--bind-elide-only") {
+            bindElideTests(device);
+            return 0;
+        }
 
         std::lock_guard gpu(GpuMutex());
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
@@ -3666,6 +5045,26 @@ int main(int argc, char** argv) {
         recorder.Activate();
         if (argc == 2 && (std::string_view(argv[1]) == "--draw-barriers-only" || std::string_view(argv[1]) == "--draw-barriers-live")) {
             drawBarrierTests(device, recorder, std::string_view(argv[1]) == "--draw-barriers-live");
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--speculated-draw-only") {
+            speculatedDrawTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--benchmark-draw-set") {
+            drawSetBenchmark(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--moved-publish-only") {
+            movedPublishTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--draw-set-writes-only") {
+            drawSetWriteTests(device, recorder);
+            return 0;
+        }
+        if (argc >= 2 && std::string_view(argv[1]) == "--benchmark-commit") {
+            commitBenchmark(device, recorder, argc >= 3 ? static_cast<std::size_t>(std::strtoull(argv[2], nullptr, 10)) : std::size_t{20000});
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--upload-memory-only") {
@@ -3691,6 +5090,28 @@ int main(int argc, char** argv) {
             std::cout << "Merged import bounds test passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--submit-reasons-only") {
+            submitReasonTests(device, recorder);
+            knownSourceTests(recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--starve-age-only") {
+            starveAgeTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--fence-nodrain-only") {
+            fenceNoDrainTests(device, recorder);
+            submitReasonTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--cpu-timeline-only") {
+            cpuTimelineTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--usage-elide-only") {
+            usageElideTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--cube-only") {
             singleCubeTests(device, recorder);
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
@@ -3706,6 +5127,9 @@ int main(int argc, char** argv) {
         completionCountTests(device, recorder);
         afterRecordedWorkTests(device, recorder);
         batchStampTests(recorder);
+        submitReasonTests(device, recorder);
+        knownSourceTests(recorder);
+        if (Recorder::FenceNoDrain()) fenceNoDrainTests(device, recorder);
         labelTests(recorder);
         lateLabelTests(recorder);
         largeLabelTests(recorder);
@@ -3732,6 +5156,7 @@ int main(int argc, char** argv) {
         unitShadowTests(device, recorder);
         storageRefreshTests(device, recorder, false);
         storageRefreshTests(device, recorder, true);
+        usageElideTests(device, recorder);
         writeBackPaddingTests(device, recorder, false);
         writeBackPaddingTests(device, recorder, true);
         importWatchTests(device);

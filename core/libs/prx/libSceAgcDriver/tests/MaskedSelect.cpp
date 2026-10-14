@@ -114,10 +114,11 @@ int main() {
     passed &= run("masked resource evaluation isolates masks and runtime inputs", [] {
         IrResourcePlan plan;
         plan.denseValueIds = true;
+        plan.valueStorage.Reserve(32);
         const auto node = [&](IrOpcode opcode, IrType type, std::initializer_list<std::uint32_t> arguments, bool immediate = false, std::uint64_t bits = 0) {
-            const auto id = static_cast<std::uint32_t>(plan.valueStorage.size());
-            auto value = std::make_unique<IrValue>(opcode, type, id);
-            for (const auto argument : arguments) value->AddArgument(plan.valueStorage[argument].get());
+            const auto id = static_cast<std::uint32_t>(plan.valueStorage.Size());
+            auto* value = plan.valueStorage.Create(opcode, type, id);
+            for (const auto argument : arguments) value->AddArgument(&plan.valueStorage[argument]);
             if (immediate) {
                 if (type == IrType::Bool) value->SetImmediateBool(bits != 0);
                 else value->SetImmediateU32(static_cast<std::uint32_t>(bits));
@@ -131,7 +132,6 @@ int main() {
             compact.immediate = bits;
             plan.compact.arguments.insert(plan.compact.arguments.end(), arguments);
             plan.compact.values.push_back(compact);
-            plan.valueStorage.push_back(std::move(value));
             return id;
         };
         const auto mask = node(IrOpcode::Void, IrType::Bool, {}, true, 0);
@@ -158,14 +158,14 @@ int main() {
             Detail::Evaluator reference(plan, runtime);
             for (const auto id : {first, second, other}) {
                 std::uint32_t actual = 0, expected = 0;
-                if (!compact.Evaluate({plan, id}, actual) || !reference.Evaluate(Detail::IrNode(plan.valueStorage[id].get()), expected)) return false;
+                if (!compact.Evaluate({plan, id}, actual) || !reference.Evaluate(Detail::IrNode(&plan.valueStorage[id]), expected)) return false;
                 if (actual != expected || actual != (id == other ? 7u : address)) return false;
             }
         }
         for (const bool tracedLeaf : {false, true}) {
             std::uint32_t reads = 0;
             SrtReadTrace trace;
-            if (tracedLeaf) trace.leaf = plan.valueStorage[read].get();
+            if (tracedLeaf) trace.leaf = &plan.valueStorage[read];
             SrtRuntime runtime;
             runtime.readTrace = &trace;
             runtime.userContext = &reads;

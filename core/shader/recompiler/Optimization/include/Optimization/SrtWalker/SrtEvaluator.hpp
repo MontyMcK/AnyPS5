@@ -150,7 +150,7 @@ public:
     }
     [[nodiscard]] std::uint32_t RegisterIndex() const { return entry().registerIndex; }
     [[nodiscard]] std::uint32_t Id() const { return _id; }
-    [[nodiscard]] IrValue* Value() const { return _program->valueStorage[_id].get(); }
+    [[nodiscard]] IrValue* Value() const { return const_cast<IrValue*>(&_program->valueStorage[_id]); }
     bool operator==(const CompactNode& other) const { return _id == other._id; }
 
 private:
@@ -163,10 +163,11 @@ private:
 template<typename TNode>
 class BasicEvaluator {
 public:
-    BasicEvaluator(const IrResourcePlan& program, const SrtRuntime& runtime, std::span<const std::uint8_t> cleanFlatSlots = {}, BasicEvaluator* cleanEvaluator = nullptr, const TNode* activeMask = nullptr) : _program(program), _runtime(runtime), _cleanFlatSlots(cleanFlatSlots), _cleanEvaluator(cleanEvaluator), _activeMask(activeMask != nullptr ? *activeMask : TNode{}), _masked(activeMask != nullptr), _dense(program.denseValueIds ? program.valueStorage.size() : 0u) {}
+    BasicEvaluator(const IrResourcePlan& program, const SrtRuntime& runtime, std::span<const std::uint8_t> cleanFlatSlots = {}, BasicEvaluator* cleanEvaluator = nullptr, const TNode* activeMask = nullptr) : _program(program), _runtime(runtime), _cleanFlatSlots(cleanFlatSlots), _cleanEvaluator(cleanEvaluator), _activeMask(activeMask != nullptr ? *activeMask : TNode{}), _masked(activeMask != nullptr), _dense(program.denseValueIds ? program.valueStorage.Size() : 0u) {}
     BasicEvaluator(const BasicEvaluator&) = delete;
     BasicEvaluator& operator=(const BasicEvaluator&) = delete;
 
+    static bool MayEvaluate(const IrResourcePlan& program, IrValue* value);
     bool Evaluate(TNode value, std::uint32_t& result);
     bool EvaluateWide(TNode value, std::uint64_t& result);
 

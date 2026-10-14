@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -191,6 +192,10 @@ GpuMutexType& GpuMutex();
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.
 void SetGpuUnlockHook(void (*hook)());
+// Called with each profiled (APS5_PROFILE_DRAW) outermost GPU mutex hold of a millisecond or more,
+// on the holder's thread right before it releases: the recorder's cpu-timeline.txt hold events.
+// One hook, set once; it must not take GpuMutex.
+void SetGpuHoldHook(void (*hook)(std::chrono::steady_clock::time_point begin, std::chrono::steady_clock::time_point end, std::size_t site, const char* siteName));
 // Debug aid (APS5_ASSERT_GPU_LOCK=1): aborts with a [lock] line naming `where` when the calling
 // thread does not hold GpuMutex. Recording, submits, command batches and the detiler's pools must
 // only be reached under it (a resource build's stage A runs without it, see ShaderResources).

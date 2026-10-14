@@ -18,9 +18,22 @@ void ReturnBdaZeroIf(SpirvEmitterState& state, std::uint32_t condition) {
     EmitLabel(state, next);
 }
 
+void ReturnBdaRangeZeroIf(SpirvEmitterState& state, std::uint32_t condition, std::uint32_t zero) {
+    const auto failed = state.module.AllocateId();
+    const auto next = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, condition, failed, next);
+    EmitLabel(state, failed);
+    state.module.AddFunction(spv::OpReturnValue, zero);
+    EmitLabel(state, next);
+}
+
 // (u64 address, u32 bytes, u32 instruction) -> u64 device address of the range holding all the bytes,
-std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool recordFaults, std::uint32_t permission = BdaAbi::Read) {
-    const bool cached = state.bdaCacheBegin != 0;
+// or with `rangeResult` (the anchor search, see EmitBdaAnchors) the u64 vector (begin, end, device
+// address) of that range, zero when the lookup would fail. The range search does not read or fill
+// the lookup cache.
+std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool recordFaults, std::uint32_t permission = BdaAbi::Read, bool rangeResult = false) {
+    const bool cached = state.bdaCacheBegin != 0 && !rangeResult;
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
     const auto boolean = TypeBool(state);
@@ -36,7 +49,9 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     // APS5_BDA_INLINE_ALL=1 (experiment, in the cache version): the driver may inline the lookups,
     // so a call's register saves and restores go away at the cost of code size.
     static const bool inlineAll = std::getenv("APS5_BDA_INLINE_ALL") != nullptr;
-    state.module.AddFunction(spv::OpFunction, u64, function, inlineAll ? spv::FunctionControlMaskNone : spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, u64, u64, u32, u32));
+    const auto rangeType = rangeResult ? state.module.Type(spv::OpTypeVector, u64, 3u) : 0u;
+    const auto resultType = rangeResult ? rangeType : u64;
+    state.module.AddFunction(spv::OpFunction, resultType, function, inlineAll || rangeResult ? spv::FunctionControlMaskNone : spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, resultType, u64, u32, u32));
     const auto address = state.module.AllocateId();
     const auto bytes = state.module.AllocateId();
     const auto instruction = state.module.AllocateId();
@@ -49,7 +64,8 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto pointer = TypePointer(state, spv::StorageClassFunction, u32);
     state.module.AddFunction(spv::OpVariable, pointer, low, spv::StorageClassFunction);
     state.module.AddFunction(spv::OpVariable, pointer, high, spv::StorageClassFunction);
-    if (state.bdaHintVariable == 0) state.bdaHintVariable = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, u32), spv::StorageClassPrivate, constant(0));
+    const bool hinted = !state.bdaNoLookupState;
+    if (hinted && state.bdaHintVariable == 0) state.bdaHintVariable = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, u32), spv::StorageClassPrivate, constant(0));
     if (cached) {
         const auto load64 = [&](std::uint32_t pointer) {
             const auto value = state.module.AllocateId();
@@ -100,7 +116,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
             EmitLabel(state, victimMiss);
         }
     }
-    if (BdaHintFastPath()) {
+    if (BdaHintFastPath() && !rangeResult && hinted) {
         const auto tableWords = state.module.AllocateId();
         state.module.AddFunction(spv::OpArrayLength, u32, tableWords, state.bdaPagetableVariable, 0u);
         const auto headerOk = binary(spv::OpUGreaterThanEqual, boolean, tableWords, constant(4));
@@ -146,8 +162,11 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         state.module.AddFunction(spv::OpBranch, headerDone);
         EmitLabel(state, headerDone);
     }
+    const auto rangeZero = rangeResult ? state.module.Constant(spv::OpConstantComposite, rangeType, BdaConstant(state, 0u), BdaConstant(state, 0u), BdaConstant(state, 0u)) : 0u;
     const auto fail = [&](std::uint32_t condition, BdaAbi::FaultReason reason) {
-        if (recordFaults) {
+        if (rangeResult) {
+            ReturnBdaRangeZeroIf(state, condition, rangeZero);
+        } else if (recordFaults) {
             ReturnBdaFailureIf(state, condition, address, bytes, instruction, reason);
         } else {
             ReturnBdaZeroIf(state, condition);
@@ -173,16 +192,18 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     fail(binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow);
     state.module.AddFunction(spv::OpStore, low, constant(0));
     state.module.AddFunction(spv::OpStore, high, count);
-    const auto hint = load(state.bdaHintVariable);
-    const auto hinted = binary(spv::OpLogicalAnd, boolean, binary(spv::OpINotEqual, boolean, hint, constant(0)), binary(spv::OpULessThanEqual, boolean, hint, count));
-    EmitIfCondition(state, hinted, [&] {
-        const auto candidate = binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, hint, constant(1)), constant(8)));
-        const auto inside = binary(spv::OpLogicalAnd, boolean, binary(spv::OpULessThanEqual, boolean, BdaLoadAddress(state, candidate), address), binary(spv::OpULessThanEqual, boolean, end, BdaLoadAddress(state, binary(spv::OpIAdd, u32, candidate, constant(2)))));
-        EmitIfCondition(state, inside, [&] {
-            state.module.AddFunction(spv::OpStore, low, hint);
-            state.module.AddFunction(spv::OpStore, high, hint);
+    if (hinted) {
+        const auto hint = load(state.bdaHintVariable);
+        const auto inHint = binary(spv::OpLogicalAnd, boolean, binary(spv::OpINotEqual, boolean, hint, constant(0)), binary(spv::OpULessThanEqual, boolean, hint, count));
+        EmitIfCondition(state, inHint, [&] {
+            const auto candidate = binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, hint, constant(1)), constant(8)));
+            const auto inside = binary(spv::OpLogicalAnd, boolean, binary(spv::OpULessThanEqual, boolean, BdaLoadAddress(state, candidate), address), binary(spv::OpULessThanEqual, boolean, end, BdaLoadAddress(state, binary(spv::OpIAdd, u32, candidate, constant(2)))));
+            EmitIfCondition(state, inside, [&] {
+                state.module.AddFunction(spv::OpStore, low, hint);
+                state.module.AddFunction(spv::OpStore, high, hint);
+            });
         });
-    });
+    }
     EmitIfCondition(state, binary(spv::OpLogicalAnd, boolean, hasBuckets, binary(spv::OpULessThan, boolean, load(low), load(high))), [&] {
         const auto index = binary(spv::OpIAdd, u32, constant(4), binary(spv::OpShiftLeftLogical, u32, count, constant(3)));
         const auto first = BdaLoadAddress(state, index);
@@ -243,7 +264,14 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     fail(binary(spv::OpULessThan, boolean, result, base), BdaAbi::FaultReason::Overflow);
     const auto deviceEnd = binary(spv::OpIAdd, u64, result, Unary(state, spv::OpUConvert, u64, bytes));
     fail(binary(spv::OpULessThanEqual, boolean, deviceEnd, result), BdaAbi::FaultReason::Overflow);
-    state.module.AddFunction(spv::OpStore, state.bdaHintVariable, index);
+    if (rangeResult) {
+        const auto range = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, rangeType, range, begin, finish, base);
+        state.module.AddFunction(spv::OpReturnValue, range);
+        state.module.AddFunction(spv::OpFunctionEnd);
+        return function;
+    }
+    if (hinted) state.module.AddFunction(spv::OpStore, state.bdaHintVariable, index);
     if (cached) {
         if (state.bdaVictimBegin != 0) {
             const auto demote = [&](std::uint32_t from, std::uint32_t to, std::uint32_t type) {
@@ -443,6 +471,10 @@ void EmitBdaClockReport(SpirvEmitterState& state) {
     });
 }
 
+void DefineBdaAnchorFunction(SpirvEmitterState& state) {
+    if (state.bdaAnchorFunction == 0) state.bdaAnchorFunction = DefineBdaLookup(state, "bda_anchor_range", false, BdaAbi::Read, true);
+}
+
 void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (!state.program.Info().usesDma) return;
     if (BdaClockEnabled()) {
@@ -451,11 +483,19 @@ void DefineGetBdaPointer(SpirvEmitterState& state) {
         state.bdaClockLookup = state.module.DefineInitializedGlobalVariable(u64Pointer, spv::StorageClassPrivate, BdaConstant(state, 0u));
         state.bdaClockCalls = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeU32(state)), spv::StorageClassPrivate, ConstantU32(state, 0u));
     }
-    if (BdaLookupCached()) DefineBdaLookupCache(state);
+    CollectBdaAnchors(state);
+    // A program with anchors keeps no lookup state (the cache and the hint) across its lookups:
+    // Private variables that the lookup functions and the program share hold registers through
+    // the whole program on NVIDIA (anchored 4K passes of PPSA01317 ran 3.2 ms with them, 3.0
+    // without), and the anchors leave the lookups to the rare reads they miss. Neither changes
+    // what a lookup returns.
+    state.bdaNoLookupState = state.bdaNoLookupState || !state.bdaAnchors.empty();
+    if (BdaLookupCached() && !state.bdaNoLookupState) DefineBdaLookupCache(state);
     DefineBdaFaultFunction(state);
     state.bdaPointerFunction = DefineBdaLookup(state, "get_bda_pointer", true);
     if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false);
     DefineBdaDwordReadFunctions(state);
+    if (!state.bdaAnchors.empty()) DefineBdaAnchorFunction(state);
     if (state.program.Info().bdaWrites) {
         state.bdaWritePointerFunction = DefineBdaLookup(state, "get_bda_write_pointer", true, BdaAbi::Write);
         state.bdaAtomicPointerFunction = DefineBdaLookup(state, "get_bda_atomic_pointer", true, BdaAbi::Read | BdaAbi::Write);

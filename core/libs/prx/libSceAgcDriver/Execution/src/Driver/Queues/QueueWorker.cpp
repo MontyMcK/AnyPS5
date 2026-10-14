@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/CpuTimeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -74,7 +75,7 @@ void Driver::submitOpenWork() {
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto localDevice = device.Load();
     recordDeferredLabels(localDevice.get(), 0);
-    if (localDevice != nullptr) localDevice->SubmitRecorded(true);
+    if (localDevice != nullptr) localDevice->SubmitRecorded(true, Graphics::Recorder::SubmitReason::SubmissionEnd);
 }
 
 void Driver::completeSubmission(std::uint64_t serial, std::uint64_t received, std::span<const std::uint64_t> labelWrites) {
@@ -152,6 +153,7 @@ void Driver::run(std::uint32_t id) noexcept {
         for (;;) {
             submission = Submission{};
             static const bool traceGpu = std::getenv("APS5_TRACE_GPU") != nullptr;
+            const auto idleSince = Graphics::CpuTimeline::Active() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             {
                 PerformanceContext timingContext(id == 0 ? frameTiming() : FrameTiming::Async());
                 PerformanceTimer timing("Driver.WorkerWait");
@@ -210,6 +212,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 worker.queued.fetch_sub(1, std::memory_order_acq_rel);
                 if (profile && submission.enqueuedAt != std::chrono::steady_clock::time_point{}) costs.dequeueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - submission.enqueuedAt).count());
             }
+            if (idleSince != std::chrono::steady_clock::time_point{}) Graphics::CpuTimeline::Event("dequeue", idleSince, std::chrono::steady_clock::now(), id, submission.serial);
             {
                 struct Running {
                     std::atomic<std::uint32_t>& count;

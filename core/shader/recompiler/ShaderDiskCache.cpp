@@ -67,13 +67,13 @@ namespace ShaderRecompiler::ShaderDiskCache {
 static_assert(sizeof(CompiledShaderArtifact) == 128, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 72, "ShaderInvocation changed: update the invocation encoder");
 static_assert(sizeof(RecompileResult) == 208, "RecompileResult changed: update EncodeResult and DecodeResult");
-static_assert(sizeof(DescriptorBinding) == 448, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(DescriptorBinding) == 512, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 28, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 12, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 12, "FragmentParameter changed: update the parameter encoder");
 static_assert(sizeof(CompiledShaderInfo) == 328, "CompiledShaderInfo changed: update the info encoder");
 static_assert(sizeof(ShaderInfo) == 224, "ShaderInfo changed: update the info encoder");
-static_assert(sizeof(BufferResource) == 32, "BufferResource changed: update the info encoder");
+static_assert(sizeof(BufferResource) == 56, "BufferResource changed: update the info encoder");
 static_assert(sizeof(ImageResource) == 104, "ImageResource changed: update the info encoder");
 static_assert(sizeof(SamplerResource) == 16, "SamplerResource changed: update the info encoder");
 static_assert(sizeof(SampledResourcePair) == 12, "SampledResourcePair changed: update the info encoder");
@@ -238,6 +238,46 @@ private:
     bool ok = true;
 };
 
+void encodeAffine(Writer& writer, const InvocationAffine& form) {
+    writer.Value(form.constant);
+    for (const auto value : form.group) writer.Value(value);
+    for (const auto value : form.local) writer.Value(value);
+}
+
+void decodeAffine(Reader& reader, InvocationAffine& form) {
+    reader.Value(form.constant);
+    for (auto& value : form.group) reader.Value(value);
+    for (auto& value : form.local) reader.Value(value);
+}
+
+void encodeCovers(Writer& writer, const std::vector<BufferStoreCover>& covers) {
+    writer.List(covers, [](Writer& out, const BufferStoreCover& cover) {
+        encodeAffine(out, cover.offset);
+        encodeAffine(out, cover.scalarOffset);
+        out.Value(cover.immediate);
+        out.Value(cover.bytes);
+        out.Value(cover.indexed);
+        out.List(cover.bounds, [](Writer& inner, const InvocationBound& bound) {
+            encodeAffine(inner, bound.value);
+            inner.Value(bound.limit);
+        });
+    });
+}
+
+void decodeCovers(Reader& reader, std::vector<BufferStoreCover>& covers) {
+    reader.List(covers, 66, [](Reader& in, BufferStoreCover& cover) {
+        decodeAffine(in, cover.offset);
+        decodeAffine(in, cover.scalarOffset);
+        in.Value(cover.immediate);
+        in.Value(cover.bytes);
+        in.Value(cover.indexed);
+        in.List(cover.bounds, 32, [](Reader& inner, InvocationBound& bound) {
+            decodeAffine(inner, bound.value);
+            inner.Value(bound.limit);
+        });
+    });
+}
+
 void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Value(binding.kind);
     writer.Value(binding.role);
@@ -258,6 +298,8 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.samplerUnnormalized);
     writer.Flags(binding.imageUnnormalized);
     writer.Values(std::span<const std::uint64_t>(binding.imageSamplers));
+    writer.Flags(binding.bufferRead);
+    writer.List(binding.bufferCovers, [](Writer& out, const std::vector<BufferStoreCover>& covers) { encodeCovers(out, covers); });
 }
 
 void decodeBinding(Reader& reader, DescriptorBinding& binding) {
@@ -281,6 +323,8 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Flags(binding.samplerUnnormalized);
     reader.Flags(binding.imageUnnormalized);
     reader.Values(binding.imageSamplers);
+    reader.Flags(binding.bufferRead);
+    reader.List(binding.bufferCovers, 8, [](Reader& in, std::vector<BufferStoreCover>& covers) { decodeCovers(in, covers); });
 }
 
 void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
@@ -449,6 +493,7 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(buffer.formattedReadMask);
         out.Value(buffer.scalar);
         out.Value(buffer.typedAlignment);
+        encodeCovers(out, buffer.covers);
     });
     writer.List(info.images, [](Writer& out, const ImageResource& image) {
         out.Value(image.source);
@@ -538,7 +583,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
     auto& info = compiled.info;
     reader.Value(info.scratchDwords);
     reader.Value(info.sharedMemoryBytes);
-    reader.List(info.buffers, 27, [](Reader& in, BufferResource& buffer) {
+    reader.List(info.buffers, 35, [](Reader& in, BufferResource& buffer) {
         in.Value(buffer.source);
         in.Value(buffer.firstUsePc);
         in.Value(buffer.maxByteExtent);
@@ -551,6 +596,7 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(buffer.formattedReadMask);
         in.Value(buffer.scalar);
         in.Value(buffer.typedAlignment);
+        decodeCovers(in, buffer.covers);
     });
     reader.List(info.images, 72, [](Reader& in, ImageResource& image) {
         in.Value(image.source);
@@ -917,7 +963,7 @@ DiskStore& store() {
 std::uint64_t SourceVersion() {
     // Switches that change the generated code take part in the version, so each setting keeps its
     // own entries (APS5_BDA_HINT_FAST, see SpirvBdaRead.cpp).
-    static const std::uint64_t version = (std::getenv("APS5_BDA_HINT_FAST") != nullptr ? Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull : Generated::SourceVersion) ^ (std::getenv("APS5_ELECT_SCALAR_BDA") != nullptr ? 0xc2b2ae3d27d4eb4full : 0ull) ^ (std::getenv("APS5_BDA_INLINE_HIT") != nullptr ? 0x165667b19e3779f9ull : 0ull) ^ (std::getenv("APS5_BDA_VICTIM") != nullptr ? 0x27d4eb2f165667c5ull : 0ull) ^ (std::getenv("APS5_PS_FULL_EXEC") != nullptr ? 0x94d049bb133111ebull : 0ull) ^ (std::getenv("APS5_LANE_BIT_FOLD") != nullptr ? 0xbf58476d1ce4e5b9ull : 0ull) ^ (std::getenv("APS5_BDA_INLINE_ALL") != nullptr ? 0x2545f4914f6cdd1dull : 0ull) ^ (std::getenv("APS5_BDA_CLOCK") != nullptr ? 0x9fb21c651e98df25ull : 0ull) ^ (std::getenv("APS5_SAMPLEID_ZERO") != nullptr ? 0xd6e8feb86659fd93ull : 0ull);
+    static const std::uint64_t version = (std::getenv("APS5_BDA_HINT_FAST") != nullptr ? Generated::SourceVersion ^ 0x9e3779b97f4a7c15ull : Generated::SourceVersion) ^ (std::getenv("APS5_ELECT_SCALAR_BDA") != nullptr ? 0xc2b2ae3d27d4eb4full : 0ull) ^ (std::getenv("APS5_BDA_INLINE_HIT") != nullptr ? 0x165667b19e3779f9ull : 0ull) ^ (std::getenv("APS5_BDA_VICTIM") != nullptr ? 0x27d4eb2f165667c5ull : 0ull) ^ (std::getenv("APS5_PS_FULL_EXEC") != nullptr ? 0x94d049bb133111ebull : 0ull) ^ (std::getenv("APS5_LANE_BIT_FOLD") != nullptr ? 0xbf58476d1ce4e5b9ull : 0ull) ^ (std::getenv("APS5_BDA_INLINE_ALL") != nullptr ? 0x2545f4914f6cdd1dull : 0ull) ^ (std::getenv("APS5_BDA_CLOCK") != nullptr ? 0x9fb21c651e98df25ull : 0ull) ^ (std::getenv("APS5_SAMPLEID_ZERO") != nullptr ? 0xd6e8feb86659fd93ull : 0ull) ^ (std::getenv("APS5_NO_BDA_ANCHORS") != nullptr ? 0x8cb92ba72f3d8dd7ull : 0ull);
     return version;
 }
 

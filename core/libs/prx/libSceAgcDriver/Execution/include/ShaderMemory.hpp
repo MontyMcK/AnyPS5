@@ -77,6 +77,16 @@ public:
     [[nodiscard]] std::vector<ShaderRecompiler::MemoryRegion> TakeRecentRegions();
     // The driver's source handle memo outcomes, for the [capture] line (APS5_PROFILE_DRAW).
     static void CountHandleMemo(bool hit);
+    // Draw shape reuse (DrawShapeReuse.cpp): one dword read exactly as a capture's walk reads it
+    // (served from the initial regions, else from this memory's pages with their pending-write
+    // policy and evidence), and counted in Regions() and TakeRecentRegions() like one. Throws
+    // where the walk's read would.
+    std::uint32_t ReadWord(std::uint64_t address);
+    // Between BeginTentative() and EndTentative(keep), the reads' marks in Regions() and
+    // TakeRecentRegions() are recorded; EndTentative(false) removes the marks those reads added (the
+    // fetched words stay cached, as a page an earlier stage read stays).
+    void BeginTentative();
+    void EndTentative(bool keep);
 
 private:
     std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation);
@@ -87,6 +97,7 @@ private:
     public:
         [[nodiscard]] bool Test(std::size_t index) const { return (bits[index / 64u] >> (index % 64u) & 1u) != 0u; }
         void Set(std::size_t index) { bits[index / 64u] |= std::uint64_t{1} << (index % 64u); }
+        void Clear(std::size_t index) { bits[index / 64u] &= ~(std::uint64_t{1} << (index % 64u)); }
         void SetAll() { bits.fill(~std::uint64_t{0}); }
         void SetBlock(std::size_t index) { bits[index / 64u] |= ((std::uint64_t{1} << BlockWords) - 1u) << (index % 64u / BlockWords * BlockWords); }
         void Reset() { bits.fill(0u); }
@@ -121,6 +132,15 @@ private:
     PendingWriteQuery pendingWrite = nullptr;
     PendingWriteObserver observe = nullptr;
     HookWaitCounter hookWaits = nullptr;
+    // BeginTentative's record: each read that added a mark, with the marks it added (1 read,
+    // 2 recent).
+    struct TentativeMark {
+        Page* page;
+        std::uint16_t index;
+        std::uint8_t added;
+    };
+    bool tentative = false;
+    std::vector<TentativeMark> tentativeMarks;
 };
 
 // The positions, among a dispatch-cache variant's stored words, of the pure flat-SRT leaves a

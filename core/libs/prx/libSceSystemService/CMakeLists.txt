@@ -1,5 +1,6 @@
 add_library(libSceSystemService SHARED EXCLUDE_FROM_ALL Export.cpp)
 target_include_directories(libSceSystemService PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(libSceSystemService PRIVATE libSceAgcDriver)
 configure_windows_unwind(libSceSystemService)
 
 if(BUILD_TESTING)

@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Graphics/include/CpuTimeline.hpp"
+#include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuCheckpoints.hpp"
 #include <immintrin.h>
@@ -336,11 +338,33 @@ struct SpeculationStats {
     std::atomic<std::uint64_t> acceptedTemplate{0};
     std::array<std::atomic<std::uint64_t>, SpeculationMissCount> prep{};
     std::array<std::atomic<std::uint64_t>, SpeculationMissCount> commit{};
+    // Speculated pipelines (live `spec_pipeline`): peeked on prep, taken by the committer, or
+    // found replaced there (the committer then asked the store).
+    std::atomic<std::uint64_t> pipelinesPeeked{0};
+    std::atomic<std::uint64_t> pipelinesTaken{0};
+    std::atomic<std::uint64_t> pipelinesStale{0};
+    // Stamped cache entries (live `spec_entry_stamp`): proven by stamp, or looked up again.
+    std::atomic<std::uint64_t> entriesStamped{0};
+    std::atomic<std::uint64_t> entriesLooked{0};
 };
 
 SpeculationStats& Speculations() {
     static SpeculationStats stats;
     return stats;
+}
+
+std::atomic<std::uint64_t> pipelinesTakenTotal{0};
+
+std::atomic<std::uint64_t> entriesStampedTotal{0};
+
+void countEntryStamp(bool stamped) {
+    (stamped ? Speculations().entriesStamped : Speculations().entriesLooked).fetch_add(1, std::memory_order_relaxed);
+    if (stamped) entriesStampedTotal.fetch_add(1, std::memory_order_relaxed);
+}
+
+void countSpeculatedPipeline(bool taken) {
+    (taken ? Speculations().pipelinesTaken : Speculations().pipelinesStale).fetch_add(1, std::memory_order_relaxed);
+    if (taken) pipelinesTakenTotal.fetch_add(1, std::memory_order_relaxed);
 }
 
 void reportSpeculation() {
@@ -354,6 +378,14 @@ void reportSpeculation() {
     for (std::size_t i = 1; i < SpeculationMissCount; ++i) {
         if (const auto count = take(stats.commit[i]); count != 0) line += " " + std::string(SpeculationMissNames[i]) + " " + std::to_string(count);
     }
+    // Which surface the prep threads' pending refusals stopped at (ShaderResources::
+    // SpeculatedPendingVerdict), and the proofs that accepted own-source view overlaps.
+    const auto verdicts = ShaderResources::TakePendingVerdicts();
+    using Verdict = ShaderResources::PendingVerdict;
+    const auto verdict = [&](Verdict which) { return std::to_string(verdicts[static_cast<std::size_t>(which)]); };
+    line += "; pending refusals by surface: own-source view " + verdict(Verdict::OwnSource) + " (spec_own_pending " + (ShaderResources::SpeculateOwnPending() ? "on" : "off") + ", accepted " + verdict(Verdict::Clear) + "), foreign over a view " + verdict(Verdict::ForeignView) + ", over a storage image " + verdict(Verdict::Storage) + ", over a snapshot " + verdict(Verdict::Snapshot);
+    line += "; pipelines (spec_pipeline " + std::string(SpeculatedPipelines() ? "on" : "off") + "): peeked " + std::to_string(take(stats.pipelinesPeeked)) + ", taken " + std::to_string(take(stats.pipelinesTaken)) + ", stale " + std::to_string(take(stats.pipelinesStale));
+    line += "; cache entries (spec_entry_stamp " + std::string(SpeculatedEntryStamps() ? "on" : "off") + "): stamped " + std::to_string(take(stats.entriesStamped)) + ", looked up " + std::to_string(take(stats.entriesLooked));
     std::fprintf(stderr, "%s\n", line.c_str());
 }
 
@@ -411,6 +443,36 @@ AppliedWindow& appliedWindow() {
 }
 
 // Adds one draw's phases to the totals and prints the [draws] and [rescache] lines every 10 s.
+bool DeferDrops() {
+    static const bool requested = std::getenv("APS5_DEFER_DROPS") != nullptr;
+    return LiveFlag("defer_drops", requested);
+}
+
+std::atomic<std::uint64_t> deferredDrops{0};
+
+// APS5_PROFILE_DRAW: the steps of the lookup, build and keep phases of the draw in progress on
+// this thread, for the cpu-timeline "draw-slow" text (a slow draw names the step that took the
+// time, not only the phase). Laps run from the previous lap of the same draw; reportDraw prints the
+// ones of 100 us or more and clears them.
+enum DrawStep : std::size_t { StepKey, StepFind, StepProof, StepAlias, StepDrop, StepBuild, StepKeepWrites, StepKeepDirty, StepKeepObjects, StepCount };
+constexpr std::array<const char*, StepCount> DrawStepNames{"key", "find", "proof", "alias", "drop", "build", "keep-writes", "keep-dirty", "keep-objects"};
+struct DrawSteps {
+    std::array<double, StepCount> us{};
+    std::chrono::steady_clock::time_point at{};
+};
+thread_local DrawSteps drawSteps;
+
+void stepStart(bool profile) {
+    if (profile) drawSteps.at = std::chrono::steady_clock::now();
+}
+
+void stepLap(bool profile, DrawStep step) {
+    if (!profile) return;
+    const auto now = std::chrono::steady_clock::now();
+    drawSteps.us[step] += std::chrono::duration<double, std::micro>(now - drawSteps.at).count();
+    drawSteps.at = now;
+}
+
 void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources::BuildTiming* built, const DrawOutcome& outcome) {
     auto& profile = Profile();
     std::lock_guard lock(profile.mutex);
@@ -421,6 +483,20 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         drawUs += us[i];
     }
     profile.maxDrawUs = std::max(profile.maxDrawUs, drawUs);
+    if (drawUs >= 1000.0 && CpuTimeline::Active()) {
+        // cpu-timeline.txt: a slow draw with its phases (the commit holding the GPU mutex that long).
+        char text[320];
+        int length = std::snprintf(text, sizeof(text), "slow-lookups=%llu/%.0fus", static_cast<unsigned long long>(outcome.slowLookups), outcome.slowLookupUs);
+        for (std::size_t i = 0; i < PhaseCount && length > 0 && static_cast<std::size_t>(length) < sizeof(text); ++i) {
+            if (us[i] >= 100.0) length += std::snprintf(text + length, sizeof(text) - static_cast<std::size_t>(length), " %s=%.0fus", DrawPhaseNames[i], us[i]);
+        }
+        for (std::size_t i = 0; i < StepCount && length > 0 && static_cast<std::size_t>(length) < sizeof(text); ++i) {
+            if (drawSteps.us[i] >= 100.0) length += std::snprintf(text + length, sizeof(text) - static_cast<std::size_t>(length), " step-%s=%.0fus", DrawStepNames[i], drawSteps.us[i]);
+        }
+        const auto now = CpuTimeline::Clock::now();
+        CpuTimeline::Event("draw-slow", now - std::chrono::microseconds(static_cast<std::int64_t>(drawUs)), now, static_cast<std::uint64_t>(drawUs), outcome.kind, text);
+    }
+    drawSteps.us = {};
     profile.hookWaitUs += outcome.hookWaitUs;
     profile.maxHookWaitUs = std::max(profile.maxHookWaitUs, outcome.hookWaitUs);
     profile.ownSyncUs += outcome.ownSyncUs;
@@ -504,6 +580,17 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu", DrawRecipeMissName(static_cast<DrawRecipeMiss>(i)), static_cast<unsigned long long>(profile.recipeMisses[i]));
     }
     std::fprintf(stderr, "%s\n", line);
+    {
+        // bind_elide: the graphics binds recorded and skipped over the 10 s, and the drops handed to
+        // the open batch (defer_drops).
+        const auto binds = TakeBindCounts();
+        constexpr std::array<const char*, 6> bindNames{"set", "push constants", "vertex buffers", "index buffer", "depth bias", "depth bounds"};
+        std::string bindLine = "[binds] (10 s, bind_elide " + std::string(BindElision() ? "on" : "off") + ") recorded/skipped:";
+        for (std::size_t i = 0; i < bindNames.size(); ++i) bindLine += " " + std::string(bindNames[i]) + " " + std::to_string(binds.recorded[i]) + "/" + std::to_string(binds.skipped[i]);
+        bindLine += "; drops released with the batch (defer_drops " + std::string(DeferDrops() ? "on" : "off") + ") " + std::to_string(deferredDrops.exchange(0, std::memory_order_relaxed));
+        bindLine += "; moved checks after a publish only (moved_publish_check " + std::string(ShaderResources::MovedPublishCheck() ? "on" : "off") + ") " + std::to_string(ShaderResources::TakeMovedPublishChecks());
+        std::fprintf(stderr, "%s\n", bindLine.c_str());
+    }
     const auto inputMemo = DrawInputMemoCounters();
     if (inputMemo.hits != 0 || inputMemo.misses != 0)
         std::fprintf(stderr, "[draw-input] cumulative memo hits %llu, fallbacks %llu\n", static_cast<unsigned long long>(inputMemo.hits), static_cast<unsigned long long>(inputMemo.misses));
@@ -833,10 +920,23 @@ void ScreenTokenWindow(DrawSpeculation& speculation) {
         if (!speculation.windowed || window.check == nullptr) {
             verdict = Fallback::WindowOverflow;
         } else {
-            std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
-            reads.reserve(speculation.proof.surfaces.size() + speculation.movedProof.ranges.size());
-            for (const auto& surface : speculation.proof.surfaces) reads.emplace_back(surface.address, surface.address + surface.bytes);
-            reads.insert(reads.end(), speculation.movedProof.ranges.begin(), speculation.movedProof.ranges.end());
+            // The prep thread's list when it made one (spec_window_reads): the surfaces and ranges
+            // it lists are final once the speculation is made, so it equals the list built here.
+            thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
+            auto& built = ShaderRecompiler::ThreadOwned(readsSlot);
+            const bool prepared = speculation.windowReadsMade && SpeculatedWindowReads();
+            if (!prepared || VerifyDrawSpeculation()) {
+                built.clear();
+                built.reserve(speculation.proof.surfaces.size() + speculation.movedProof.ranges.size());
+                for (const auto& surface : speculation.proof.surfaces) built.emplace_back(surface.address, surface.address + surface.bytes);
+                built.insert(built.end(), speculation.movedProof.ranges.begin(), speculation.movedProof.ranges.end());
+                if (prepared && built != speculation.windowReads) {
+                    std::fprintf(stderr, "[spec] APS5_VERIFY_DRAW_SPECULATION: a speculation's window reads differ from the committer's\n");
+                    std::fflush(stderr);
+                    std::abort();
+                }
+            }
+            const auto& reads = prepared ? speculation.windowReads : built;
             switch (window.check(speculation.frontier, reads)) {
                 case WindowVerdict::Clear: break;
                 case WindowVerdict::Overlap: verdict = Fallback::WindowOverlap; break;
@@ -852,7 +952,55 @@ void ScreenTokenWindow(DrawSpeculation& speculation) {
 namespace {
 
 thread_local std::shared_ptr<DrawSpeculation> currentSpeculation;
+// The last SpeculateDrawResources refusal on this thread, and the committer's last outcome.
+thread_local DrawSpeculation::Miss lastSpeculationRefusal = DrawSpeculation::Miss::None;
+thread_local std::uint8_t lastCommitSpeculation = 0;
 
+}
+
+bool SpeculatedKeyHash() {
+    static const bool requested = std::getenv("APS5_SPEC_KEY_HASH") != nullptr;
+    return LiveFlag("spec_key_hash", requested);
+}
+
+bool SpeculatedEntryStamps() {
+    static const bool requested = std::getenv("APS5_SPEC_ENTRY_STAMP") != nullptr;
+    return LiveFlag("spec_entry_stamp", requested);
+}
+
+bool DeferDropsEnabled() {
+    return DeferDrops();
+}
+
+std::uint64_t SpeculatedEntryStampsTaken() {
+    return entriesStampedTotal.load(std::memory_order_relaxed);
+}
+
+bool SpeculatedWindowReads() {
+    static const bool requested = std::getenv("APS5_SPEC_WINDOW_READS") != nullptr;
+    return LiveFlag("spec_window_reads", requested);
+}
+
+bool SpeculatedPipelines() {
+    static const bool requested = std::getenv("APS5_SPEC_PIPELINE") != nullptr;
+    return LiveFlag("spec_pipeline", requested);
+}
+
+std::uint64_t SpeculatedPipelinesTaken() {
+    return pipelinesTakenTotal.load(std::memory_order_relaxed);
+}
+
+DrawSpeculation::Miss TakeSpeculationRefusal() {
+    return std::exchange(lastSpeculationRefusal, DrawSpeculation::Miss::None);
+}
+
+const char* SpeculationMissName(DrawSpeculation::Miss miss) {
+    const auto index = static_cast<std::size_t>(miss);
+    return index < SpeculationMissCount ? SpeculationMissNames[index] : "?";
+}
+
+std::uint8_t TakeCommitSpeculationOutcome() {
+    return std::exchange(lastCommitSpeculation, std::uint8_t{0});
 }
 
 SpeculationScope::SpeculationScope(std::shared_ptr<DrawSpeculation> speculation) {
@@ -870,8 +1018,10 @@ std::shared_ptr<DrawSpeculation> SpeculateDrawResources(const Context& context, 
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     const auto refuse = [](Miss miss) {
         CountSpeculationMiss(miss, false);
+        lastSpeculationRefusal = miss;
         return std::shared_ptr<DrawSpeculation>{};
     };
+    lastSpeculationRefusal = Miss::None;
     if (noDrawResourceCache || noTextureCache || !std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; })) return refuse(Miss::Uncacheable);
     try {
         auto speculation = std::make_shared<DrawSpeculation>();
@@ -882,7 +1032,11 @@ std::shared_ptr<DrawSpeculation> SpeculateDrawResources(const Context& context, 
         }
         const auto indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
         speculation->key = DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
-        auto cached = SharedResourceCache().Peek(speculation->key);
+        if (SpeculatedKeyHash()) {
+            speculation->keyHash = ResourceCache::HashKey(speculation->key);
+            speculation->hashed = true;
+        }
+        auto cached = speculation->hashed && SpeculatedEntryStamps() ? SharedResourceCache().Peek(speculation->key, speculation->keyHash, speculation->entry) : speculation->hashed ? SharedResourceCache().Peek(speculation->key, speculation->keyHash) : SharedResourceCache().Peek(speculation->key);
         if (cached == nullptr) return refuse(Miss::NoEntry);
         speculation->aliasesOk = true;
         if (trimKey) {
@@ -895,6 +1049,13 @@ std::shared_ptr<DrawSpeculation> SpeculateDrawResources(const Context& context, 
         const bool made = cached->AddressReusable() ? ShaderResources::SpeculateAddressUse(cached, shaders, snapshots, *speculation) : cached->SpeculateTemplate(shaders, *speculation);
         if (!made) return refuse(speculation->miss);
         speculation->source = std::move(cached);
+        if (speculation->windowed && SpeculatedWindowReads()) {
+            auto& reads = speculation->windowReads;
+            reads.reserve(speculation->proof.surfaces.size() + speculation->movedProof.ranges.size());
+            for (const auto& surface : speculation->proof.surfaces) reads.emplace_back(surface.address, surface.address + surface.bytes);
+            reads.insert(reads.end(), speculation->movedProof.ranges.begin(), speculation->movedProof.ranges.end());
+            speculation->windowReadsMade = true;
+        }
         (speculation->kind == DrawSpeculation::Kind::Address ? Speculations().address : Speculations().templates).fetch_add(1, std::memory_order_relaxed);
         return speculation;
     } catch (const std::exception&) {
@@ -962,6 +1123,23 @@ void CountDrawSkip(DrawSkip kind, double us) {
 bool DrawRecipes() {
     static const bool noDrawRecipe = std::getenv("APS5_NO_DRAW_RECIPE") != nullptr;
     return !noDrawRecipe;
+}
+
+namespace {
+
+std::atomic<std::uint64_t> drawRecipeSkips{0};
+
+}
+
+bool DrawRecipeWanted(bool drawKeyHit) {
+    static const bool requested = std::getenv("APS5_RECIPE_ON_HIT") != nullptr;
+    if (drawKeyHit || !LiveFlag("recipe_on_hit", requested)) return true;
+    drawRecipeSkips.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+std::uint64_t TakeDrawRecipeSkips() {
+    return drawRecipeSkips.exchange(0, std::memory_order_relaxed);
 }
 
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
@@ -1397,6 +1575,9 @@ struct DrawPrebuild {
     std::optional<State> masked;
     bool keyed = false;
     ResourceCache::Key key;
+    // ResourceCache::HashKey(key), made with the key (live `spec_key_hash`).
+    std::size_t keyHash = 0;
+    bool hashed = false;
     bool aliasesOk = false;
     AssembledPush push;
     bool storesThroughAddresses = false;
@@ -1618,7 +1799,14 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     auto fetchPlan = prebuilt != nullptr && prebuilt->vertexPlan.has_value() ? std::move(*prebuilt->vertexPlan) : planVertexFetches(state, draw, attributes, inputs.maxIndex, args != nullptr);
     const auto& fetchOf = fetchPlan.fetchOf;
     const auto& plan = fetchPlan.plan;
-    std::vector<std::shared_ptr<Buffer>> shortBuffers(attributes.size());
+    // Per-draw scratch, reused by the thread (emptied again before the return).
+    thread_local std::vector<std::shared_ptr<Buffer>>* shortSlot = nullptr;
+    auto& shortBuffers = ShaderRecompiler::ThreadOwned(shortSlot);
+    shortBuffers.assign(attributes.size(), nullptr);
+    struct ClearShort {
+        std::vector<std::shared_ptr<Buffer>>& buffers;
+        ~ClearShort() { buffers.clear(); }
+    } clearShort{shortBuffers};
     for (std::size_t index = 0; index < attributes.size(); ++index) {
         if (!fetchPlan.shortBytes[index].has_value()) continue;
         const auto& attribute = attributes[index];
@@ -1632,8 +1820,12 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     }
     inputs.vertexBuffers.reserve(plan.copies.size() + std::count_if(shortBuffers.begin(), shortBuffers.end(), [](const auto& buffer) { return buffer != nullptr; }));
     inputs.vertexHandles.reserve(attributes.size());
-    std::vector<VkBuffer> rangeHandles;
-    std::vector<VkDeviceSize> rangeOffsets;
+    thread_local std::vector<VkBuffer>* handlesSlot = nullptr;
+    thread_local std::vector<VkDeviceSize>* offsetsSlot = nullptr;
+    auto& rangeHandles = ShaderRecompiler::ThreadOwned(handlesSlot);
+    auto& rangeOffsets = ShaderRecompiler::ThreadOwned(offsetsSlot);
+    rangeHandles.clear();
+    rangeOffsets.clear();
     rangeHandles.reserve(plan.copies.size());
     rangeOffsets.reserve(plan.copies.size());
     for (std::size_t range = 0; range < plan.copies.size(); ++range) {
@@ -1705,6 +1897,32 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
     return resident;
 }
 
+// Live `defer_drops` (env APS5_DEFER_DROPS): references the committer drops under the GPU mutex
+// that may be the last ones (a template the lookup removed or found unusable, the entries an
+// insert evicted, a refused speculation's address use) go to the open batch's kept objects
+// instead, so their destruction (descriptor sets, buffers, the textures a template pinned past the
+// caches' budgets) runs on the release thread with the batch's other objects (Recorder::Keep's
+// contract) rather than inside the draw. Only the time of the release moves: nothing holds the
+// objects but the batch. Objects holding an allocation lease are released as before (a lease
+// release is not deferred).
+
+void deferDrop(std::shared_ptr<ShaderResources>& object) {
+    // Only a last reference is worth moving: with another holder (the cache, a kept batch) the
+    // drop destroys nothing.
+    if (object == nullptr || object.use_count() != 1 || !DeferDrops() || ForkLogged() != nullptr || ForkWitnessed() != nullptr || object->HoldsLease()) return;
+    // Into a batch already open only: opening one for the drop would change the submissions.
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || !recorder->Recording() || !GuestMemory::GpuMutex().HeldByThisThread()) return;
+    recorder->Keep(std::move(object));
+    object.reset();
+    deferredDrops.fetch_add(1, std::memory_order_relaxed);
+}
+
+void deferDrops(std::vector<std::shared_ptr<ShaderResources>>& objects) {
+    for (auto& object : objects) deferDrop(object);
+    objects.clear();
+}
+
 // A draw's resources (resolveDrawResources): the resource-cache template a recordable draw's
 // stages repeat, or a fresh build.
 thread_local std::shared_ptr<DrawSpeculation> forkSpeculation;
@@ -1722,6 +1940,9 @@ struct ResolvedResources {
     const ShaderResources::BuildTiming* built = nullptr;
     std::shared_ptr<DrawSpeculation> speculated;
     std::shared_ptr<ShaderResources> speculatedSource;
+    // The prep thread's speculation this draw's resources came from (its template proof or its
+    // address use accepted), for its other speculated parts (the peeked pipeline).
+    std::shared_ptr<DrawSpeculation> accepted;
 };
 
 const char* addressSpeculationRefusal(DrawSpeculation::Miss miss) {
@@ -1749,7 +1970,9 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool split = std::getenv("APS5_PROFILE_LOOKUP") != nullptr;
     auto& splitStats = LookupSplitStats();
     auto splitAt = split ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    stepStart(timer.profile);
     const auto splitLap = [&](std::atomic<std::uint64_t>& into) {
+        stepLap(timer.profile, &into == &splitStats.keyNs ? StepKey : &into == &splitStats.findNs ? StepFind : &into == &splitStats.proofNs ? StepProof : StepAlias);
         if (!split) return;
         const auto now = std::chrono::steady_clock::now();
         into.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - splitAt).count()), std::memory_order_relaxed);
@@ -1769,6 +1992,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     resolved.cacheable = recordable && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; });
     auto speculation = ForkLogged() != nullptr ? std::shared_ptr<DrawSpeculation>{} : std::exchange(currentSpeculation, nullptr);
+    const bool brought = speculation != nullptr && speculation->kind != DrawSpeculation::Kind::None;
+    // Only a draw that brought a speculation sets the outcome: a resolve without one (a fallback
+    // re-run, a fork's) leaves the commit's first answer.
+    if (brought) lastCommitSpeculation = 2;
     if (speculation != nullptr && speculation->kind != DrawSpeculation::Kind::None && (!resolved.cacheable || speculation->device != context.device)) {
         CountSpeculationMiss(resolved.cacheable ? DrawSpeculation::Miss::Device : DrawSpeculation::Miss::Uncacheable, true);
         speculation = nullptr;
@@ -1786,8 +2013,26 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 std::fflush(stderr);
                 std::abort();
             }
+            if (speculation->hashed && VerifyDrawSpeculation() && speculation->keyHash != ResourceCache::HashKey(resolved.contentKey)) {
+                std::fprintf(stderr, "[spec] APS5_VERIFY_DRAW_SPECULATION: a speculation's key hash differs from the committer's\n");
+                std::fflush(stderr);
+                std::abort();
+            }
             splitLap(splitStats.keyNs);
-            cached = SharedResourceCache().Find(resolved.contentKey);
+            // The peeked entry still the key's (spec_entry_stamp): Find's answer, with its LRU
+            // move, in O(1) without the key; otherwise the lookup as before.
+            if (speculation->source != nullptr && speculation->entry.stamp != 0 && SpeculatedEntryStamps() && SharedResourceCache().TouchStamped(speculation->entry, *speculation->source)) {
+                cached = speculation->source;
+                countEntryStamp(true);
+                if (VerifyDrawSpeculation() && SharedResourceCache().Find(resolved.contentKey) != cached) {
+                    std::fprintf(stderr, "[spec] APS5_VERIFY_DRAW_SPECULATION: a stamped cache entry differs from the cache's answer for the key\n");
+                    std::fflush(stderr);
+                    std::abort();
+                }
+            } else {
+                if (speculation->entry.stamp != 0) countEntryStamp(false);
+                cached = speculation->hashed ? SharedResourceCache().Find(resolved.contentKey, speculation->keyHash) : SharedResourceCache().Find(resolved.contentKey);
+            }
             splitLap(splitStats.findNs);
             if (cached == nullptr || cached != speculation->source) {
                 CountSpeculationMiss(DrawSpeculation::Miss::Identity, true);
@@ -1802,10 +2047,25 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             } else {
                 speculatedProof = true;
             }
+            // An own-source overlap the speculation accepted (spec_own_pending): the ordinary
+            // proof must accept the template too (with APS5_VERIFY_PROOFS it also walks every
+            // lookup again).
+            const bool ownAccepted = speculation->proof.ownAccepted && (speculatedProof || speculatedUse != nullptr);
+            if (ownAccepted && VerifyDrawSpeculation() && !cached->Revalidate(shaders, nullptr, speculatedUse != nullptr && ShaderResources::MovableImages())) {
+                std::fprintf(stderr, "[spec] APS5_VERIFY_DRAW_SPECULATION: a proof that accepted an own-source pending overlap fails the ordinary proof\n");
+                std::fflush(stderr);
+                std::abort();
+            }
         } else {
+            const bool prehashed = prebuilt != nullptr && prebuilt->keyed && prebuilt->hashed;
             resolved.contentKey = prebuilt != nullptr && prebuilt->keyed ? std::move(prebuilt->key) : DrawResourceKey(context, shaders, state.color, draw.indexAddress, indexBytes, !trimKey);
+            if (prehashed && VerifyDrawSpeculation() && prebuilt->keyHash != ResourceCache::HashKey(resolved.contentKey)) {
+                std::fprintf(stderr, "[spec] APS5_VERIFY_DRAW_SPECULATION: a prebuild's key hash differs from the committer's\n");
+                std::fflush(stderr);
+                std::abort();
+            }
             splitLap(splitStats.keyNs);
-            cached = SharedResourceCache().Find(resolved.contentKey);
+            cached = prehashed ? SharedResourceCache().Find(resolved.contentKey, prebuilt->keyHash) : SharedResourceCache().Find(resolved.contentKey);
             splitLap(splitStats.findNs);
         }
         const auto sameMoved = [](std::span<const ShaderResources::MovedBuffer> left, std::span<const ShaderResources::MovedBuffer> right) {
@@ -1818,8 +2078,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             SharedResourceCache().Remove(resolved.contentKey, cached.get());
             countCache(&DrawProfile::cacheInvalidated);
             countCache(&DrawProfile::streamDropped);
+            deferDrop(cached);
             cached = nullptr;
             speculatedProof = false;
+            deferDrop(speculatedUse);
             speculatedUse = nullptr;
         }
         if (cached != nullptr && cached->AddressReusable() && ForkLogged() != nullptr) {
@@ -1851,7 +2113,10 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             auto use = speculatedHit ? std::move(speculatedUse) : ShaderResources::AddressUse(cached, shaders, snapshots, miss);
             splitLap(splitStats.proofNs);
             if (use != nullptr) {
-                if (speculatedHit) Speculations().acceptedAddress.fetch_add(1, std::memory_order_relaxed);
+                if (speculatedHit) {
+                    Speculations().acceptedAddress.fetch_add(1, std::memory_order_relaxed);
+                    resolved.accepted = speculation;
+                }
                 if (trimKey && !(speculatedHit && speculation->aliasesOk) && !(prebuilt != nullptr && prebuilt->aliasesOk)) CheckBufferAliases(shaders, state.color, draw.indexAddress, indexBytes);
                 splitLap(splitStats.aliasNs);
                 resolved.resources = std::move(use);
@@ -1881,6 +2146,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                     }
                     moved = std::move(speculation->moved);
                     Speculations().acceptedTemplate.fetch_add(1, std::memory_order_relaxed);
+                    resolved.accepted = speculation;
                 } else {
                     CountSpeculationMiss(DrawSpeculation::Miss::MovedRecheck, true);
                 }
@@ -1905,10 +2171,25 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 if (cached->Streamed()) countCache(&DrawProfile::streamRefused);
             } else {
                 ForkTrap("resource invalidated");
-                SharedResourceCache().Remove(resolved.contentKey);
+                std::shared_ptr<ShaderResources> removed;
+                SharedResourceCache().Remove(resolved.contentKey, nullptr, &removed);
+                deferDrop(removed);
                 countCache(&DrawProfile::cacheInvalidated);
             }
         }
+        // What the lookup did not use (a template refused, removed or unusable here; an address
+        // use refused): released with the batch (defer_drops), else here as before. A refused
+        // speculation's reference to the template goes first (nothing reads it after the lookup).
+        if (cached != nullptr && cached != resolved.resources) {
+            if (DeferDrops() && speculation != nullptr && resolved.accepted == nullptr && speculation->source == cached) speculation->source.reset();
+            deferDrop(cached);
+        }
+        if (speculatedUse != nullptr) deferDrop(speculatedUse);
+        if (speculation != nullptr && speculation->refusedUse != nullptr) {
+            deferDrop(speculation->refusedUse);
+            speculation->refusedUse.reset();
+        }
+        stepLap(timer.profile, StepDrop);
     } else {
         countCache(&DrawProfile::uncacheable);
     }
@@ -1928,7 +2209,9 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     }
     if (resolved.resources == nullptr) {
         ForkTrap("resource build");
+        stepLap(timer.profile, StepDrop);
         resolved.resources = std::make_shared<ShaderResources>(context, shaders, state.color, draw.indexAddress, static_cast<std::size_t>(indexBytes), snapshots);
+        stepLap(timer.profile, StepBuild);
         resolved.built = &resolved.resources->Timing();
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
@@ -1936,6 +2219,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     }
     timer.phase(PhaseResources);
     APS5_LOG_CHARS_OUT_DEBUG("ShaderResources created");
+    if (resolved.accepted != nullptr) lastCommitSpeculation = 1;
     return resolved;
 }
 
@@ -1981,8 +2265,7 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
         context.Function<PFN_vkCmdDrawMeshTasksEXT>("vkCmdDrawMeshTasksEXT")(commands, inputs.meshGroups, draw.instanceCount, 1);
         return;
     }
-    if (!inputs.vertexHandles.empty()) context.Resolved(&DeviceFunctions::cmdBindVertexBuffers, "vkCmdBindVertexBuffers")(commands, 0, static_cast<std::uint32_t>(inputs.vertexHandles.size()), inputs.vertexHandles.data(), inputs.vertexOffsets.data());
-    if (draw.indexed) context.Resolved(&DeviceFunctions::cmdBindIndexBuffer, "vkCmdBindIndexBuffer")(commands, inputs.indexHandle, inputs.indexOffset, draw.indexSize == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
+    BindDrawBuffers(context, commands, inputs.vertexHandles, std::span<const VkDeviceSize>(inputs.vertexOffsets.data(), inputs.vertexHandles.size()), draw.indexed, inputs.indexHandle, inputs.indexOffset, draw.indexSize == 2 ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32);
     if (args == nullptr) {
         if (draw.indexed) context.Resolved(&DeviceFunctions::cmdDrawIndexed, "vkCmdDrawIndexed")(commands, draw.indexCount, draw.instanceCount, 0, static_cast<std::int32_t>(draw.firstVertex), draw.firstInstance);
         else context.Resolved(&DeviceFunctions::cmdDraw, "vkCmdDraw")(commands, draw.indexCount, draw.instanceCount, draw.firstVertex, draw.firstInstance);
@@ -2118,6 +2401,8 @@ struct Kept {
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
 void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    stepStart(profile);
     auto kept = std::make_shared<Kept>();
     kept->resources = resources;
     kept->pipeline = std::move(pipeline);
@@ -2133,10 +2418,12 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     // finishes the recorder up to the open batch, which holds the kept resources and gets the
     // next serial), or waited for by the caller (any wait releases it at once).
     if (resources->HoldsLease()) CountLeaseOutcome(outcome.waited, outcome.waited ? 0 : recorder.Submissions() + 1);
+    stepLap(profile, StepKeepObjects);
     // Every use of a (possibly shared) resources object registers its GPU writes anew.
     Recorder::SetNoteProgram(1);
     resources->MarkGpuWrites(recorder);
     Recorder::SetNoteProgram(0);
+    stepLap(profile, StepKeepWrites);
     // The write-back (fault check, copied buffers) runs when the batch completed; a fault is
     // reported by the recorder ("deferred write-back failed") instead of thrown out of the draw.
     if (listed) {
@@ -2156,6 +2443,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     for (const auto& resident : residents) {
         if (resident != nullptr) resident->MarkDirty();
     }
+    stepLap(profile, StepKeepDirty);
 }
 
 // What recordDraw records from: the recorder, the resources, the pipeline and framebuffer, the
@@ -2289,6 +2577,8 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
     });
 }
 
+thread_local std::uint8_t drawPassOutcome = 0;
+
 struct TargetMemo {
     Recorder* recorder = nullptr;
     std::uint64_t passKey = 0;
@@ -2383,6 +2673,8 @@ std::function<bool(std::uint64_t, std::uint64_t)> recordTouches(const RecordedDr
 bool recordStoresDue(const RecordedDraw& record) {
     auto* recorder = record.recorder;
     const auto& resources = *record.resources;
+    // Nothing queued (the common case): no touch test to build.
+    if (!recorder->HasQueuedKeyStores() && !recorder->HasQueuedStores()) return false;
     const auto touches = recordTouches(record);
     return (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) || (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches)));
 }
@@ -2390,6 +2682,8 @@ bool recordStoresDue(const RecordedDraw& record) {
 void flushRecordStores(const RecordedDraw& record) {
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
+    if (!recorder->HasQueuedKeyStores() && !recorder->HasQueuedStores()) return;
+    const Recorder::PassEndCauseScope passEndScope(Recorder::PassEndCause::DrawStoreFlush);
     const auto touches = recordTouches(record);
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
@@ -2411,6 +2705,11 @@ void emitRecord(const Context& context, const State& state, const Pm4::DrawParam
     const bool continued = !capture && !readsTarget && !gpuIndirect && !meshIndirect && recorder->ContinuesRenderPass(passKey);
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
+    drawPassOutcome = continued ? 1 : 2;
+    // Why the Commands call below ends a pass the previous draw left open ([parcommit] line).
+    using PassEndCause = Recorder::PassEndCause;
+    const auto passEndCause = continued ? PassEndCause::Auto : !recorder->PassContinuable() ? PassEndCause::DrawNotContinuable : !recorder->ContinuesRenderPass(passKey) ? PassEndCause::DrawOtherPass : readsTarget ? PassEndCause::DrawReadsTarget : PassEndCause::DrawOutsidePass;
+    const Recorder::PassEndCauseScope passEndScope(passEndCause == PassEndCause::Auto ? PassEndCause::DrawBuild : passEndCause);
     VkAccessFlags covered = 0;
     bool elided = false;
     VkCommandBuffer commands = VK_NULL_HANDLE;
@@ -2552,10 +2851,9 @@ void emitRecord(const Context& context, const State& state, const Pm4::DrawParam
         Recorder::DebugLabelBegin(context, commands, name);
     }
     if (drawBindings != nullptr) {
-        const auto set = drawBindings->allocation.set;
-        context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout(), 0, 1, &set, 0, nullptr);
-    } else {
-        resources.Bind(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, record.pipeline->Layout());
+        record.pipeline->BindSet(commands, drawBindings->allocation.set);
+    } else if (const auto set = resources.Set(); set != VK_NULL_HANDLE) {
+        record.pipeline->BindSet(commands, set);
     }
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     recordMark(1);
@@ -2910,12 +3208,15 @@ void drawPrepared(const Context& context, const State& state, const Pm4::DrawPar
     // A build this recorded draw can share with later identical ones goes into the cache (a cache
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
     // never reusable).
-    if (cacheable && built != nullptr && recorded && resources->Reusable()) SharedResourceCache().Insert(contentKey, resources);
+    std::vector<std::shared_ptr<ShaderResources>> evicted;
+    auto* const evictedOut = DeferDrops() ? &evicted : nullptr;
+    if (cacheable && built != nullptr && recorded && resources->Reusable()) SharedResourceCache().Insert(contentKey, resources, evictedOut);
     else if (cacheable && built != nullptr && recorded && resources->AddressReusable()) {
         auto use = ShaderResources::DetachAddressUse(resources);
-        SharedResourceCache().Insert(contentKey, resources);
+        SharedResourceCache().Insert(contentKey, resources, evictedOut);
         resources = std::move(use);
     }
+    deferDrops(evicted);
     // A recorded draw renders into its resident targets in the general layout (recordDraw). Debug
     // aid: APS5_DRAW_TRANSITIONS=1 keeps the per-draw upload and download barriers, the layout
     // transitions of every target and one pass per draw, as before.
@@ -3329,6 +3630,10 @@ std::shared_ptr<DrawPrebuild> buildPrebuild(const Context& context, const State&
     if (keyed && variants) {
         prebuilt->key = DrawResourceKey(context, shaders, state.color, draw.indexAddress, inputs.indexBytes, !trimKey);
         prebuilt->keyed = true;
+        if (SpeculatedKeyHash()) {
+            prebuilt->keyHash = ResourceCache::HashKey(prebuilt->key);
+            prebuilt->hashed = true;
+        }
     }
     if (trimKey) {
         try {
@@ -3495,12 +3800,15 @@ DrawPlan BuildDraw(const Context& context, const State& state, const Pm4::DrawPa
         if (copiedWrites && !lease && recordCopiedDraws) listed = true;
         else plan.outcome.waited = true;
     }
-    if (plan.resolved.cacheable && plan.resolved.built != nullptr && resources->Reusable()) SharedResourceCache().Insert(plan.resolved.contentKey, resources);
+    std::vector<std::shared_ptr<ShaderResources>> evicted;
+    auto* const evictedOut = DeferDrops() ? &evicted : nullptr;
+    if (plan.resolved.cacheable && plan.resolved.built != nullptr && resources->Reusable()) SharedResourceCache().Insert(plan.resolved.contentKey, resources, evictedOut);
     else if (plan.resolved.cacheable && plan.resolved.built != nullptr && resources->AddressReusable()) {
         auto use = ShaderResources::DetachAddressUse(resources);
-        SharedResourceCache().Insert(plan.resolved.contentKey, resources);
+        SharedResourceCache().Insert(plan.resolved.contentKey, resources, evictedOut);
         resources = std::move(use);
     }
+    deferDrops(evicted);
     if (pre != nullptr) {
         plan.masked = std::move(pre->masked);
     } else {
@@ -3518,7 +3826,20 @@ DrawPlan BuildDraw(const Context& context, const State& state, const Pm4::DrawPa
     const auto storageImages = resources->StorageImages();
     const bool storesThroughAddresses = pre != nullptr ? pre->storesThroughAddresses : std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->bdaWrites; });
     const bool mayDefer = !resources->HasCopiedWrites() && resources->GpuWrites().empty() && !storesThroughAddresses && std::none_of(storageImages.begin(), storageImages.end(), [](const auto& image) { return image.second; });
-    plan.pipeline = CachedPipeline(context, pipelineState, plan.inputs.vertexInput, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL, mayDefer);
+    // The prep thread's peek of this configuration (SpeculateDrawPipeline), made with this very
+    // prebuild's masked state and vertex input over these resources, is CachedPipeline's answer
+    // while the store still holds its entry (TakePeekedPipeline).
+    if (const auto& accepted = plan.resolved.accepted; accepted != nullptr && pre != nullptr && accepted->pipelineWith == pre && !accepted->pipeline.pipeline.expired() && SpeculatedPipelines()) {
+        plan.pipeline = TakePeekedPipeline(context, accepted->pipeline, *resources);
+        accepted->pipeline = {};
+        countSpeculatedPipeline(plan.pipeline != nullptr);
+        if (plan.pipeline != nullptr && VerifyDrawSpeculation() && CachedPipeline(context, pipelineState, plan.inputs.vertexInput, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL, mayDefer) != plan.pipeline) {
+            std::fprintf(stderr, "[spec] APS5_VERIFY_DRAW_SPECULATION: a speculated pipeline differs from the pipeline store's\n");
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
+    if (plan.pipeline == nullptr) plan.pipeline = CachedPipeline(context, pipelineState, plan.inputs.vertexInput, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL, mayDefer);
     if (plan.pipeline == nullptr) {
         plan.skipped = true;
         return plan;
@@ -4039,6 +4360,8 @@ bool PrepareForkedDraw(ForkedDraw& forked) {
 }
 
 bool ApplyForkedDraw(const Context& context, ForkedDraw& forked, const ForkStamp& stamp, const std::function<void()>* quiesce) {
+    // A pass the draw's own build ends (a target refresh, a depth copy, an upload) ([parcommit] line).
+    const Recorder::PassEndCauseScope passEndScope(Recorder::PassEndCause::DrawBuild);
     const auto cut = [&](const char* why) {
         forked.cut = why;
         countForkCut(why);
@@ -4060,6 +4383,19 @@ bool ApplyForkedDraw(const Context& context, ForkedDraw& forked, const ForkStamp
 
 void CountForkCut(const char* reason) {
     countForkCut(reason);
+}
+
+DrawPhaseTotals TakeDrawPhaseTotals() {
+    auto& profile = Profile();
+    std::lock_guard lock(profile.mutex);
+    DrawPhaseTotals totals;
+    for (std::size_t i = 0; i < PhaseCount; ++i) totals.phases.emplace_back(DrawPhaseNames[i], std::exchange(profile.totalsUs[i], 0.0));
+    totals.draws = std::exchange(profile.draws, 0);
+    return totals;
+}
+
+std::uint8_t TakeDrawPassOutcome() {
+    return std::exchange(drawPassOutcome, std::uint8_t{0});
 }
 
 std::string TakeForkReport() {
@@ -4110,6 +4446,22 @@ std::shared_ptr<DrawPrebuild> PrebuildDraw(const Context& context, const State& 
     return prebuilt;
 }
 
+void SpeculateDrawPipeline(const Context& context, const State& state, std::span<const CompiledShader> shaders, DrawSpeculation& speculation, const std::shared_ptr<DrawPrebuild>& prebuilt) {
+    if (!SpeculatedPipelines() || prebuilt == nullptr || prebuilt->refused || prebuilt->nothing || prebuilt->device != context.device || speculation.device != context.device) return;
+    const auto* resources = speculation.kind == DrawSpeculation::Kind::Address ? speculation.use.get() : speculation.kind == DrawSpeculation::Kind::Template ? speculation.source.get() : nullptr;
+    if (resources == nullptr) return;
+    try {
+        // BuildDraw's pipeline inputs with this prebuild: its masked state and vertex input, the
+        // general attachment layout of a lean draw.
+        auto peek = PeekCachedPipeline(context, prebuilt->masked.has_value() ? *prebuilt->masked : state, prebuilt->vertexInput, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL);
+        if (peek.pipeline.expired()) return;
+        speculation.pipeline = std::move(peek);
+        speculation.pipelineWith = prebuilt.get();
+        Speculations().pipelinesPeeked.fetch_add(1, std::memory_order_relaxed);
+    } catch (...) {
+    }
+}
+
 DrawPrebuildScope::DrawPrebuildScope(std::shared_ptr<DrawPrebuild> prebuilt) {
     currentPrebuild = std::move(prebuilt);
 }
@@ -4128,6 +4480,8 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
 }
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+    // A pass the draw's own build ends (a target refresh, a depth copy, an upload) ([parcommit] line).
+    const Recorder::PassEndCauseScope passEndScope(Recorder::PassEndCause::DrawBuild);
     static const bool profileTokens = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct TokenTiming {
         bool on;
@@ -4379,6 +4733,8 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
 }
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe) {
+    // A pass the draw's own build ends (a target refresh, a depth copy, an upload) ([parcommit] line).
+    const Recorder::PassEndCauseScope passEndScope(Recorder::PassEndCause::DrawBuild);
     static_cast<void>(snapshots);
     PerformanceTimer timing("Graphics.DrawWithRecipe");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

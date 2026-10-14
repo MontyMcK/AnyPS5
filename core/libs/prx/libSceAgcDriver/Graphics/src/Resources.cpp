@@ -275,7 +275,10 @@ CommandBatch::CommandBatch(const Context& context) : context(context) {
         begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         Check(context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands, &begin), "vkBeginCommandBuffer");
         // Work recorded so far goes first in queue order, so this batch sees its results.
-        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Submit();
+        if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) {
+            Recorder::AnnounceSubmit(Recorder::SubmitReason::Immediate);
+            recorder->Submit();
+        }
     } catch (...) {
         release();
         throw;

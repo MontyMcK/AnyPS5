@@ -106,10 +106,11 @@ ShaderMemory::ShaderMemory(std::span<const ShaderRecompiler::MemoryRegion> regio
     }
 }
 
-ShaderMemory::ShaderMemory(ShaderMemory&& other) noexcept : initial(std::move(other.initial)), pages(std::move(other.pages)), lastBase(other.lastBase), lastPage(other.lastPage), pendingWrite(other.pendingWrite), observe(other.observe), hookWaits(other.hookWaits) {
+ShaderMemory::ShaderMemory(ShaderMemory&& other) noexcept : initial(std::move(other.initial)), pages(std::move(other.pages)), callCodeReads(std::move(other.callCodeReads)), lastBase(other.lastBase), lastPage(other.lastPage), pendingWrite(other.pendingWrite), observe(other.observe), hookWaits(other.hookWaits), tentative(other.tentative), tentativeMarks(std::move(other.tentativeMarks)) {
     other.pages.clear();
     other.lastBase = ~std::uint64_t{0};
     other.lastPage = nullptr;
+    other.tentative = false;
 }
 
 ShaderMemory::~ShaderMemory() {
@@ -272,10 +273,37 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
         page.words[index] = word;
         page.valid.Set(index);
     }
+    if (self.tentative) {
+        const auto added = static_cast<std::uint8_t>((page.read.Test(index) ? 0u : 1u) | (page.recent.Test(index) ? 0u : 2u));
+        if (added != 0u) self.tentativeMarks.push_back({&page, static_cast<std::uint16_t>(index), added});
+    }
     page.read.Set(index);
     page.recent.Set(index);
     *value = page.words[index];
     return true;
+}
+
+std::uint32_t ShaderMemory::ReadWord(std::uint64_t address) {
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Capture);
+    std::uint32_t value = 0;
+    read(this, address, &value);
+    return value;
+}
+
+void ShaderMemory::BeginTentative() {
+    tentative = true;
+    tentativeMarks.clear();
+}
+
+void ShaderMemory::EndTentative(bool keep) {
+    tentative = false;
+    if (!keep) {
+        for (auto mark = tentativeMarks.rbegin(); mark != tentativeMarks.rend(); ++mark) {
+            if ((mark->added & 1u) != 0u) mark->page->read.Clear(mark->index);
+            if ((mark->added & 2u) != 0u) mark->page->recent.Clear(mark->index);
+        }
+    }
+    tentativeMarks.clear();
 }
 
 ShaderMemory::KnownValueCounts ShaderMemory::KnownValues() {

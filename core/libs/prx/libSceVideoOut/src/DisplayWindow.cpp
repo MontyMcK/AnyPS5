@@ -70,6 +70,18 @@ SDL_Window* DisplayWindow::Handle() const {
     return window;
 }
 
+void* DisplayWindow::NativeHandle() const {
+#ifdef _WIN32
+    if (window == nullptr) return nullptr;
+    SDL_SysWMinfo info;
+    SDL_VERSION(&info.version);
+    if (SDL_GetWindowWMInfo(window, &info) != SDL_TRUE || info.subsystem != SDL_SYSWM_WINDOWS) return nullptr;
+    return info.info.win.window;
+#else
+    return nullptr;
+#endif
+}
+
 void DisplayWindow::ToggleFullscreen() {
     require(window != nullptr, "window must exist before toggling fullscreen");
     const auto flags = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) != 0 ? 0u : static_cast<Uint32>(SDL_WINDOW_FULLSCREEN_DESKTOP);

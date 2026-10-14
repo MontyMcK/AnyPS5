@@ -278,12 +278,71 @@ public:
         std::size_t batchesToFinish;
     };
     std::optional<PendingWriteInfo> DescribePendingWrite(std::uint64_t address, std::size_t bytes) const;
+    // Why a batch went to the queue ([submits] line, cpu-timeline.txt). A caller announces the
+    // reason for the Submit this thread makes next (AnnounceSubmit; the Submit consumes it); a
+    // sync that submits without an announcement takes the reason of its CountSync source, and any
+    // other Submit counts as Other with its call site kept for the [submits] line's site table.
+    enum class SubmitReason : std::uint8_t {
+        Other = 0, Starve, LabelDeadline, BatchCap, PacketFlush, Label, Eop, SubmissionEnd, Suspend, Flip, Present, Wait, WaitDeadline, Drain, Presync,
+        SyncIdle, SyncPendingWrite, SyncRecordedStore, SyncAddressBased, SyncOther, KeptBytes, Immediate, Lease, Count
+    };
+    static constexpr std::size_t SubmitReasonCount = static_cast<std::size_t>(SubmitReason::Count);
+    static const char* SubmitReasonName(SubmitReason reason);
+    // `site`: the code address to name when the reason is Other (null: the Submit's caller).
+    static void AnnounceSubmit(SubmitReason reason, const void* site = nullptr);
+    // Submit reasons and starvation are tracked: APS5_PROFILE_DRAW, APS5_PROFILE_SUBMITS=1 or the
+    // GPU timeline window. Otherwise Submit records the reason only (no status query).
+    static bool SubmitProfiled();
+    // Cumulative counts (all recorders): batches by reason, and of them those submitted while the
+    // GPU had nothing queued (the newest earlier batch's fence had signaled: it went idle waiting
+    // for this submit), plus the top unannounced call sites (module offsets) with their counts.
+    struct SubmitStatistics {
+        std::array<std::uint64_t, SubmitReasonCount> batches{};
+        std::array<std::uint64_t, SubmitReasonCount> starved{};
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> otherSites;
+    };
+    static SubmitStatistics SubmitCounts();
+    // Why the render pass a draw left open ended (the [parcommit] line, APS5_PROFILE_DRAW; see
+    // parcommit-design.md): a submit (split by its SubmitReason), the next draw itself (other
+    // attachments, a pass the previous draw left not continuable, a draw reading its own targets,
+    // one that records outside a pass first, the queued stores a draw flushes, or work the draw's
+    // build recorded: a target refresh, a depth copy, an upload), a label store run, or anything else recorded by the
+    // draw committer (a dispatch, a store, a copy), by a queue worker or by another thread (the
+    // presenter, a flush hook on a game thread). A pass that ends for anything but the guest's own
+    // next draw is a pass break the committer pays for again at the next draw (a new head).
+    enum class PassEndCause : std::uint8_t { Auto = 0, Submit, DrawOtherPass, DrawNotContinuable, DrawReadsTarget, DrawOutsidePass, DrawStoreFlush, DrawBuild, LabelStores, CommitterOther, QueueWorker, OtherThread, Count };
+    static constexpr std::size_t PassEndCauseCount = static_cast<std::size_t>(PassEndCause::Count);
+    static const char* PassEndCauseName(PassEndCause cause);
+    struct PassEndCounts {
+        std::array<std::uint64_t, PassEndCauseCount> causes{};
+        std::array<std::uint64_t, SubmitReasonCount> submits{};
+    };
+    // Counts since the last call (all recorders).
+    static PassEndCounts TakePassEndCounts();
+    // Pass ends recorded by threads other than the draw committer, ever (monotonic): the
+    // APS5_VERIFY_PARALLEL_COMMIT check that nothing interleaved inside a pass run.
+    static std::uint64_t PassEndsByOtherThreads();
+    // The draw committer's thread (DrawPipeline::run): its pass ends that no scope names count as
+    // CommitterOther, everyone else's as QueueWorker (a tagged queue thread) or OtherThread.
+    static void MarkCommitterThread();
+    // Names the cause of the pass end the calling thread's next Commands call may make.
+    class PassEndCauseScope {
+    public:
+        explicit PassEndCauseScope(PassEndCause cause);
+        ~PassEndCauseScope();
+        PassEndCauseScope(const PassEndCauseScope&) = delete;
+        PassEndCauseScope& operator=(const PassEndCauseScope&) = delete;
+
+    private:
+        PassEndCause previous;
+    };
     // Ends and submits the open batch without waiting.
     void Submit();
     // Submits the open batch when it holds at least `minWork` commands and the newest submitted
     // batch has completed, so the GPU does not idle while the committer records (APS5_STARVE_SUBMIT).
     // Returns whether it submitted. Requires the GPU mutex.
-    bool SubmitIfStarved(std::uint64_t minWork);
+    // `ignoreAge`: the caller is about to go idle (nothing else queued), so StarveAge does not hold.
+    bool SubmitIfStarved(std::uint64_t minWork, bool ignoreAge = false);
     // Submits the open batch and returns the serial of the newest submitted batch (0 when nothing was
     // ever submitted); WaitSerial(serial) then covers all recorded work.
     std::uint64_t SubmitAndEpoch();
@@ -314,6 +373,28 @@ public:
     void SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked = false);
     // Completes batches that already finished; returns whether nothing is in flight.
     bool Reap();
+    // Live `fence_nodrain` (env APS5_FENCE_NO_DRAIN=1), with the recorder thread
+    // (APS5_RECORDER_THREAD=1): a finished batch's fence reset and its timestamp read go straight
+    // to the driver instead of first waiting for the recorder thread to make every call streamed
+    // so far (DeferredVulkan's waiting calls), which held whoever reaped (under the GPU mutex)
+    // behind the whole stream at every retired batch. Exact: taken only once the recorder thread
+    // returned from the batch's vkQueueSubmit (its stream ticket, DeferredVulkanExecuted) and the
+    // fence signaled, so every command of it ran and no streamed call still names the fence, the
+    // command buffer or the batch's query pool. Counted for the [submits] line and the tests.
+    static bool FenceNoDrain();
+    static std::uint64_t UndrainedFenceResets();
+    // Live `starve_age` (env APS5_STARVE_AGE_US=<us>, default 250 when only the live flag is set),
+    // with APS5_STARVE_SUBMIT: SubmitIfStarved also waits until the open batch is that old (from
+    // its first command) or holds 4 times the minimum work, so a GPU that runs a few draws faster
+    // than the committer records them gets them in fewer, larger batches. Exact: only when
+    // recorded work reaches the queue changes; labels, EOPs, waits, flips and syncs still submit
+    // at once, and the committer passes ignoreAge before it goes idle.
+    static std::chrono::microseconds StarveAge();
+    // SubmitIfStarved checks StarveAge held back so far (cumulative; one batch can be held by
+    // several checks).
+    static std::uint64_t StarveAgeHolds();
+    // When the open batch began (its first command), the steady-clock zero when none is open.
+    std::chrono::steady_clock::time_point OpenedAt() const { return open != nullptr ? open->openedAt : std::chrono::steady_clock::time_point{}; }
     std::uint64_t Submissions() const { return submissions; }
     // Batches submitted and not yet finished (what a full Sync() waits for); under GuestMemory::GpuMutex.
     std::size_t InFlightBatches() const { return inFlight.size(); }
@@ -412,6 +493,16 @@ public:
     // label covers it. Work recorded after the store reads this value, so a capture for such work
     // can take it instead of waiting for the GPU (live `label_known`).
     static bool CurrentLabelDword(std::uint64_t address, std::uint32_t& value);
+    // The bytes a read ordered after all recorded work will see in [address, address +
+    // out.size()) (a DMA_DATA source, driver live `dma_known`), without waiting for the GPU: each
+    // dword the pending-write snapshot covers must hold a recorded label store's value
+    // (CurrentLabelDword) and is taken from the table, the others are read from memory as they
+    // are. Unknown at the first covered dword with no such value (a non-label writer, a label
+    // behind a completion or written over, a wide label) or one of this thread's queued labels;
+    // NotPending when nothing covers the range (a plain read waits for nothing either). The
+    // caller checks the range is accessible and holds no unit-shadow or storage-image results.
+    enum class KnownSource : std::uint8_t { Served, Unaligned, NotPending, Queued, Unknown };
+    static KnownSource KnownSourceBytes(std::uint64_t address, std::span<std::byte> out);
     // APS5_TRACE_DCC_SYNC: the code address that noted a pending write (the caller of
     // NotePendingWrite/NotePendingFill/NotePendingWrites), from a ring of the last 8192 notes;
     // null when the note is older or was noted another way.
@@ -419,6 +510,12 @@ public:
     // The guest program whose recorded work notes writes next on this thread (a dispatch's compute
     // program, 1 for a draw; 0 clears), kept with the note sites for the same trace.
     static void SetNoteProgram(std::uint64_t program);
+    // The write notes the calling thread's last recorded dispatch made: notes in (first, last]
+    // (VulkanDevice::recordDispatch around MarkGpuWrites). A caller that knows what the dispatch
+    // stored (the pattern-fill kernel's DCC keys) attributes the range to the dispatch only while
+    // the newest note over it is one of these.
+    static void SetDispatchNotes(std::uint64_t first, std::uint64_t last);
+    static std::pair<std::uint64_t, std::uint64_t> DispatchNotes();
     static std::uint64_t NoteProgram(std::uint64_t note);
     static bool WideLabelIn(std::uint64_t address, std::size_t bytes);
     // A label a queue worker decoded but has not recorded yet (Driver.cpp DeferredLabels): it
@@ -646,6 +743,9 @@ public:
     // Presentations so far (never reset): a frame clock for policies that count per frame, such as
     // StorageTexture's write-back hysteresis.
     static std::uint64_t Presents();
+    // The GPU milliseconds per MiB of the storage-writeback class in the last [gputime] window
+    // (APS5_PROFILE_GPU), 0 before one measured any.
+    static double StorageWritebackMsPerMiB();
 
     // What the presenter learns about finished batches (Driver::Present's [present] line and the
     // frame record): finish() writes an entry per submitted batch into a ring of the last 128,
@@ -658,6 +758,11 @@ public:
         std::uint64_t serial = 0;
         double gpuStartNs = 0;
         double gpuEndNs = 0;
+        // Why it was submitted, whether the GPU had nothing queued then (SubmitProfiled only), and
+        // the GpuMutex tag of the thread that opened it.
+        SubmitReason reason = SubmitReason::Other;
+        bool starved = false;
+        std::uint32_t queue = 0xffffffffu;
         std::chrono::steady_clock::time_point submittedAt{};
         std::chrono::steady_clock::time_point fenceSeenAt{};
         std::uint64_t readGeneration = 0;
@@ -699,6 +804,13 @@ private:
         // (the [syncwait] line reports what a wait's target and the batches ahead of it were).
         std::uint32_t queue = 0xffffffffu;
         std::chrono::steady_clock::time_point submittedAt{};
+        // See SubmitReason; `starved`: the GPU had nothing queued when it was submitted.
+        SubmitReason reason = SubmitReason::Other;
+        bool starved = false;
+        std::chrono::steady_clock::time_point openedAt{};
+        // The recorder thread's stream position of its vkQueueSubmit (DeferredVulkanTicket; 0
+        // without the thread).
+        std::uint64_t submitTicket = 0;
         VkQueryPool queries = VK_NULL_HANDLE;
         VkQueryPool samples = VK_NULL_HANDLE;
         std::shared_ptr<void> samplePool;
@@ -855,6 +967,10 @@ private:
     PFN_vkCmdBindPipeline cmdBindPipeline = nullptr;
     PFN_vkCmdPushConstants cmdPushConstants = nullptr;
     PFN_vkCmdDispatch cmdDispatch = nullptr;
+    // This device's entry points past DeferredVulkan's waiting thunks (FenceNoDrain); null
+    // without the recorder thread.
+    PFN_vkResetFences resetFencesUndrained = nullptr;
+    PFN_vkGetQueryPoolResults queryResultsUndrained = nullptr;
     template<typename TFunction>
     TFunction function(TFunction resolved, const char* name) const {
         return resolved != nullptr ? resolved : context.Function<TFunction>(name);
@@ -873,7 +989,8 @@ private:
     // form, toward the host only); returns whether the batch's host-read barrier was included.
     bool closeStoreRun(bool atSubmit = false);
     // Ends the render pass a draw left open (vkCmdEndRenderPass, the pass's trailing barrier).
-    void endOpenRenderPass();
+    // `cause` Auto: the calling thread's PassEndCauseScope, else its role (MarkCommitterThread).
+    void endOpenRenderPass(PassEndCause cause = PassEndCause::Auto, SubmitReason submitReason = SubmitReason::Other);
     // Records the trailing barrier an open dispatch run owes (see DispatchRunsEnabled).
     void closeDispatchRun();
     // Whether the last RecordStore went in place inside a dispatch run: its NoteLabel then does

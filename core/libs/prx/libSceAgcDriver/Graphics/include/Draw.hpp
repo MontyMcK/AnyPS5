@@ -37,6 +37,9 @@ bool ForkedDrawNeedsFinish(const ForkedDraw& forked);
 bool PrepareForkedDraw(ForkedDraw& forked);
 void CountForkCut(const char* reason);
 std::string TakeForkReport();
+// The calling thread's last recorded draw (emitRecord): 1 when it continued the open render pass,
+// 2 when it began one, 0 when none was recorded since the last call (APS5_VERIFY_PARALLEL_COMMIT).
+std::uint8_t TakeDrawPassOutcome();
 std::shared_ptr<DrawPrebuild> PrebuildDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, bool keyed);
 class DrawPrebuildScope {
 public:
@@ -116,6 +119,20 @@ struct DrawRecipeOutcome {
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe);
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();
+// Whether a draw builds (and attaches) a recipe: always with live `recipe_on_hit` off (env
+// APS5_RECIPE_ON_HIT the default), as before; with it on only a draw whose draw-cache key hit,
+// since a recipe is only ever looked up by a hit of the key it is attached under and a key that
+// missed is mostly never seen again (per-frame user-data rings move the keys of most draws).
+// Counts the recipes it skips (TakeDrawRecipeSkips, the [commit] line).
+bool DrawRecipeWanted(bool drawKeyHit);
+std::uint64_t TakeDrawRecipeSkips();
+// Tests and benchmarks (APS5_PROFILE_DRAW): the [draws] line's per-phase totals in microseconds,
+// by phase name, and the draws they cover since the last take (the 10 s report also resets them).
+struct DrawPhaseTotals {
+    std::vector<std::pair<const char*, double>> phases;
+    std::uint64_t draws = 0;
+};
+DrawPhaseTotals TakeDrawPhaseTotals();
 // Whether draws with a depth target get recipes (APS5_NO_DEPTH_RECIPE unset), and draws whose
 // template hit rebinds moved read-only buffers (APS5_NO_MOVED_RECIPE unset).
 bool DepthDrawRecipes();

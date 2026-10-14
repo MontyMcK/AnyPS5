@@ -2,10 +2,12 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SHADERS_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "Recompiler.hpp"
 #include <array>
 #include <cstddef>
 #include <span>
+#include <unordered_map>
 
 namespace AgcDriver::Graphics {
 
@@ -47,7 +49,7 @@ inline VkPipelineStageFlags PipelineStages(std::span<const CompiledShader> shade
 
 // Whether a vertex-pipeline stage writes gl_Layer (decorated BuiltIn Layer): it then reads the
 // framebuffer's last layer from push dword LayerLimitPushDword to clamp its layer as the hardware does.
-inline bool WritesLayer(const ShaderRecompiler::RecompileResult& program) {
+inline bool ScanWritesLayer(const ShaderRecompiler::RecompileResult& program) {
     const auto& words = program.spirv;
     for (std::size_t cursor = 5; cursor + 3 < words.size();) {
         const auto count = words[cursor] >> 16u;
@@ -56,6 +58,25 @@ inline bool WritesLayer(const ShaderRecompiler::RecompileResult& program) {
         cursor += count;
     }
     return false;
+}
+
+// Whether the module decorates a Layer built-in. The scan walks the whole module (thousands of words
+// for a vertex shader that writes no layer), and draws ask for every vertex-stage shader they bind
+// (pushDrawConstants, PushConstantStages), so the answer is kept per program: a pipeline variant id
+// names one module (pipelines are cached by it), the word count guards it. Per thread, no lock.
+inline bool WritesLayer(const ShaderRecompiler::RecompileResult& program) {
+    const auto id = program.PipelineVariantId();
+    if (id == 0 || !LiveFlag("layer_scan_cache", true)) return ScanWritesLayer(program);
+    struct Entry {
+        std::size_t words;
+        bool writes;
+    };
+    thread_local std::unordered_map<std::uint64_t, Entry> known;
+    if (const auto found = known.find(id); found != known.end() && found->second.words == program.spirv.size()) return found->second.writes;
+    const bool writes = ScanWritesLayer(program);
+    if (known.size() >= 16384) known.clear();
+    known[id] = {program.spirv.size(), writes};
+    return writes;
 }
 
 inline bool LayerLimited(const CompiledShader& shader) {

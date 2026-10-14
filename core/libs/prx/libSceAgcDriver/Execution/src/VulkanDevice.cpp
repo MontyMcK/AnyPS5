@@ -1,4 +1,6 @@
+#include "prx/libSceAgcDriver/Graphics/include/CpuTimeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuCheckpoints.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/AddressLedger.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
@@ -17,6 +19,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
@@ -40,6 +43,7 @@
 #include <fstream>
 #include <cctype>
 #include <cstdlib>
+#include <map>
 #include <mutex>
 #include <SDL_loadso.h>
 #include <SDL_error.h>
@@ -247,6 +251,11 @@ struct ComputePipelineObjects {
 
 struct VulkanDevice::State {
     void* library = nullptr;
+    // APS5_GPU_TIMELINE: VK_KHR/EXT_calibrated_timestamps (CalibrateClock), and whether this device
+    // gave cpu-timeline.txt its calibration (taken back at teardown).
+    PFN_vkGetCalibratedTimestampsKHR calibratedTimestamps = nullptr;
+    VkTimeDomainKHR hostTimeDomain = VK_TIME_DOMAIN_DEVICE_KHR;
+    bool timelineCalibration = false;
     PFN_vkGetInstanceProcAddr instanceProc = nullptr;
     PFN_vkGetDeviceProcAddr deviceProc = nullptr;
     VkInstance instance = VK_NULL_HANDLE;
@@ -354,6 +363,21 @@ struct VulkanDevice::State {
     std::shared_ptr<std::vector<std::shared_ptr<Graphics::ShaderResources>>> copiedWriters = std::make_shared<std::vector<std::shared_ptr<Graphics::ShaderResources>>>();
     VkPhysicalDeviceMeshShaderPropertiesEXT meshLimits{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
     std::unique_ptr<PresentationScaler> scaler;
+    // HDR10 presentation (SelectDynamicRange): the swapchain's surface format, the surface formats
+    // that can take the presentation blit, and the scaler whose source holds a display buffer's
+    // 10-bit texels unchanged. `surfaceDisplayGeneration` is the host monitor report the formats were
+    // read for; `hdrRefusedGeneration` the one for which an HDR10 swapchain could not be made.
+    VkSurfaceFormatKHR swapchainFormat{VK_FORMAT_B8G8R8A8_UNORM, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
+    bool swapchainHdr = false;
+    bool swapchainColorspace = false;
+    bool hdrMetadata = false;
+    std::vector<VkSurfaceFormatKHR> surfaceFormats;
+    std::uint64_t surfaceDisplayGeneration = ~0ull;
+    std::uint64_t hdrRefusedGeneration = ~0ull;
+    std::uint64_t fallbackWarnedGeneration = ~0ull;
+    std::uint64_t metadataGeneration = ~0ull;
+    std::unique_ptr<PresentationScaler> hdrScaler;
+    VkFormat hdrScalerSource = VK_FORMAT_UNDEFINED;
     // The swapchain image AcquireImage took for the next present(), consumed by that present.
     bool imageAcquired = false;
     std::uint32_t acquiredIndex = 0;
@@ -513,6 +537,12 @@ struct VulkanDevice::State {
         SettleRetired(false);
     }
 
+    // The end of the newest stamped batch SettleRetired accounted and its serial ([submits] idle
+    // gaps). Work outside the recorder's batches (the presenter's blit, immediate command batches)
+    // is not in the ring, so a gap it filled still counts as idle.
+    double lastSettledEndNs = 0;
+    std::uint64_t lastSettledSerial = 0;
+
     // The GPU accounting of retired slots ([present] line, frame record): a batch's completion
     // record is written when a queue worker finishes it, which can be well after the blit's fence
     // signaled (compute queues never reap), so a range read at the retire was mostly unread. Each
@@ -530,7 +560,25 @@ struct VulkanDevice::State {
             bool stamped = false;
             std::uint64_t checked = 0, overwritten = 0;
             for (const auto& batch : batches) {
+                // A gap is the batch's own only when the batch before it (serial - 1) was stamped
+                // and accounted: a missing record or an unstamped batch hides GPU work in between.
+                const bool contiguous = batch.serial == lastSettledSerial + 1;
+                lastSettledSerial = batch.serial;
+                if (!(batch.gpuEndNs > batch.gpuStartNs)) lastSettledEndNs = 0;
                 if (batch.gpuEndNs > batch.gpuStartNs) {
+                    if (contiguous && lastSettledEndNs > 0 && batch.gpuStartNs > lastSettledEndNs) {
+                        const double idleMs = (batch.gpuStartNs - lastSettledEndNs) / 1e6;
+                        const auto reason = static_cast<std::size_t>(batch.reason);
+                        if (idleMs < 1000.0 && reason < Graphics::Recorder::SubmitReasonCount) {
+                            presentCounters.idleMsByReason[reason] += idleMs;
+                            (batch.starved ? presentCounters.starvedIdleMs : presentCounters.queuedIdleMs) += idleMs;
+                            if (idleMs >= 5.0) {
+                                presentCounters.longIdleMsByReason[reason] += idleMs;
+                                ++presentCounters.longGapsByReason[reason];
+                            }
+                        }
+                    }
+                    lastSettledEndNs = std::max(lastSettledEndNs, batch.gpuEndNs);
                     busyMs += (batch.gpuEndNs - batch.gpuStartNs) / 1e6;
                     firstNs = stamped ? std::min(firstNs, batch.gpuStartNs) : batch.gpuStartNs;
                     lastNs = stamped ? std::max(lastNs, batch.gpuEndNs) : batch.gpuEndNs;
@@ -583,6 +631,7 @@ struct VulkanDevice::State {
     }
 
     ~State() {
+        if (timelineCalibration) Graphics::CpuTimeline::ClearCalibration(this);
         contextReady = false;
         if (device != VK_NULL_HANDLE) {
             Graphics::DrainDeferredVulkan();
@@ -635,6 +684,7 @@ struct VulkanDevice::State {
             detiler.reset();
             colorTransfer.reset();
             scaler.reset();
+            hdrScaler.reset();
             pipelineCache.reset();
             context.bufferPool.reset();
             bufferPool.reset();
@@ -712,6 +762,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
             }
         }
         if (std::getenv("APS5_DEBUG_LABELS") != nullptr && std::any_of(available.begin(), available.end(), [](const auto& item) { return std::strcmp(item.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0; })) instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        if (std::any_of(available.begin(), available.end(), [](const auto& item) { return std::strcmp(item.extensionName, VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME) == 0; })) {
+            instanceExtensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+            state->swapchainColorspace = true;
+        }
         create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
         create.ppEnabledExtensionNames = instanceExtensions.data();
     } else if (std::getenv("APS5_NO_ATTACH_WINDOW") == nullptr) {
@@ -728,6 +782,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
             instanceExtensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
             instanceExtensions.push_back("VK_KHR_win32_surface");
             state->presentationCapable = true;
+            if (has(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME)) {
+                instanceExtensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
+                state->swapchainColorspace = true;
+            }
         }
         if (std::getenv("APS5_DEBUG_LABELS") != nullptr && has(VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
         create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
@@ -922,6 +980,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     std::vector<const char*> deviceExtensions;
     if (window != nullptr) {
         deviceExtensions.assign(presentationExtensions.begin(), presentationExtensions.end());
+        state->hdrMetadata = hasExtension(VK_EXT_HDR_METADATA_EXTENSION_NAME);
     } else if (state->presentationCapable) {
         std::uint32_t extensionCount = 0;
         const auto enumerateExtensions = state->InstanceFunction<PFN_vkEnumerateDeviceExtensionProperties>("vkEnumerateDeviceExtensionProperties");
@@ -931,8 +990,12 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         state->presentationCapable = std::all_of(presentationExtensions.begin(), presentationExtensions.end(), [&](const char* name) {
             return std::any_of(extensions.begin(), extensions.end(), [&](const auto& item) { return std::strcmp(item.extensionName, name) == 0; });
         });
-        if (state->presentationCapable) deviceExtensions.assign(presentationExtensions.begin(), presentationExtensions.end());
+        if (state->presentationCapable) {
+            deviceExtensions.assign(presentationExtensions.begin(), presentationExtensions.end());
+            state->hdrMetadata = hasExtension(VK_EXT_HDR_METADATA_EXTENSION_NAME);
+        }
     }
+    if (state->hdrMetadata) deviceExtensions.push_back(VK_EXT_HDR_METADATA_EXTENSION_NAME);
     if (state->fragmentShaderBarycentric) {
         deviceExtensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         state->capabilities.push_back(spv::CapabilityFragmentBarycentricKHR);
@@ -1326,6 +1389,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     static VkPhysicalDeviceAddressBindingReportFeaturesEXT bindingReport{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT};
     const bool reportBindings = std::getenv("APS5_DEVICE_FAULT") != nullptr && hasExtension(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
     if (reportBindings) deviceExtensions.push_back(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+    // APS5_GPU_TIMELINE: calibrated timestamps put cpu-timeline.txt in the GPU timestamp domain of
+    // gpu-timeline.txt (enabled only with the switch, as upstream #4632 does for its trace).
+    const char* calibratedTimestamps = std::getenv("APS5_GPU_TIMELINE") == nullptr ? nullptr : hasExtension(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ? VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME : hasExtension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) ? VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME : nullptr;
+    if (calibratedTimestamps != nullptr) deviceExtensions.push_back(calibratedTimestamps);
     deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
     deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
     deviceInfo.pNext = &bdaFeatures;
@@ -1367,6 +1434,26 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         std::fprintf(stderr, "[device-fault] VK_EXT_device_fault enabled\n");
     }
     state->shaderProfile = std::move(shaderProfile);
+    if (calibratedTimestamps != nullptr) {
+        const bool khr = std::strcmp(calibratedTimestamps, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0;
+        const auto domains = reinterpret_cast<PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR>(state->instanceProc(state->instance, khr ? "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR" : "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT"));
+        std::uint32_t domainCount = 0;
+        std::vector<VkTimeDomainKHR> available;
+        if (domains != nullptr && domains(selected, &domainCount, nullptr) == VK_SUCCESS) {
+            available.resize(domainCount);
+            if (domains(selected, &domainCount, available.data()) != VK_SUCCESS) available.clear();
+        }
+#ifdef _WIN32
+        const auto host = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_KHR;
+#else
+        const auto host = VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR;
+#endif
+        if (std::find(available.begin(), available.end(), VK_TIME_DOMAIN_DEVICE_KHR) != available.end() && std::find(available.begin(), available.end(), host) != available.end()) {
+            state->hostTimeDomain = host;
+            state->calibratedTimestamps = state->DeviceFunction<PFN_vkGetCalibratedTimestampsKHR>(khr ? "vkGetCalibratedTimestampsKHR" : "vkGetCalibratedTimestampsEXT");
+        }
+        std::fprintf(stderr, "[timeline] %s\n", state->calibratedTimestamps != nullptr ? "cpu-timeline.txt is calibrated to the GPU timestamps" : "no calibrated timestamps: cpu-timeline.txt keeps steady-clock times");
+    }
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     Graphics::NvPerf::Initialize(state->instance, selected, state->device, state->queue, family, state->instanceProc, state->deviceProc);
     faultQueue = state->queue;
@@ -1392,6 +1479,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->samplerCache = std::make_unique<Graphics::SamplerCache>();
     state->recorder = std::make_unique<Graphics::Recorder>(graphicsContext(), state->timelineSemaphores);
     state->recorder->Activate();
+    if (state->calibratedTimestamps != nullptr) {
+        state->timelineCalibration = true;
+        Graphics::CpuTimeline::SetCalibration([this](double& gpuNs, std::chrono::steady_clock::time_point& cpu) { return CalibrateClock(gpuNs, cpu); }, state.get());
+    }
     state->context = buildContext();
     state->contextReady = true;
     if (window != nullptr) setupPresentation(*window);
@@ -1423,17 +1514,17 @@ void VulkanDevice::setupPresentation(const PresentationWindow& presentation) {
         require((surface.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0, "surface does not support transfer destination images");
         require((surface.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) != 0, "opaque composition is unavailable");
         require((surface.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0, "identity surface transform is unavailable");
-        std::uint32_t formatCount = 0;
-        auto getFormats = state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>("vkGetPhysicalDeviceSurfaceFormatsKHR");
-        check(getFormats(selected, state->surface, &formatCount, nullptr), "vkGetPhysicalDeviceSurfaceFormatsKHR");
-        std::vector<VkSurfaceFormatKHR> formats(formatCount);
-        check(getFormats(selected, state->surface, &formatCount, formats.data()), "vkGetPhysicalDeviceSurfaceFormatsKHR");
-        require(std::any_of(formats.begin(), formats.end(), [](const auto& format) { return format.format == VK_FORMAT_B8G8R8A8_UNORM && format.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR; }), "BGRA8 sRGB-nonlinear surface format is unavailable");
+        refreshSurfaceFormats();
+        const auto sdrFormat = SelectSwapchainFormat(state->surfaceFormats, false, VK_FORMAT_UNDEFINED);
+        require(sdrFormat.has_value(), "BGRA8 sRGB-nonlinear surface format is unavailable");
+        state->swapchainFormat = *sdrFormat;
+        state->swapchainHdr = false;
+        AgcDriverSetPresentingHdr10_nid_postfix(false);
         VkSwapchainCreateInfoKHR swapchain{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
         swapchain.surface = state->surface;
         swapchain.minImageCount = surface.minImageCount;
-        swapchain.imageFormat = VK_FORMAT_B8G8R8A8_UNORM;
-        swapchain.imageColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        swapchain.imageFormat = state->swapchainFormat.format;
+        swapchain.imageColorSpace = state->swapchainFormat.colorSpace;
         swapchain.imageExtent = state->extent;
         swapchain.imageArrayLayers = 1;
         swapchain.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
@@ -1468,6 +1559,32 @@ void VulkanDevice::setupPresentation(const PresentationWindow& presentation) {
 }
 
 VulkanDevice::~VulkanDevice() = default;
+
+// As upstream #4632 (AlxcBTW): one calibrated pair, the host stamp moved onto the steady clock by
+// reading both host clocks back to back.
+bool VulkanDevice::CalibrateClock(double& gpuNs, std::chrono::steady_clock::time_point& cpu) const {
+    if (state->calibratedTimestamps == nullptr) return false;
+    const std::array<VkCalibratedTimestampInfoKHR, 2> domains{VkCalibratedTimestampInfoKHR{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, VK_TIME_DOMAIN_DEVICE_KHR}, VkCalibratedTimestampInfoKHR{VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR, nullptr, state->hostTimeDomain}};
+    std::array<std::uint64_t, 2> stamps{};
+    std::uint64_t deviation = 0;
+    if (state->calibratedTimestamps(state->device, static_cast<std::uint32_t>(domains.size()), domains.data(), stamps.data(), &deviation) != VK_SUCCESS) return false;
+#ifdef _WIN32
+    LARGE_INTEGER counter{};
+    LARGE_INTEGER frequency{};
+    QueryPerformanceCounter(&counter);
+    const auto now = std::chrono::steady_clock::now();
+    QueryPerformanceFrequency(&frequency);
+    const double sinceNs = static_cast<double>(static_cast<std::int64_t>(static_cast<std::uint64_t>(counter.QuadPart) - stamps[1])) * 1e9 / static_cast<double>(frequency.QuadPart);
+#else
+    timespec monotonic{};
+    clock_gettime(CLOCK_MONOTONIC, &monotonic);
+    const auto now = std::chrono::steady_clock::now();
+    const double sinceNs = static_cast<double>(static_cast<std::int64_t>(static_cast<std::uint64_t>(monotonic.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(monotonic.tv_nsec) - stamps[1]));
+#endif
+    gpuNs = static_cast<double>(stamps[0]) * state->properties.limits.timestampPeriod;
+    cpu = now - std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double, std::nano>(sinceNs));
+    return true;
+}
 
 bool VulkanDevice::AttachWindow(const PresentationWindow& window) {
     GuestMemory::AssertGpuLockHeld("VulkanDevice::AttachWindow");
@@ -1526,7 +1643,7 @@ bool OpportunisticReap() {
 
 }
 
-void VulkanDevice::SubmitRecorded(bool reapFirst) {
+void VulkanDevice::SubmitRecorded(bool reapFirst, Graphics::Recorder::SubmitReason reason) {
     if (!state->recorder) return;
     // Finished batches are retired first (a non-blocking fence status check on the front of the
     // in-flight list), so PendingWriteOverlaps/HasCompletions scans stay short and a label recorded
@@ -1534,6 +1651,8 @@ void VulkanDevice::SubmitRecorded(bool reapFirst) {
     // Not for cross-queue submitters: a retired batch's write-back may sync a later batch under the
     // mutex (see the header), which a poller or compute worker must never do for queue 0.
     if (reapFirst && OpportunisticReap()) state->recorder->Reap();
+    // After the reap: a completion's sync inside it must not consume this announcement.
+    Graphics::Recorder::AnnounceSubmit(reason, __builtin_return_address(0));
     state->recorder->Submit();
 }
 
@@ -1541,9 +1660,10 @@ bool VulkanDevice::CanWaitUnlocked() const {
     return state->recorder && state->recorder->HasTimeline();
 }
 
-std::uint64_t VulkanDevice::SubmitAndEpoch() {
+std::uint64_t VulkanDevice::SubmitAndEpoch(Graphics::Recorder::SubmitReason reason) {
     if (!state->recorder) return 0;
     if (OpportunisticReap()) state->recorder->Reap();
+    Graphics::Recorder::AnnounceSubmit(reason, __builtin_return_address(0));
     return state->recorder->SubmitAndEpoch();
 }
 
@@ -1636,7 +1756,10 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // wait on its range, after APS5_LABEL_FLUSH_US, or at the submission's end (Driver.cpp).
     // Debug aid: APS5_LABEL_SUBMIT_NOW=1 submits every label at once, as before.
     static const bool submitNow = std::getenv("APS5_LABEL_SUBMIT_NOW") != nullptr;
-    if (submitNow) recorder.Submit();
+    if (submitNow) {
+        Graphics::Recorder::AnnounceSubmit(Graphics::Recorder::SubmitReason::Label);
+        recorder.Submit();
+    }
     return 0;
 }
 
@@ -2087,6 +2210,16 @@ void* VulkanDevice::Window() const {
 
 void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     APS5_LOG_OUT_DEBUG("Resize requested=%ux%u current=%ux%u", width, height, state->extent.width, state->extent.height);
+    if (state->swapchain == VK_NULL_HANDLE && state->surface != VK_NULL_HANDLE && !state->surfaceFormats.empty()) {
+        // A dynamic range change whose SDR fallback also failed left no swapchain: it is made again
+        // (SDR) once the window can be presented to.
+        if (width == 0 || height == 0) return;
+        WaitIdle();
+        const auto sdrFormat = SelectSwapchainFormat(state->surfaceFormats, false, VK_FORMAT_UNDEFINED);
+        require(sdrFormat.has_value(), "BGRA8 sRGB-nonlinear surface format is unavailable");
+        static_cast<void>(recreateSwapchain(*sdrFormat, {width, height}));
+        return;
+    }
     require(state->swapchain != VK_NULL_HANDLE, "cannot resize an unavailable swapchain");
     if (width == 0 || height == 0) {
         state->extent = {0, 0};
@@ -2109,6 +2242,27 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     }
     require(width >= surface.minImageExtent.width && width <= surface.maxImageExtent.width && height >= surface.minImageExtent.height && height <= surface.maxImageExtent.height, "unsupported resized output extent");
     require((surface.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT) != 0 && (surface.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR) != 0 && (surface.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) != 0, "resized surface capabilities are unsupported");
+    if (state->swapchainHdr) {
+        // An HDR10 swapchain is remade HDR10 only while the host still offers HDR output in its
+        // format (an HDR toggle also makes the swapchain out of date); otherwise SDR, until the next
+        // HDR10 display buffer asks again (SelectDynamicRange).
+        if (AgcDriverHostHdr_nid_postfix().displayGeneration != state->surfaceDisplayGeneration) refreshSurfaceFormats();
+        const auto host = AgcDriverHostHdr_nid_postfix();
+        const bool offered = std::any_of(state->surfaceFormats.begin(), state->surfaceFormats.end(), [&](const VkSurfaceFormatKHR& format) { return format.format == state->swapchainFormat.format && format.colorSpace == state->swapchainFormat.colorSpace; });
+        if (host.available && offered) {
+            try {
+                static_cast<void>(recreateSwapchain(state->swapchainFormat, {width, height}));
+                return;
+            } catch (const std::runtime_error& error) {
+                state->hdrRefusedGeneration = host.displayGeneration;
+                std::fprintf(stderr, "[hdr] error: the resized HDR10 swapchain could not be created (%s); presenting through the SDR swapchain\n", error.what());
+            }
+        } else {
+            std::fprintf(stderr, "[hdr] HDR output is no longer offered by the host; presenting through the SDR swapchain\n");
+        }
+        recreateSdrSwapchain({width, height});
+        return;
+    }
     VkSwapchainCreateInfoKHR create{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     create.surface = state->surface;
     create.minImageCount = surface.minImageCount;
@@ -2136,6 +2290,173 @@ void VulkanDevice::Resize(std::uint32_t width, std::uint32_t height) {
     state->images.resize(count);
     state->rendered.assign(count, VK_NULL_HANDLE);
     APS5_LOG_OUT_DEBUG("Resize complete swapchain=%p extent=%ux%u images=%u", reinterpret_cast<void*>(state->swapchain), state->extent.width, state->extent.height, count);
+}
+
+void VulkanDevice::refreshSurfaceFormats() {
+    const auto host = AgcDriverHostHdr_nid_postfix();
+    const auto getFormats = state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfaceFormatsKHR>("vkGetPhysicalDeviceSurfaceFormatsKHR");
+    std::uint32_t count = 0;
+    check(getFormats(state->physical, state->surface, &count, nullptr), "vkGetPhysicalDeviceSurfaceFormatsKHR");
+    std::vector<VkSurfaceFormatKHR> formats(count);
+    check(getFormats(state->physical, state->surface, &count, formats.data()), "vkGetPhysicalDeviceSurfaceFormatsKHR");
+    formats.resize(count);
+    // The presentation writes the swapchain with a blit: an HDR10 format that cannot be a blit
+    // target is not offered.
+    const auto formatProperties = state->InstanceFunction<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties");
+    std::erase_if(formats, [&](const VkSurfaceFormatKHR& format) {
+        if (format.colorSpace != VK_COLOR_SPACE_HDR10_ST2084_EXT) return false;
+        VkFormatProperties properties{};
+        formatProperties(state->physical, format.format, &properties);
+        return (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) == 0;
+    });
+    state->surfaceFormats = std::move(formats);
+    state->surfaceDisplayGeneration = host.displayGeneration;
+    AgcDriverSetSurfaceHdr10_nid_postfix(state->swapchainColorspace && SurfaceOffersHdr10(state->surfaceFormats));
+}
+
+void VulkanDevice::setHdrMetadata() {
+    const auto host = AgcDriverHostHdr_nid_postfix();
+    state->metadataGeneration = host.generation;
+    if (!state->hdrMetadata || !state->swapchainHdr || state->swapchain == VK_NULL_HANDLE) return;
+    // The title tone-maps to the luminance VideoOut reports (the monitor's, see
+    // sceSystemServiceGetHdrToneMapLuminance), so the monitor's range describes the content too.
+    VkHdrMetadataEXT metadata{VK_STRUCTURE_TYPE_HDR_METADATA_EXT};
+    metadata.displayPrimaryRed = {0.708f, 0.292f};
+    metadata.displayPrimaryGreen = {0.170f, 0.797f};
+    metadata.displayPrimaryBlue = {0.131f, 0.046f};
+    metadata.whitePoint = {0.3127f, 0.3290f};
+    metadata.maxLuminance = host.display.maxLuminance;
+    metadata.minLuminance = host.display.minLuminance;
+    metadata.maxContentLightLevel = host.display.maxLuminance;
+    metadata.maxFrameAverageLightLevel = host.display.maxFullFrameLuminance;
+    state->DeviceFunction<PFN_vkSetHdrMetadataEXT>("vkSetHdrMetadataEXT")(state->device, 1, &state->swapchain, &metadata);
+}
+
+bool VulkanDevice::recreateSwapchain(VkSurfaceFormatKHR format, VkExtent2D extent) {
+    VkSurfaceCapabilitiesKHR surface{};
+    check(state->InstanceFunction<PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>("vkGetPhysicalDeviceSurfaceCapabilitiesKHR")(state->physical, state->surface, &surface), "vkGetPhysicalDeviceSurfaceCapabilitiesKHR dynamic range");
+    if (surface.currentExtent.width != std::numeric_limits<std::uint32_t>::max()) extent = surface.currentExtent;
+    // A minimized window (or one being resized past its surface for a moment) cannot take a
+    // swapchain now: the frame is dropped and the next flip asks again, as Resize does.
+    if (extent.width == 0 || extent.height == 0 || extent.width < surface.minImageExtent.width || extent.width > surface.maxImageExtent.width || extent.height < surface.minImageExtent.height || extent.height > surface.maxImageExtent.height) {
+        state->extent = {0, 0};
+        return false;
+    }
+    VkSwapchainCreateInfoKHR create{VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+    create.surface = state->surface;
+    create.minImageCount = surface.minImageCount;
+    create.imageFormat = format.format;
+    create.imageColorSpace = format.colorSpace;
+    create.imageExtent = extent;
+    create.imageArrayLayers = 1;
+    create.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    create.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    create.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    create.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    create.presentMode = RequestedPresentMode(*state, state->physical, state->surface);
+    create.oldSwapchain = state->swapchain;
+    state->retiredSwapchains.reserve(state->retiredSwapchains.size() + 1);
+    VkSwapchainKHR replacement = VK_NULL_HANDLE;
+    const auto created = state->DeviceFunction<PFN_vkCreateSwapchainKHR>("vkCreateSwapchainKHR")(state->device, &create, nullptr, &replacement);
+    // The old swapchain is retired whether or not the new one was made.
+    if (state->swapchain != VK_NULL_HANDLE) state->retiredSwapchains.push_back({state->swapchain, std::move(state->rendered)});
+    state->swapchain = VK_NULL_HANDLE;
+    state->rendered.clear();
+    state->images.clear();
+    if (created != VK_SUCCESS) {
+        // Nothing is in flight (the caller waited for the device): the retired swapchains go now, so
+        // a replacement can be made for the surface without an old swapchain.
+        state->DestroyRetiredSwapchains();
+        char message[160];
+        std::snprintf(message, sizeof(message), "vkCreateSwapchainKHR (format %d, color space %d) failed with VkResult %d", static_cast<int>(format.format), static_cast<int>(format.colorSpace), static_cast<int>(created));
+        throw std::runtime_error(message);
+    }
+    state->swapchain = replacement;
+    state->swapchainFormat = format;
+    state->swapchainHdr = format.colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT;
+    AgcDriverSetPresentingHdr10_nid_postfix(state->swapchainHdr);
+    state->extent = extent;
+    auto getImages = state->DeviceFunction<PFN_vkGetSwapchainImagesKHR>("vkGetSwapchainImagesKHR");
+    std::uint32_t count = 0;
+    check(getImages(state->device, replacement, &count, nullptr), "vkGetSwapchainImagesKHR dynamic range");
+    state->images.resize(count);
+    check(getImages(state->device, replacement, &count, state->images.data()), "vkGetSwapchainImagesKHR dynamic range");
+    state->images.resize(count);
+    state->rendered.assign(count, VK_NULL_HANDLE);
+    if (state->swapchainHdr) setHdrMetadata();
+    APS5_LOG_OUT("Swapchain recreated swapchain=%p format=%d colorSpace=%d extent=%ux%u images=%u", reinterpret_cast<void*>(state->swapchain), static_cast<int>(format.format), static_cast<int>(format.colorSpace), extent.width, extent.height, count);
+    return true;
+}
+
+void VulkanDevice::recreateSdrSwapchain(VkExtent2D extent) {
+    const auto sdrFormat = SelectSwapchainFormat(state->surfaceFormats, false, VK_FORMAT_UNDEFINED);
+    require(sdrFormat.has_value(), "BGRA8 sRGB-nonlinear surface format is unavailable");
+    try {
+        if (recreateSwapchain(*sdrFormat, extent)) std::fprintf(stderr, "[hdr] presenting SDR: swapchain format %d in VK_COLOR_SPACE_SRGB_NONLINEAR_KHR\n", static_cast<int>(sdrFormat->format));
+    } catch (const std::runtime_error& error) {
+        // Without a swapchain nothing is presented; Resize makes the SDR swapchain again at the next
+        // flip (and a second failure there is fatal, as any swapchain failure was before).
+        std::fprintf(stderr, "[hdr] error: the SDR swapchain could not be created (%s); retrying at the next flip\n", error.what());
+        state->extent = {0, 0};
+    }
+}
+
+void VulkanDevice::SelectDynamicRange(const DisplayBuffer* buffer) {
+    GuestMemory::AssertGpuLockHeld("VulkanDevice::SelectDynamicRange");
+    if (state->surface == VK_NULL_HANDLE || state->swapchain == VK_NULL_HANDLE) return;
+    if (AgcDriverHostHdr_nid_postfix().displayGeneration != state->surfaceDisplayGeneration) refreshSurfaceFormats();
+    const auto host = AgcDriverHostHdr_nid_postfix();
+    if (state->swapchainHdr && host.generation != state->metadataGeneration) setHdrMetadata();
+    if (buffer == nullptr) return;
+    const bool pq = DisplayPq(buffer->pixelFormat);
+    const char* refusal = nullptr;
+    std::optional<VkSurfaceFormatKHR> hdrFormat;
+    if (pq) {
+        const auto source = DisplayTexelFormat(buffer->pixelFormat);
+        VkFormatProperties properties{};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFormatProperties>("vkGetPhysicalDeviceFormatProperties")(state->physical, source, &properties);
+        constexpr VkFormatFeatureFlags scalerSource = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+        hdrFormat = SelectSwapchainFormat(state->surfaceFormats, true, source);
+        if (!host.display.hdr) refusal = "the monitor showing the window is not in HDR mode";
+        else if (!host.surfaceHdr10 || !hdrFormat) refusal = "the window's Vulkan surface offers no HDR10 (ST 2084) swapchain in a 10-bit format";
+        else if ((properties.optimalTilingFeatures & scalerSource) != scalerSource) refusal = "the display buffer's 10-bit texel format cannot be a filtered blit source";
+        else if (state->hdrRefusedGeneration == host.displayGeneration) refusal = "the HDR10 swapchain could not be created";
+    }
+    const bool hdr = pq && refusal == nullptr;
+    if (pq && refusal != nullptr && state->fallbackWarnedGeneration != host.displayGeneration) {
+        state->fallbackWarnedGeneration = host.displayGeneration;
+        std::fprintf(stderr, "[hdr] error: display buffer format 0x%016llx is HDR10 (BT.2020, ST 2084) but %s; its code values are presented through the SDR swapchain unconverted\n", static_cast<unsigned long long>(buffer->pixelFormat), refusal);
+    }
+    if (hdr == state->swapchainHdr) return;
+    if (state->extent.width == 0 || state->extent.height == 0) return;
+    WaitIdle();
+    if (hdr) {
+        try {
+            if (recreateSwapchain(*hdrFormat, state->extent)) std::fprintf(stderr, "[hdr] presenting HDR10: swapchain format %d in VK_COLOR_SPACE_HDR10_ST2084_EXT, display buffer format 0x%016llx passed through\n", static_cast<int>(hdrFormat->format), static_cast<unsigned long long>(buffer->pixelFormat));
+            return;
+        } catch (const std::runtime_error& error) {
+            state->hdrRefusedGeneration = host.displayGeneration;
+            state->fallbackWarnedGeneration = host.displayGeneration;
+            std::fprintf(stderr, "[hdr] error: the HDR10 swapchain could not be created (%s); presenting through the SDR swapchain\n", error.what());
+            if (state->swapchain != VK_NULL_HANDLE && !state->swapchainHdr) return;
+        }
+    }
+    recreateSdrSwapchain(state->extent);
+}
+
+bool VulkanDevice::passthroughFor(const DisplayBuffer& buffer) const {
+    return state->swapchainHdr && DisplayPq(buffer.pixelFormat);
+}
+
+PresentationScaler* VulkanDevice::activeScaler(bool passthrough, std::uint64_t pixelFormat) {
+    if (!passthrough) return state->scaler.get();
+    const auto source = DisplayTexelFormat(pixelFormat);
+    if (state->hdrScaler == nullptr || state->hdrScalerSource != source) {
+        if (state->hdrScaler != nullptr && state->SharedSlotInFlight()) RetirePresents(0);
+        state->hdrScaler = std::make_unique<PresentationScaler>(graphicsContext(), source, state->swapchainFormat.format);
+        state->hdrScalerSource = source;
+    }
+    return state->hdrScaler.get();
 }
 
 bool VulkanDevice::Presentable() const {
@@ -2222,7 +2543,7 @@ void WriteFrameBmp(int index, std::uint32_t fullWidth, std::uint32_t fullHeight,
     }
 }
 
-ResidentPresent ResidentPresentable(const Graphics::Context& context, const Graphics::StorageTexture& image, const DisplayBuffer& buffer, VkFilter& filter) {
+ResidentPresent ResidentPresentable(const Graphics::Context& context, const Graphics::StorageTexture& image, const DisplayBuffer& buffer, VkFilter& filter, bool passthrough) {
     const auto& descriptor = image.Descriptor();
     if (descriptor.width != buffer.width || descriptor.height != buffer.height || descriptor.mipCount != 1 || image.ImageLayers() != 1 || image.ImageDepth() != 1) return ResidentPresent::None;
     if (image.GuestBytes() != DisplayBufferSize(buffer)) return ResidentPresent::None;
@@ -2231,15 +2552,15 @@ ResidentPresent ResidentPresentable(const Graphics::Context& context, const Grap
     context.formatProperties(context.physical, format, &properties);
     const bool blitSource = (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) != 0;
     filter = (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT) != 0 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    return ResidentPresentPath(format, buffer.pixelFormat, blitSource);
+    return ResidentPresentPath(format, buffer.pixelFormat, blitSource, passthrough);
 }
 
-std::shared_ptr<Graphics::StorageTexture> PresentableResident(const Graphics::Context& context, const DisplayBuffer& buffer, VkFilter& filter, bool& pending, bool& convert) {
+std::shared_ptr<Graphics::StorageTexture> PresentableResident(const Graphics::Context& context, const DisplayBuffer& buffer, VkFilter& filter, bool& pending, bool& convert, bool passthrough) {
     auto resident = Graphics::StorageTexture::FindPending(buffer.address, DisplayBufferSize(buffer));
     pending = resident != nullptr;
     convert = false;
     if (resident == nullptr) return resident;
-    const auto path = ResidentPresentable(context, *resident, buffer, filter);
+    const auto path = ResidentPresentable(context, *resident, buffer, filter, passthrough);
     if (path == ResidentPresent::None) resident.reset();
     convert = path == ResidentPresent::Convert;
     return resident;
@@ -2323,7 +2644,12 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
         std::snprintf(name, sizeof(name), "dump_depth_%llx.raw", static_cast<unsigned long long>(depth));
         Graphics::DumpDepthSurface(depth, name);
     }
+    // An HDR10 display buffer reaches the HDR10 swapchain with its texels unchanged (see
+    // SelectDynamicRange); every other one is reduced to 8-bit BGRA as before.
+    const bool passthrough = passthroughFor(buffer);
+    if (passthrough) activeScaler(true, buffer.pixelFormat);
     if (buffer.tilingMode == 1) {
+        if (passthrough) return present(buffer.width, buffer.height, true, ReadDisplayBufferTexels(buffer), nullptr, nullptr, VK_FILTER_LINEAR, false, false, nullptr, true);
         const auto pixels = ReadDisplayBuffer(buffer);
         return present(buffer.width, buffer.height, true, pixels);
     }
@@ -2340,7 +2666,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     bool convert = false;
     if (!NoResidentPresent()) {
         bool pending = false;
-        resident = PresentableResident(graphicsContext(), buffer, filter, pending, convert);
+        resident = PresentableResident(graphicsContext(), buffer, filter, pending, convert, passthrough);
         if (resident != nullptr && buffer.dccAddress != 0 && !ResidentServesDisplay(*resident, buffer)) {
             resident.reset();
             convert = false;
@@ -2366,7 +2692,7 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     const auto cleared = buffer.dccAddress != 0 && resident == nullptr ? CompressedClearPixel(buffer, bytes) : std::nullopt;
     auto& dumps = Dumps();
     bool dumpFrame = false;
-    if (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0) {
+    if (dumps.dumped < dumps.limit && ++dumps.presents % static_cast<std::uint64_t>(dumps.every) == 0 && (dumps.cpu || !passthrough)) {
         if (dumps.cpu) {
             auto full = cleared ? std::vector<std::byte>(static_cast<std::size_t>(buffer.width) * buffer.height * cleared->size()) : ReadDisplayBuffer(buffer);
             for (std::size_t offset = 0; cleared && offset < full.size(); offset += cleared->size()) std::memcpy(full.data() + offset, cleared->data(), cleared->size());
@@ -2383,11 +2709,18 @@ bool VulkanDevice::PresentDisplayBuffer(const DisplayBuffer& buffer) {
     }
     CaptureTrace::Log("present dump=%d address=%llx width=%u height=%u resident=%d generation=%llu", dumpFrame ? state->nextDumpIndex : -1, static_cast<unsigned long long>(buffer.address), buffer.width, buffer.height, resident != nullptr, static_cast<unsigned long long>(resident ? resident->Generation() : 0));
     VkClearColorValue uniform{};
-    if (cleared) {
+    if (cleared && passthrough) {
+        const auto texel = DisplayBufferClearTexel(buffer, DisplayBufferKeys(buffer));
+        std::uint32_t word = 0;
+        std::memcpy(&word, texel.data(), sizeof(word));
+        const auto field = [&](unsigned shift) { return static_cast<float>((word >> shift) & 1023u) / 1023.0f; };
+        const float low = field(0), green = field(10), high = field(20);
+        uniform = DisplayRedLow(buffer.pixelFormat) ? VkClearColorValue{{low, green, high, 1.0f}} : VkClearColorValue{{high, green, low, 1.0f}};
+    } else if (cleared) {
         const auto channel = [&](std::size_t index) { return static_cast<float>(std::to_integer<unsigned>((*cleared)[index])) / 255.0f; };
         uniform = {{channel(2), channel(1), channel(0), channel(3)}};
     }
-    if (!present(buffer.width, buffer.height, true, {}, cleared ? nullptr : &buffer, resident, filter, dumpFrame, convert, cleared ? &uniform : nullptr)) {
+    if (!present(buffer.width, buffer.height, true, {}, cleared ? nullptr : &buffer, resident, filter, dumpFrame, convert, cleared ? &uniform : nullptr, passthrough)) {
         // A dropped frame (swapchain out of date) keeps the dump numbering contiguous.
         if (dumpFrame) --dumps.dumped;
         return false;
@@ -2432,7 +2765,7 @@ bool VulkanDevice::AcquireImage() {
     return true;
 }
 
-bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels, const DisplayBuffer* display, const std::shared_ptr<Graphics::StorageTexture>& resident, VkFilter residentFilter, bool dumpFrame, bool residentConvert, const VkClearColorValue* uniform) {
+bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaque, std::span<const std::byte> pixels, const DisplayBuffer* display, const std::shared_ptr<Graphics::StorageTexture>& resident, VkFilter residentFilter, bool dumpFrame, bool residentConvert, const VkClearColorValue* uniform, bool passthrough) {
     PerformanceTimer timing("Vulkan.Present");
     APS5_LOG_OUT_DEBUG("present begin width=%u height=%u opaque=%u pixels=%zu", width, height, static_cast<unsigned>(opaque), pixels.size());
     require(state->swapchain != VK_NULL_HANDLE, "device has no swapchain");
@@ -2450,12 +2783,14 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     require(!residentConvert || (resident != nullptr && display != nullptr), "a converted resident presentation needs its image and display buffer");
     require(uniform == nullptr || (pixels.empty() && display == nullptr && resident == nullptr), "a uniform presentation has no other source");
     const bool direct = resident != nullptr && !residentConvert;
+    require(!passthrough || (state->swapchainHdr && state->hdrScaler != nullptr && !dumpFrame), "an HDR10 passthrough presentation needs the HDR10 swapchain and its scaler");
+    auto* scaler = passthrough ? state->hdrScaler.get() : state->scaler.get();
     // The scaler's source image, the color transfer's staging and the upload buffer are single
     // objects an in-flight blit through them may still read: the paths using or re-creating them
     // wait for every slot first. The game path did so before taking the mutex
     // (PresentWaitsForSlots); this is the fallback.
     const bool shared = !clearOnly && !direct;
-    if ((shared || (!clearOnly && (state->scaler == nullptr || state->scaler->SourceWidth() != width || state->scaler->SourceHeight() != height))) && state->SharedSlotInFlight()) RetirePresents(0);
+    if ((shared || (!clearOnly && (scaler == nullptr || scaler->SourceWidth() != width || scaler->SourceHeight() != height))) && state->SharedSlotInFlight()) RetirePresents(0);
     // The next slot is the oldest; a caller that did not retire it first (PresentPixels) waits here.
     if (state->presentSlots[state->presentCursor].inFlight) RetirePresents(state->presentSlots.size() - 1);
     auto& slot = state->presentSlots[state->presentCursor];
@@ -2468,7 +2803,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     // The frame's recorded work (and a refresh of the resident image) must reach the queue before the
     // presentation's own submission, which reads the image in queue order. No reap first: queue 0
     // reaps at its next packet, so the presenter's hold carries no completions.
-    SubmitRecorded(false);
+    SubmitRecorded(false, Graphics::Recorder::SubmitReason::Present);
     std::chrono::steady_clock::time_point lastSubmittedAt{};
     const std::uint64_t batchesAtBlit = state->recorder ? state->recorder->NewestSubmitted(&lastSubmittedAt) : 0;
     CaptureTrace::Log("blit dump=%d batch=%llu slot=%zu image=%u direct=%d", dumpFrame ? state->nextDumpIndex : -1, static_cast<unsigned long long>(batchesAtBlit), state->presentCursor, index, direct);
@@ -2513,8 +2848,8 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         state->DeviceFunction<PFN_vkCmdClearColorImage>("vkCmdClearColorImage")(commands, barrier.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &clear, 1, &barrier.subresourceRange);
     } else {
         APS5_LOG_OUT_DEBUG("Recording swapchain scaled blit width=%u height=%u bytes=%zu buffer=%p image=%p", width, height, pixels.size(), reinterpret_cast<void*>(state->uploadBuffer), reinterpret_cast<void*>(barrier.image));
-        require(state->scaler != nullptr, "presentation scaler is unavailable");
-        state->scaler->EnsureSourceImage(width, height);
+        require(scaler != nullptr, "presentation scaler is unavailable");
+        scaler->EnsureSourceImage(width, height);
         VkImageMemoryBarrier residentBarrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
         if (resident != nullptr) {
             // The draws and dispatches that produced the image were submitted before this command
@@ -2531,15 +2866,15 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             pipelineBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &residentBarrier);
             Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
             if (residentConvert) {
-                state->colorTransfer->DetileImage(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, Graphics::ColorTileMode::RenderTarget, DisplayRedLow(display->pixelFormat), DisplayTenBit(display->pixelFormat));
-                state->scaler->RecordUpload(commands, state->colorTransfer->LinearBuffer());
+                state->colorTransfer->DetileImage(commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, Graphics::ColorTileMode::RenderTarget, !passthrough && DisplayRedLow(display->pixelFormat), !passthrough && DisplayTenBit(display->pixelFormat));
+                scaler->RecordUpload(commands, state->colorTransfer->LinearBuffer());
             }
         } else {
             if (display != nullptr) {
-                state->colorTransfer->Detile(commands, DisplayRedLow(display->pixelFormat), DisplayTenBit(display->pixelFormat));
+                state->colorTransfer->Detile(commands, !passthrough && DisplayRedLow(display->pixelFormat), !passthrough && DisplayTenBit(display->pixelFormat));
             }
-            if (uniform != nullptr) state->scaler->RecordClear(commands, *uniform);
-            else state->scaler->RecordUpload(commands, display != nullptr ? state->colorTransfer->LinearBuffer() : state->uploadBuffer);
+            if (uniform != nullptr) scaler->RecordClear(commands, *uniform);
+            else scaler->RecordUpload(commands, display != nullptr ? state->colorTransfer->LinearBuffer() : state->uploadBuffer);
         }
         VkClearColorValue letterbox{};
         letterbox.float32[3] = 1.0f;
@@ -2556,7 +2891,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         pipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &letterboxBarrier);
         Graphics::Recorder::CountBarriers(CommandClass::PresentBlit);
         if (direct) PresentationScaler::RecordBlitFrom(graphicsContext(), commands, resident->Image(), VK_IMAGE_LAYOUT_GENERAL, width, height, residentFilter, barrier.image, state->extent.width, state->extent.height);
-        else state->scaler->RecordBlit(commands, barrier.image, state->extent.width, state->extent.height);
+        else scaler->RecordBlit(commands, barrier.image, state->extent.width, state->extent.height);
         if (dumpFrame && direct) {
             const auto scale = DumpScale();
             slot.dumpWidth = (width + scale - 1) / scale;
@@ -2665,8 +3000,10 @@ bool VulkanDevice::PresentWaitsForSlots(const DisplayBuffer* buffer) const {
     VkFilter filter = VK_FILTER_LINEAR;
     bool pending = false;
     bool convert = false;
-    if (PresentableResident(graphicsContext(), *buffer, filter, pending, convert) == nullptr || convert) return true;
-    return state->scaler == nullptr || state->scaler->SourceWidth() != buffer->width || state->scaler->SourceHeight() != buffer->height;
+    const bool passthrough = passthroughFor(*buffer);
+    if (PresentableResident(graphicsContext(), *buffer, filter, pending, convert, passthrough) == nullptr || convert) return true;
+    const auto* scaler = passthrough ? state->hdrScaler.get() : state->scaler.get();
+    return scaler == nullptr || (passthrough && state->hdrScalerSource != DisplayTexelFormat(buffer->pixelFormat)) || scaler->SourceWidth() != buffer->width || scaler->SourceHeight() != buffer->height;
 }
 
 void VulkanDevice::FlipBatches(std::uint64_t& submissions, std::uint64_t& unsignaled) const {
@@ -2858,6 +3195,10 @@ std::shared_ptr<Graphics::DrawSpeculation> VulkanDevice::SpeculateDraw(const Gra
 
 std::shared_ptr<Graphics::DrawPrebuild> VulkanDevice::PrebuildDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, bool keyed) const {
     return Graphics::PrebuildDraw(graphicsContext(), graphics, draw, shaders, keyed);
+}
+
+void VulkanDevice::SpeculatePipeline(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders, Graphics::DrawSpeculation& speculation, const std::shared_ptr<Graphics::DrawPrebuild>& prebuilt) const {
+    Graphics::SpeculateDrawPipeline(graphicsContext(), graphics, shaders, speculation, prebuilt);
 }
 
 void VulkanDevice::ColorMetadataPass(const Graphics::ColorMetadataPass& pass) {
@@ -3416,7 +3757,10 @@ std::uint64_t VulkanDevice::presync(std::span<const std::pair<std::uint64_t, std
                 open = open || info->open;
                 serial = std::max(serial, info->serial);
             }
-            if (open) serial = state->recorder->SubmitAndEpoch();
+            if (open) {
+                Graphics::Recorder::AnnounceSubmit(Graphics::Recorder::SubmitReason::Presync);
+                serial = state->recorder->SubmitAndEpoch();
+            }
         }
     }
     if (serial != 0) {
@@ -3627,6 +3971,53 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
     if (record.x > limit[0] || record.y > limit[1] || record.z > limit[2]) throw std::runtime_error("Vulkan dispatch: workgroup count exceeds device limits");
 }
 
+// APS5_ASYNC_ELIGIBILITY_PROFILE=1 (Stage 2 slice 0, no behaviour change): for every dispatch
+// recorded by a compute queue worker, whether a separate Recorder for that queue could take it
+// without touching state only the shared one owns, by the first refusal met: a held lease, storage
+// images, copied (staged) writes or a BDA fault check needing a completion, indirect arguments, a
+// read or write range under a unit shadow, or a queued label/key store over its writes. Printed
+// per queue every 10 s as [async-elig].
+void VulkanDevice::countAsyncEligibility(const RecordedDispatch& record, const Graphics::ShaderResources& resources) {
+    static const bool enabled = std::getenv("APS5_ASYNC_ELIGIBILITY_PROFILE") != nullptr;
+    if (!enabled) return;
+    const auto queue = GuestMemory::GpuLockThreadTag();
+    if (queue == 0xffffffffu || queue == 0) return;
+    enum Reason : std::size_t { Eligible, Lease, StorageImages, Completion, Indirect, Shadowed, QueuedStores, Count };
+    static constexpr const char* names[Count] = {"eligible", "lease", "storage images", "completion", "indirect", "shadowed", "queued stores"};
+    std::size_t reason = Eligible;
+    auto* recorder = Graphics::Recorder::Active();
+    if (resources.HoldsLease()) reason = Lease;
+    else if (!resources.StorageImages().empty()) reason = StorageImages;
+    else if (resources.NeedsCompletion()) reason = Completion;
+    else if (record.arguments != 0) reason = Indirect;
+    else if (Graphics::AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>>(resources.GpuWrites())) || Graphics::AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>>(resources.TrackedReads()))) reason = Shadowed;
+    else if (recorder != nullptr && std::any_of(resources.GpuWrites().begin(), resources.GpuWrites().end(), [&](const auto& range) { return (recorder->HasQueuedStores() && recorder->QueuedStoreOverlaps(range.first, static_cast<std::size_t>(range.second - range.first))) || (recorder->HasQueuedKeyStores() && recorder->QueuedKeyStoreOverlaps(range.first, static_cast<std::size_t>(range.second - range.first))); })) reason = QueuedStores;
+    static std::mutex mutex;
+    static std::map<std::uint32_t, std::array<std::uint64_t, Count>> counts;
+    static auto last = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    ++counts[queue][reason];
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    std::string line = "[async-elig] dispatches a per-queue recorder could take (10 s, by first refusal):";
+    for (const auto& [id, row] : counts) {
+        std::uint64_t total = 0;
+        for (const auto value : row) total += value;
+        char part[96];
+        std::snprintf(part, sizeof(part), " queue 0x%x %llu (%.0f%% eligible:", id, static_cast<unsigned long long>(total), total != 0 ? 100.0 * static_cast<double>(row[Eligible]) / static_cast<double>(total) : 0.0);
+        line += part;
+        for (std::size_t r = 1; r < Count; ++r) {
+            if (row[r] == 0) continue;
+            std::snprintf(part, sizeof(part), " %s %llu", names[r], static_cast<unsigned long long>(row[r]));
+            line += part;
+        }
+        line += ")";
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+    counts.clear();
+}
+
 void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     auto& d = Dispatches();
     auto& recorder = *state->recorder;
@@ -3787,9 +4178,12 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     recordStep(PhaseRecordBind);
     Graphics::Recorder::SetNoteProgram(record.programAddress);
+    const auto notesBefore = recorder.WriteNotes();
     resources.MarkGpuWrites(recorder);
+    Graphics::Recorder::SetDispatchNotes(notesBefore, recorder.WriteNotes());
     Graphics::Recorder::SetNoteProgram(0);
     recordStep(PhaseRecordMarks);
+    countAsyncEligibility(record, resources);
     // Only copied written buffers (and BDA fault checks) need work once the GPU is done; without them
     // the batch can signal its labels from the GPU.
     if (resources.NeedsCompletion()) {

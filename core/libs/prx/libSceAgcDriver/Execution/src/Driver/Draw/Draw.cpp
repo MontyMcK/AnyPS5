@@ -996,7 +996,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i]);
         if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = (clipControl & (0xffffu | (1u << 21u) | (1u << 22u) | (1u << 23u))) | graphics.layerExports;
     };
+    // Draw shape reuse (DrawShapeReuse.cpp) for the stages this draw captures: not for indirect
+    // draws (their stages are captured again per record), debug dumps and probes, or the modes that
+    // verify the draw cache against full captures. `registered` are the program regions the stages'
+    // ShaderMemory serves from the snapshots.
+    const bool shapeReuse = drawShapeReuse() && !drawParameters.indirect && dumpTarget == 0 && dumpSlot1 == 0 && !ShaderRecompiler::DebugProbeActive() && !stampValidate() && !verifyHit && !verifyDrawDataHits() && !verifyRebasedHits();
+    const std::vector<ShaderRecompiler::MemoryRegion> registered(shapeReuse ? memory.begin() : memory.end(), memory.end());
     ShaderMemory shaderMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
+    // APS5_VERIFY_DRAW_SHAPE_REUSE: a second memory over the same regions on which every captured
+    // stage is captured in full again and compared.
+    std::optional<ShaderMemory> shapeShadow;
+    if (shapeReuse && verifyDrawShapeReuse()) shapeShadow.emplace(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter());
     static_cast<void>(setMeshIndexBuffer);
     static_cast<void>(locate);
 
@@ -1056,7 +1066,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
             } else {
                 if (!dataCandidates[i].empty() && !verifyDrawDataHits()) decodeVertexInfo(i);
-                compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected));
+                compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, shapeReuse, registered, shapeShadow ? &*shapeShadow : nullptr));
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 programResults[i] = compiledStages.back().get();
                 if (programResults[i] != nullptr) Graphics::GpuCheckpoints::NoteVariant(programResults[i]->variantId, programs[i].binary.codeAddress);
@@ -1313,7 +1323,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
 
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
-    if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes()) {
+    if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes() && Graphics::DrawRecipeWanted(drawHit)) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
@@ -1377,23 +1387,34 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             for (const auto& color : graphics.colors) prefetchTarget(color);
         }
         std::shared_ptr<Graphics::DrawSpeculation> speculation;
+        // Why the prep thread did not speculate (the [commit] line): Count when it did not try.
+        auto prepRefusal = Graphics::DrawSpeculation::Miss::Count;
         if (recipe == nullptr && Graphics::DrawSpeculationEnabled() && DrawPipeline::Queue0().OnPrepThread()) {
             try {
                 speculation = localDevice->SpeculateDraw(graphics, drawParameters, stages, snapshots);
+                prepRefusal = Graphics::TakeSpeculationRefusal();
             } catch (...) {
                 speculation = nullptr;
+                prepRefusal = Graphics::DrawSpeculation::Miss::Thrown;
             }
         }
         std::shared_ptr<Graphics::DrawPrebuild> prebuilt;
         if (recipe == nullptr && Graphics::ParallelDrawBuild() && Graphics::DrawPlansEnabled() && DrawPipeline::Queue0().OnPrepThread()) prebuilt = localDevice->PrebuildDraw(graphics, drawParameters, stages, speculation == nullptr);
+        if (speculation != nullptr && prebuilt != nullptr) localDevice->SpeculatePipeline(graphics, stages, *speculation, prebuilt);
         static const bool runnerRegistered = [this] {
             DrawPipeline::SetForkRunner(new DrawForkRunner(*this));
             return true;
         }();
         static_cast<void>(runnerRegistered);
         std::shared_ptr<DrawForkJob> forkJob;
-        if (Graphics::ForkBuildEnabled() || Graphics::ForkStatsEnabled() || Graphics::ForkAheadEnabled()) forkJob = std::make_shared<DrawForkJob>();
-        auto commit = [this, forkJob, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, speculation = std::move(speculation), prebuilt = std::move(prebuilt), programs = std::move(programs), results = std::move(results), compiledStages = std::move(compiledStages), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry)](DrawForkJob* fork) {
+        // The job's pass hint also tells the committer which queued draws continue a pass (live
+        // `parallel_commit` pass runs, DrawPipeline::run); it changes nothing else there.
+        const bool forkFlags = Graphics::ForkBuildEnabled() || Graphics::ForkStatsEnabled() || Graphics::ForkAheadEnabled();
+        if (forkFlags || Graphics::ParallelCommitEnabled()) {
+            forkJob = std::make_shared<DrawForkJob>();
+            forkJob->forFork = forkFlags;
+        }
+        auto commit = [this, forkJob, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, prepRefusal, speculation = std::move(speculation), prebuilt = std::move(prebuilt), programs = std::move(programs), results = std::move(results), compiledStages = std::move(compiledStages), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry)](DrawForkJob* fork) {
             if (fork != nullptr) {
                 fork->device = localDevice;
                 fork->state = &decode->state;
@@ -1431,7 +1452,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, std::move(speculation), std::move(prebuilt));
+            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, std::move(speculation), std::move(prebuilt), static_cast<std::uint8_t>(prepRefusal));
             if (forkJob != nullptr && Graphics::ForkAheadEnabled()) {
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
                 std::lock_guard publishLock(GuestMemory::GpuMutex());
@@ -1478,7 +1499,72 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     return drawn();
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, std::shared_ptr<Graphics::DrawSpeculation> speculation, std::shared_ptr<Graphics::DrawPrebuild> prebuilt) {
+namespace {
+
+// APS5_PROFILE_DRAW: the committer's draw commits (Driver::commitDraw) every 10 s, the [commit]
+// line: the GPU mutex wait, the hold and its parts, per draw, and the hold by what became of the
+// draw's speculation (accepted, refused on commit, or why the prep thread made none).
+struct CommitProfile {
+    // Classes: recipe draws, accepted, refused on commit, then the prep refusals by
+    // SpeculationMiss (index Count: the prep thread did not try; Count + 1: unknown).
+    static constexpr std::size_t MissCount = static_cast<std::size_t>(Graphics::DrawSpeculation::Miss::Count);
+    static constexpr std::size_t Recipe = 0, Accepted = 1, Refused = 2, FirstPrep = 3, ClassCount = FirstPrep + MissCount + 2;
+    std::array<std::atomic<std::uint64_t>, ClassCount> counts{};
+    std::array<std::atomic<std::uint64_t>, ClassCount> heldNs{};
+    std::atomic<std::uint64_t> commits{0}, waitNs{0}, labelsNs{0}, writersNs{0}, drawNs{0}, attachNs{0}, submitNs{0}, held{0}, attached{0};
+    std::atomic<std::int64_t> reported{0};
+};
+
+CommitProfile& CommitStats() {
+    static CommitProfile stats;
+    return stats;
+}
+
+bool commitProfiled() {
+    static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profiled;
+}
+
+std::size_t commitClass(bool recipeDrawn, std::uint8_t outcome, std::uint8_t prepRefusal) {
+    if (recipeDrawn) return CommitProfile::Recipe;
+    if (outcome == 1) return CommitProfile::Accepted;
+    if (outcome == 2) return CommitProfile::Refused;
+    if (prepRefusal == 0 || prepRefusal > CommitProfile::MissCount) return CommitProfile::FirstPrep + CommitProfile::MissCount + 1;
+    return CommitProfile::FirstPrep + prepRefusal;
+}
+
+void reportCommits() {
+    auto& stats = CommitStats();
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto last = stats.reported.load(std::memory_order_relaxed);
+    if (last == 0) {
+        stats.reported.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now - last < 10'000'000'000ll || !stats.reported.compare_exchange_strong(last, now)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
+    const auto commits = take(stats.commits);
+    const auto per = [&](std::uint64_t ns) { return commits != 0 ? static_cast<double>(ns) / 1000.0 / static_cast<double>(commits) : 0.0; };
+    const auto wait = take(stats.waitNs), held = take(stats.held), labels = take(stats.labelsNs), writers = take(stats.writersNs), drawn = take(stats.drawNs), attach = take(stats.attachNs), submit = take(stats.submitNs);
+    const auto rest = held > labels + writers + drawn + attach + submit ? held - labels - writers - drawn - attach - submit : 0;
+    char head[640];
+    std::snprintf(head, sizeof(head), "[commit] (10 s) %llu draw commits, us per commit: GPU mutex wait %.2f, held %.2f (labels %.2f, writers %.2f, Graphics::Draw %.2f, recipe attach %.2f (%llu attached, %llu skipped by recipe_on_hit), submit check %.2f, other %.2f); held %.1f ms in total; by speculation (commits at us held each):", static_cast<unsigned long long>(commits), per(wait), per(held), per(labels), per(writers), per(drawn), per(attach), static_cast<unsigned long long>(take(stats.attached)), static_cast<unsigned long long>(Graphics::TakeDrawRecipeSkips()), per(submit), per(rest), static_cast<double>(held) / 1e6);
+    std::string line = head;
+    for (std::size_t index = 0; index < CommitProfile::ClassCount; ++index) {
+        const auto count = take(stats.counts[index]);
+        const auto ns = take(stats.heldNs[index]);
+        if (count == 0) continue;
+        std::string name = index == CommitProfile::Recipe ? "recipe" : index == CommitProfile::Accepted ? "accepted" : index == CommitProfile::Refused ? "refused on commit" : index == CommitProfile::FirstPrep + CommitProfile::MissCount ? "not tried" : index == CommitProfile::FirstPrep + CommitProfile::MissCount + 1 ? "unknown" : std::string("prep refused ") + Graphics::SpeculationMissName(static_cast<Graphics::DrawSpeculation::Miss>(index - CommitProfile::FirstPrep));
+        char item[160];
+        std::snprintf(item, sizeof(item), " %s %llu at %.1f;", name.c_str(), static_cast<unsigned long long>(count), static_cast<double>(ns) / 1000.0 / static_cast<double>(count));
+        line += item;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
+}
+
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, std::shared_ptr<Graphics::DrawSpeculation> speculation, std::shared_ptr<Graphics::DrawPrebuild> prebuilt, std::uint8_t prepRefusal) {
     const bool timed = forkTimed();
     auto lap = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto mark = [&](std::atomic<std::uint64_t>& into) {
@@ -1487,28 +1573,79 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         into.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - lap).count()), std::memory_order_relaxed);
         lap = now;
     };
+    // The [commit] profile's clock: `stamp` laps into a CommitProfile counter; the hold ends when
+    // `holdEnd` (declared after the lock, so destroyed before it) runs, after the submit check.
+    const bool profiled = commitProfiled();
+    auto& commitStats = CommitStats();
+    auto stampAt = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto stamp = [&](std::atomic<std::uint64_t>& into) {
+        if (!profiled) return;
+        const auto now = std::chrono::steady_clock::now();
+        into.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - stampAt).count()), std::memory_order_relaxed);
+        stampAt = now;
+    };
+    // The 10 s report runs once the GPU mutex is released (declared before the lock).
+    struct ReportAfterUnlock {
+        bool profiled;
+        ~ReportAfterUnlock() {
+            if (!profiled) return;
+            try {
+                reportCommits();
+            } catch (...) {
+            }
+        }
+    } reportAfterUnlock{profiled};
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    stamp(commitStats.waitNs);
+    bool recipeDrawn = false;
+    struct HoldEnd {
+        bool profiled;
+        CommitProfile& stats;
+        std::chrono::steady_clock::time_point locked;
+        const bool& recipeDrawn;
+        std::uint8_t prepRefusal;
+        ~HoldEnd() {
+            if (!profiled) return;
+            const auto held = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - locked).count());
+            const auto index = commitClass(recipeDrawn, Graphics::TakeCommitSpeculationOutcome(), prepRefusal);
+            stats.held.fetch_add(held, std::memory_order_relaxed);
+            stats.counts[index].fetch_add(1, std::memory_order_relaxed);
+            stats.heldNs[index].fetch_add(held, std::memory_order_relaxed);
+            stats.commits.fetch_add(1, std::memory_order_relaxed);
+        }
+    } holdEnd{profiled, commitStats, stampAt, recipeDrawn, prepRefusal};
+    if (profiled) static_cast<void>(Graphics::TakeCommitSpeculationOutcome());
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
     mark(Commits().lockNs);
     struct SubmitDue {
         Driver& driver;
         const std::shared_ptr<VulkanDevice>& device;
         bool timed;
+        bool profiled;
+        CommitProfile& stats;
         ~SubmitDue() noexcept(false) {
             if (std::uncaught_exceptions() != 0) return;
-            const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const auto start = timed || profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             driver.submitDueAfterCommit(device.get());
-            if (timed) Commits().submitNs.fetch_add(nanosSince(start), std::memory_order_relaxed);
+            if (timed || profiled) {
+                const auto ns = nanosSince(start);
+                if (timed) Commits().submitNs.fetch_add(ns, std::memory_order_relaxed);
+                if (profiled) stats.submitNs.fetch_add(ns, std::memory_order_relaxed);
+            }
         }
-    } submitDue{*this, localDevice, timed};
+    } submitDue{*this, localDevice, timed, profiled, commitStats};
     recordLabelsForPacket(localDevice.get(), queue);
     mark(Commits().labelsNs);
+    stamp(commitStats.labelsNs);
     noteDrawWriters(stages, queue);
     mark(Commits().writersNs);
+    stamp(commitStats.writersNs);
     if (recipe != nullptr) {
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe) == RecipeOutcome::Recorded) {
             mark(Commits().drawNs);
+            stamp(commitStats.drawNs);
+            recipeDrawn = true;
             return;
         }
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
@@ -1519,7 +1656,12 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         const Graphics::DrawPrebuildScope prebuildScope(std::move(prebuilt));
         localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built);
     }
-    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built));
+    stamp(commitStats.drawNs);
+    if (built != nullptr) {
+        attachDrawRecipe(drawKey, recipeStages, std::move(built));
+        if (profiled) commitStats.attached.fetch_add(1, std::memory_order_relaxed);
+    }
+    stamp(commitStats.attachNs);
     mark(Commits().drawNs);
 }
 

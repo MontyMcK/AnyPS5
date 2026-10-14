@@ -51,6 +51,9 @@ public:
     // construction: the attachment formats alone decide).
     void Continue(VkCommandBuffer commands, const State& state) const;
     void PushConstants(VkCommandBuffer commands, VkShaderStageFlags stages, std::span<const std::byte, PipelinePushConstantBytes> bytes) const;
+    // Binds `set` as set 0 at the graphics bind point with this pipeline's layout (a draw inside a
+    // pass this pipeline began or continued).
+    void BindSet(VkCommandBuffer commands, VkDescriptorSet set) const;
     // Forgets the Vulkan objects without destroying them: for entries of a device that is already gone.
     void Abandon() noexcept;
 
@@ -82,10 +85,43 @@ private:
 // only evicted once no recorded draw holds them. Debug aid: APS5_NO_PIPELINE_CACHE=1 builds one per
 // draw as before.
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, bool mayDefer = false);
+// A pipeline store hit found off the committer (a draw speculation's pipeline, live
+// `spec_pipeline`): the entry's key hash, its pipeline (weakly: a peek must not pin the entry against
+// eviction or outlive the device; while it locks, its identity is the entry's) and the resources
+// object whose layout the key named.
+struct PipelinePeek {
+    std::weak_ptr<Pipeline> pipeline;
+    std::uint64_t hash = 0;
+    const ShaderResources* resources = nullptr;
+    VkDevice device = VK_NULL_HANDLE;
+};
+// CachedPipeline's hit without its side effects: no compile, insert, wait, LRU move or counter;
+// an empty peek when the configuration is not cached (or private).
+PipelinePeek PeekCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout);
+// The committer's use of a peek for a draw of the same configuration over `resources`: when the
+// store still maps the peek's key hash to the peeked pipeline of the context's device (the entry,
+// the only one holding that pipeline, carries the peeked key), counts the hit and moves the entry
+// as CachedPipeline's hit does and returns the pipeline, which is then exactly CachedPipeline's
+// answer; null otherwise (the caller asks CachedPipeline).
+std::shared_ptr<Pipeline> TakePeekedPipeline(const Context& context, const PipelinePeek& peek, const ShaderResources& resources);
 // Destroys the cached pipelines of a device; to be called before the device goes away. Without it,
 // entries of a gone device are recognised by their buffer pool (made and reset with the device, so
 // it tells device instances apart when the loader reuses a VkDevice handle) and forgotten unused.
 void ClearCachedPipelines(VkDevice device);
+// The vertex and index buffer binds of a draw inside a pass a Pipeline began or continued
+// (`indexed`: the index buffer too).
+void BindDrawBuffers(const Context& context, VkCommandBuffer commands, std::span<const VkBuffer> vertexBuffers, std::span<const VkDeviceSize> vertexOffsets, bool indexed, VkBuffer indexBuffer, VkDeviceSize indexOffset, VkIndexType indexType);
+// Live `bind_elide` (env APS5_BIND_ELIDE): inside one render pass of one command buffer, the
+// descriptor set, push constant, vertex and index buffer binds and the depth bias and depth bounds
+// a draw would record identical to what the pass already holds are skipped (see Pipeline.cpp).
+bool BindElision();
+// The binds recorded and skipped so far by kind (set, push constants, vertex buffers, index
+// buffer, depth bias, depth bounds), for the [binds] line; taking resets them.
+struct BindCounts {
+    std::array<std::uint64_t, 6> recorded{};
+    std::array<std::uint64_t, 6> skipped{};
+};
+BindCounts TakeBindCounts();
 // Device limit checks of the viewport, which is dynamic state and so no longer checked by Pipeline.
 void ValidateViewport(const Context& context, const VkViewport& viewport);
 void ValidateDepthBounds(const Context& context, const State& state);

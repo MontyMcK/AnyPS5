@@ -87,6 +87,8 @@ private:
 
 }
 
+void RunBdaAnchorTests(const Context& context);
+
 void RunBdaExecutionTests(const Context& context) {
     namespace Abi = ShaderRecompiler::BdaAbi;
     Buffer first(context, 3, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
@@ -196,4 +198,160 @@ void RunBdaExecutionTests(const Context& context) {
     }
     ranges[0].permissions = 0;
     run(guest, 8, 0, Abi::FaultReason::Permission);
+    RunBdaAnchorTests(context);
+}
+
+// A read through an anchor (the range of a draw-uniform base found at the program's entry) must
+// produce the data and the fault record of the same read through the lookups alone, whether the
+// anchor holds it, misses it, or failed to find a range.
+void RunBdaAnchorTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    constexpr std::uint64_t guest = 0x7fff12340001ULL;
+    constexpr std::uint64_t half = 0x8000000000000000ULL;
+    const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    Buffer first(context, 3, usage);
+    Buffer second(context, 2, usage);
+    Buffer words(context, 16, usage);
+    Buffer shifted(context, 20, usage);
+    Buffer large(context, 1024, usage);
+    Buffer top(context, 16, usage);
+    Buffer above(context, 16, usage);
+    const auto fill = [](Buffer& buffer, std::uint32_t seed) {
+        for (std::size_t i = 0; i < buffer.Bytes().size(); ++i) buffer.Bytes()[i] = std::byte(static_cast<std::uint8_t>(seed + i * 7u));
+    };
+    for (std::uint32_t i = 0; i < 3; ++i) first.Bytes()[i] = std::byte(static_cast<std::uint8_t>(0x11 * (i + 1)));
+    for (std::uint32_t i = 0; i < 2; ++i) second.Bytes()[i] = std::byte(static_cast<std::uint8_t>(0x44 + 0x11 * i));
+    for (std::uint32_t i = 0; i < 16; ++i) words.Bytes()[i] = std::byte(static_cast<std::uint8_t>(0xa0 + i));
+    for (std::uint32_t i = 0; i < 20; ++i) shifted.Bytes()[i] = std::byte(static_cast<std::uint8_t>(0xc0 + i));
+    fill(large, 0x31);
+    fill(top, 0x52);
+    fill(above, 0x63);
+    // Ascending and disjoint, as the driver builds them: a range mapped to an odd device address
+    // (its dword reads leave the anchor's loads for the lookup path's bytes), a range ending at
+    // 2^63 (an anchor may hold it) and one above it (no anchor).
+    const std::array<Abi::Range, 7> ranges{{{guest, guest + 3, first.DeviceAddress(), Abi::Read, 0},
+        {guest + 3, guest + 5, second.DeviceAddress(), Abi::Read, 0},
+        {guest + 0x100, guest + 0x110, words.DeviceAddress(), Abi::Read, 0},
+        {guest + 0x200, guest + 0x210, shifted.DeviceAddress() + 1u, Abi::Read, 0},
+        {guest + 0x400, guest + 0x800, large.DeviceAddress(), Abi::Read, 0},
+        {half - 0x10, half, top.DeviceAddress(), Abi::Read, 0},
+        {half + 0x1000, half + 0x1010, above.DeviceAddress(), Abi::Read, 0}}};
+    Require(Abi::RangesOrdered(ranges.data(), ranges.size()), "the anchor test table is not ascending and disjoint");
+    // The bucket index BdaResources builds, over [guest, guest + 0x800) in 256-byte buckets.
+    constexpr std::uint32_t bucketShift = 8;
+    constexpr std::uint32_t bucketCount = 8;
+    std::array<std::uint32_t, bucketCount * 2u> bounds{};
+    {
+        std::size_t low = 0;
+        std::size_t high = 0;
+        for (std::uint32_t bucket = 0; bucket < bucketCount; ++bucket) {
+            const auto start = guest + (static_cast<std::uint64_t>(bucket) << bucketShift);
+            const auto stop = start + (std::uint64_t{1} << bucketShift);
+            while (low < ranges.size() && ranges[low].end <= start) ++low;
+            while (high < ranges.size() && ranges[high].begin < stop) ++high;
+            bounds[bucket * 2u] = static_cast<std::uint32_t>(low);
+            bounds[bucket * 2u + 1u] = static_cast<std::uint32_t>(high);
+        }
+    }
+    constexpr std::uint32_t maxLanes = 64;
+    Buffer plainTable(context, sizeof(Abi::Header) + sizeof(ranges), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer bucketTable(context, sizeof(Abi::Header) + sizeof(ranges) + sizeof(Abi::BucketHeader) + sizeof(bounds), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer fault(context, sizeof(Abi::Fault), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer output(context, maxLanes * 16u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    struct Outcome {
+        Abi::Fault fault{};
+        std::array<std::uint32_t, maxLanes * 4u> values{};
+    };
+    std::uint32_t count = static_cast<std::uint32_t>(ranges.size());
+    bool buckets = false;
+    std::uint32_t permissions = Abi::Read;
+    const auto execute = [&](const std::vector<std::uint32_t>& code) {
+        auto copy = ranges;
+        copy[2].permissions = permissions;
+        // A count that disagrees with the table's size (3) fails every lookup (InvalidTable).
+        auto& table = buckets ? bucketTable : plainTable;
+        const Abi::Header header{Abi::Version, count, sizeof(Abi::Range), buckets ? bucketCount : 0u};
+        const Abi::BucketHeader index{guest, bucketShift, 0};
+        auto* bytes = table.Bytes().data();
+        std::memcpy(bytes, &header, sizeof(header));
+        std::memcpy(bytes + sizeof(header), copy.data(), sizeof(copy));
+        if (buckets) {
+            std::memcpy(bytes + sizeof(header) + sizeof(copy), &index, sizeof(index));
+            std::memcpy(bytes + sizeof(header) + sizeof(copy) + sizeof(index), bounds.data(), sizeof(bounds));
+        }
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        std::memset(output.Bytes().data(), 0xa5, output.Bytes().size());
+        Pipeline pipeline(context, code, {&table, &fault, &output});
+        pipeline.Run(1);
+        Outcome outcome;
+        std::memcpy(&outcome.fault, fault.Bytes().data(), sizeof(outcome.fault));
+        std::memcpy(outcome.values.data(), output.Bytes().data(), sizeof(outcome.values));
+        return outcome;
+    };
+    const auto same = [](const Outcome& a, const Outcome& b) { return std::memcmp(&a.fault, &b.fault, sizeof(a.fault)) == 0 && a.values == b.values; };
+    const auto compare = [&](const BdaAnchoredRead& read) {
+        const auto plain = execute(MakeBdaAnchoredReadTestShader(read, false));
+        const auto anchored = execute(MakeBdaAnchoredReadTestShader(read, true));
+        Require(same(plain, anchored), "an anchored BDA read differs from the same read through the lookups");
+        return anchored;
+    };
+    // (bits, dwords, used): byte and half reads, dword reads of one to four dwords, and wide reads
+    // of which the program extracts some dwords only.
+    struct Width {
+        std::uint32_t bits, dwords, used;
+    };
+    const std::array<Width, 8> widths{{{8, 1, 1}, {16, 1, 1}, {32, 1, 1}, {32, 2, 3}, {32, 4, 15}, {32, 4, 2}, {32, 4, 10}, {32, 3, 4}}};
+    const auto sweep = [&](std::uint64_t anchor, std::uint32_t low, std::int32_t immediate, bool elect) {
+        for (const auto& width : widths) {
+            for (const bool stops : {true, false}) compare({anchor, low, immediate, width.bits, width.dwords, width.used, stops, elect});
+        }
+    };
+    // Bases in each range (one at a range's end, one unmapped) and reads around them: in the
+    // anchor's range, across its end, below its begin (negative immediates), in other ranges,
+    // unmapped, and with base + low or the immediate wrapping around 2^64.
+    const std::array<std::uint64_t, 9> anchors{guest + 0x100, guest + 0x108, guest, guest + 3, guest + 0x200, guest - 1, guest + 0x110, half - 0x10, half + 0x1000};
+    const std::array<std::pair<std::uint32_t, std::int32_t>, 12> offsets{{{0, 0}, {4, 0}, {0xc, 0}, {0xe, 0}, {0x10, 0}, {0, -1}, {8, -8}, {4, 8}, {0, -0x100}, {0x100, 0}, {0xffffffffu, 0}, {0, 0x7ffffff0}}};
+    for (const auto anchor : anchors) {
+        for (const auto& [low, immediate] : offsets) sweep(anchor, low, immediate, anchor == guest + 0x100);
+    }
+    sweep(std::numeric_limits<std::uint64_t>::max() - 2, 4, 0, false);
+    sweep(std::numeric_limits<std::uint64_t>::max() - 2, 0, 4, false);
+    // With the bucket index.
+    buckets = true;
+    const std::array<std::pair<std::uint32_t, std::int32_t>, 6> bucketOffsets{{{0, 0}, {0xc, 0}, {0x10, 0}, {8, -8}, {0x300, 0}, {0x3fc, 0}}};
+    for (const auto anchor : {guest + 0x100, guest, guest + 0x400, half - 0x10}) {
+        for (const auto& [low, immediate] : bucketOffsets) sweep(anchor, low, immediate, true);
+    }
+    buckets = false;
+    // A subgroup: 64 lanes reading their own dwords of one range (the elected lane's search serves
+    // them all), and 64 lanes faulting at one address.
+    for (const bool elect : {true, false}) {
+        for (const bool stops : {true, false}) {
+            for (const auto& width : widths) {
+                compare({guest + 0x400, 0, 0, width.bits, width.dwords, width.used, stops, elect, maxLanes, 16});
+                compare({guest + 0x400, 0x3fc, 0, width.bits, width.dwords, width.used, stops, elect, maxLanes, 0});
+            }
+        }
+    }
+    // The data of reads the anchor holds: from its range, through the anchor's loads or, for a range
+    // mapped to an odd device address, through the bytes of the lookup path.
+    {
+        const auto wide = compare({guest + 0x100, 0, 0, 32, 4, 15, true, true});
+        Require(wide.fault.state == Abi::FaultState::Empty && wide.values[0] == 0xa3a2a1a0u && wide.values[1] == 0xa7a6a5a4u && wide.values[2] == 0xabaaa9a8u && wide.values[3] == 0xafaeadacu, "an anchored span read returned wrong data");
+        const auto some = compare({guest + 0x100, 0, 0, 32, 4, 10, true, true});
+        Require(some.fault.state == Abi::FaultState::Empty && some.values[0] == 0u && some.values[1] == 0xa7a6a5a4u && some.values[2] == 0u && some.values[3] == 0xafaeadacu, "an anchored read of some dwords returned wrong data");
+        const auto odd = compare({guest + 0x200, 0, 0, 32, 1, 1, true, false});
+        Require(odd.fault.state == Abi::FaultState::Empty && odd.values[0] == 0xc4c3c2c1u, "an anchored read of an odd device address returned wrong data");
+        const auto byte = compare({guest + 0x200, 0xd, 0, 8, 1, 1, true, false});
+        Require(byte.fault.state == Abi::FaultState::Empty && byte.values[0] == 0xceu, "an anchored byte read returned wrong data");
+        const auto below = compare({guest + 0x108, 4, -8, 32, 1, 1, true, false});
+        Require(below.fault.state == Abi::FaultState::Empty && below.values[0] == 0xa7a6a5a4u, "an anchored read below the base returned wrong data");
+    }
+    // A base in a range without read permission, and a table the lookups refuse: no anchor, and
+    // the reads fault as before.
+    permissions = 0;
+    sweep(guest + 0x100, 4, 0, true);
+    permissions = Abi::Read;
+    count = 3;
+    sweep(guest + 0x100, 4, 0, false);
 }

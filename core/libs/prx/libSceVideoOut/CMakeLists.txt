@@ -10,6 +10,7 @@ add_library(libSceVideoOut SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/src/KeyboardInput.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/InputMapping.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/AutomationCapture.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/HostHdrProbe.cpp
 )
 
 target_include_directories(libSceVideoOut PRIVATE
@@ -34,6 +35,20 @@ set_target_properties(video_out_flip_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(video_out_flip_tests)
 
 if(BUILD_TESTING)
+    add_test_executable(video_out_hdr_present_tests tests/HdrPresent.cpp)
+    target_include_directories(video_out_hdr_present_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/SDL2/include ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+    target_link_libraries(video_out_hdr_present_tests PRIVATE libSceVideoOut libSceAgcDriver libkernel libc)
+    set_target_properties(video_out_hdr_present_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(video_out_hdr_present_tests)
+    add_test(NAME video_out_hdr_present COMMAND video_out_hdr_present_tests)
+    set_tests_properties(video_out_hdr_present PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120 RUN_SERIAL TRUE)
+    if(WIN32)
+        set_tests_properties(video_out_hdr_present PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+if(BUILD_TESTING)
     add_test_executable(pad_sdl_tests tests/PadSdl.cpp)
     target_link_libraries(pad_sdl_tests PRIVATE SDL2-static)
     add_test(NAME pad_sdl COMMAND pad_sdl_tests)
@@ -48,6 +63,19 @@ if(BUILD_TESTING)
     set_tests_properties(guest_video_out_wqhd_detection PROPERTIES TIMEOUT 20)
     if(WIN32)
         set_tests_properties(guest_video_out_wqhd_detection PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+if(BUILD_TESTING)
+    add_test_executable(guest_video_out_hdr_tests ${LIBS_INCLUDE_DIR}/tests/GuestVideoOutHdr.cpp)
+    target_include_directories(guest_video_out_hdr_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+    target_link_libraries(guest_video_out_hdr_tests PRIVATE libSceVideoOut libSceSystemService libSceAgcDriver libkernel libc)
+    configure_windows_unwind(guest_video_out_hdr_tests)
+    add_test(NAME guest_video_out_hdr COMMAND guest_video_out_hdr_tests)
+    set_tests_properties(guest_video_out_hdr PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(guest_video_out_hdr PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

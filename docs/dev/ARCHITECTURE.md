@@ -67,3 +67,10 @@ flowchart LR
 
 - [`Recompiler.cpp`](../../core/shader/recompiler/Recompiler.cpp) runs the stages in this order. With `ANYPS5_ENABLE_SPIRV_TOOLS`, the SPIR-V is also validated and optimized with SPIRV-Tools.
 - `ShaderRecompiler::Recompile` keeps compiled variants in memory, and `ShaderDiskCache` stores them on disk so later runs reuse them.
+
+### Resource plans
+
+A cached shader keeps an `IrResourcePlan` (`ResourceMaterializer::ExtractPlan` in [`ResourceMaterializer.cpp`](../../core/shader/recompiler/Optimization/src/ResourceMaterializer.cpp)) for as long as it is registered: a copy of the IR values its descriptor sources, SRT reads, uniform fill and control-flow conditions depend on, which every capture walks to read the shader's resources from guest memory. The copy is sized to what the walk can use:
+
+- A control-flow condition is kept only when `Detail::Evaluator::MayEvaluate` finds a runtime it could be evaluated for. A condition that depends on a vector register, or on an opcode the evaluator does not evaluate, takes both successors whatever the runtime holds, so the plan stores it as no condition and does not copy its operands. Such conditions are most of a shader's IR when the masked-lane code feeds its branches.
+- The copied values are allocated in one `IrValueArena` and hold no use lists: the walk only follows arguments.

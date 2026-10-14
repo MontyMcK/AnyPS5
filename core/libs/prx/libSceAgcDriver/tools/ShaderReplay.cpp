@@ -44,6 +44,50 @@ bool g_disassemble = false;
 bool g_assembly = false;
 bool g_memory = false;
 bool g_spirv = false;
+// --bench: <request>.bench next to the cwd, the inputs agc_bda_pass_bench draws the program with
+// (SPIR-V, push constants, user data, descriptor bindings with their guest words, captured memory).
+bool g_bench = false;
+
+template <typename T>
+void PutValue(std::ofstream& file, T value) {
+    file.write(reinterpret_cast<const char*>(&value), sizeof(value));
+}
+
+bool WriteBenchInputs(const char* path, const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::RecompileResult& result) {
+    std::string name(path);
+    name = name.substr(name.find_last_of("/\\") + 1) + ".bench";
+    std::ofstream file(name, std::ios::binary);
+    PutValue<std::uint32_t>(file, 0x42535041u);
+    PutValue<std::uint32_t>(file, 1u);
+    PutValue<std::uint32_t>(file, static_cast<std::uint32_t>(result.spirv.size()));
+    file.write(reinterpret_cast<const char*>(result.spirv.data()), static_cast<std::streamsize>(result.spirv.size() * sizeof(result.spirv[0])));
+    PutValue<std::uint32_t>(file, static_cast<std::uint32_t>(result.pushConstants.size()));
+    file.write(reinterpret_cast<const char*>(result.pushConstants.data()), static_cast<std::streamsize>(result.pushConstants.size()));
+    const auto& userData = request.context.userData;
+    PutValue<std::uint32_t>(file, static_cast<std::uint32_t>(userData.size()));
+    file.write(reinterpret_cast<const char*>(userData.data()), static_cast<std::streamsize>(userData.size() * sizeof(userData[0])));
+    PutValue<std::uint32_t>(file, static_cast<std::uint32_t>(result.bindings.size()));
+    for (const auto& binding : result.bindings) {
+        PutValue<std::uint32_t>(file, binding.binding);
+        PutValue<std::uint32_t>(file, static_cast<std::uint32_t>(binding.role));
+        PutValue<std::uint32_t>(file, static_cast<std::uint32_t>(binding.kind));
+        PutValue<std::uint32_t>(file, binding.count);
+        PutValue<std::uint32_t>(file, static_cast<std::uint32_t>(binding.guestDescriptor.size()));
+        file.write(reinterpret_cast<const char*>(binding.guestDescriptor.data()), static_cast<std::streamsize>(binding.guestDescriptor.size() * sizeof(std::uint32_t)));
+    }
+    PutValue<std::uint32_t>(file, static_cast<std::uint32_t>(request.context.memory.size()));
+    for (const auto& region : request.context.memory) {
+        PutValue<std::uint64_t>(file, region.guestAddress);
+        PutValue<std::uint32_t>(file, static_cast<std::uint32_t>(region.bytes.size()));
+        file.write(reinterpret_cast<const char*>(region.bytes.data()), static_cast<std::streamsize>(region.bytes.size()));
+    }
+    if (!file) {
+        std::printf("  could not write %s\n", name.c_str());
+        return false;
+    }
+    std::printf("  bench inputs -> %s\n", name.c_str());
+    return true;
+}
 bool g_graph = false;
 bool g_maintenance8 = false;
 bool g_code = false;
@@ -255,6 +299,7 @@ bool Replay(const char* path) {
             name = name.substr(name.find_last_of("/\\") + 1) + ".spv";
             std::ofstream(name, std::ios::binary).write(reinterpret_cast<const char*>(result.spirv.data()), static_cast<std::streamsize>(result.spirv.size() * sizeof(result.spirv[0])));
         }
+        if (g_bench && !WriteBenchInputs(path, request.request, result)) return false;
         if (g_memory) {
             for (const auto& binding : result.bindings) {
                 if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
@@ -285,7 +330,7 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--images] [--spv] [--synthetic-memory] [--code] [--maintenance8] [--prepare] <shader.req>...\n  agc_shader_replay --raw-control-flow <validation.bin>...\n  the driver writes shader_<address>.req files with APS5_DUMP_SHADERS or APS5_DUMP_SHADER_FAILURES\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--images] [--spv] [--bench] [--synthetic-memory] [--code] [--maintenance8] [--prepare] <shader.req>...\n  agc_shader_replay --raw-control-flow <validation.bin>...\n  the driver writes shader_<address>.req files with APS5_DUMP_SHADERS or APS5_DUMP_SHADER_FAILURES\n");
         return 2;
     }
     int failures = 0;
@@ -324,6 +369,10 @@ int main(int argc, char** argv) {
         }
         if (std::string(argv[i]) == "--code") {
             g_code = true;
+            continue;
+        }
+        if (std::string(argv[i]) == "--bench") {
+            g_bench = true;
             continue;
         }
         if (std::string(argv[i]) == "--spv") {

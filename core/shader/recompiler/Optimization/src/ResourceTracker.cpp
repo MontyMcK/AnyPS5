@@ -1,4 +1,5 @@
 #include "Optimization/ResourceTracker.hpp"
+#include "Optimization/BufferStoreCovers.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
@@ -98,7 +99,7 @@ std::uint32_t byteExtent(const MemoryInfo& memory) {
 
 class Tracker {
 public:
-    explicit Tracker(IrProgram& program) : m_program(program), m_info(program.Resources().info), m_builder(program) {
+    explicit Tracker(IrProgram& program) : m_program(program), m_info(program.Resources().info), m_builder(program), m_covers(program) {
         m_info.buffers.clear();
         m_info.images.clear();
         m_info.samplers.clear();
@@ -117,9 +118,16 @@ public:
         SplitDescriptorPhis();
         PlanIndirectImages();
         for (auto& block : m_program.Blocks()) {
+            m_block = block.get();
             for (IrValue* inst : block->Instructions()) {
                 Collect(*inst);
             }
+        }
+        m_block = nullptr;
+        // An address-based access can fault and stop its invocation early (SpirvRuntimeBuffer.cpp),
+        // so no store of such a program is made by every invocation.
+        if (m_info.usesDma) {
+            for (auto& buffer : m_info.buffers) buffer.covers.clear();
         }
         if (m_bdaTraces > bdaTraceLimit) std::fprintf(stderr, "[bda] %u more address accesses in this program not shown\n", m_bdaTraces - bdaTraceLimit);
         LinkImageAliases();
@@ -1033,6 +1041,12 @@ private:
             const auto source = InternSource(descriptor);
             const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
             if (resource == std::numeric_limits<std::uint32_t>::max()) fail("buffer resource limit exceeded");
+            if (access == BufferAccess::Write) {
+                if (auto cover = m_covers.Analyze(inst, m_block, memory)) {
+                    auto& covers = m_info.buffers[resource].covers;
+                    if (std::find(covers.begin(), covers.end(), *cover) == covers.end() && covers.size() < BufferResource::MaxStoreCovers) covers.push_back(std::move(*cover));
+                }
+            }
             AddMemoryPatch(memoryIndex, resource, 0u, false);
             memory.gpuDescriptor = false;
             m_info.usesDma = m_info.usesDma || access == BufferAccess::Atomic;
@@ -1322,6 +1336,9 @@ private:
     IrProgram& m_program;
     ShaderInfo m_info;
     IrBuilder m_builder;
+    // Stores every invocation makes (BufferResource::covers), and the block Collect is visiting.
+    BufferStoreCoverAnalysis m_covers;
+    const IrBlock* m_block = nullptr;
     std::vector<DescriptorSource> m_sources;
     std::vector<HandlePatch> m_handlePatches;
     std::vector<MemoryPatch> m_memoryPatches;

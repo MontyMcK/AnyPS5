@@ -194,7 +194,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                 if (takeLabel(localDevice->PendingLabel(awaited, awaitedBytes, received, &refusal), refusal, false, false)) return;
             }
 
-            if (!overlapSubmit || localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) localDevice->SubmitRecorded(false);
+            if (!overlapSubmit || localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) localDevice->SubmitRecorded(false, Graphics::Recorder::SubmitReason::Wait);
         }
     }
 
@@ -266,12 +266,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                 pollRefused(refusal);
             }
             if (localDevice->OpenWriteOverlaps(awaited, awaitedBytes)) {
-                localDevice->SubmitRecorded(false);
+                localDevice->SubmitRecorded(false, Graphics::Recorder::SubmitReason::Wait);
                 submitted = true;
             }
         }
         if (labelDue && !submitted && Graphics::Recorder::PendingLabelSince().has_value()) {
-            localDevice->SubmitRecorded(false);
+            localDevice->SubmitRecorded(false, Graphics::Recorder::SubmitReason::WaitDeadline);
             submitted = true;
         }
         if (submitted) {

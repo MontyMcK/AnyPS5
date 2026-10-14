@@ -27,7 +27,12 @@ struct DisplayBuffer {
 std::size_t DisplayBufferSize(const DisplayBuffer& buffer);
 std::vector<std::byte> DecodeDisplayBuffer(const DisplayBuffer& buffer, std::span<const std::byte> source);
 std::vector<std::byte> ReadDisplayBuffer(const DisplayBuffer& buffer);
+// The buffer's texels in row order, as stored (no conversion to 8-bit BGRA).
+std::vector<std::byte> DisplayBufferTexels(const DisplayBuffer& buffer, std::span<const std::byte> source);
+std::vector<std::byte> ReadDisplayBufferTexels(const DisplayBuffer& buffer);
 std::array<std::byte, 4> DisplayBufferClearPixel(const DisplayBuffer& buffer, Graphics::DccKeys keys);
+// The fast-clear texel as stored (the display format's own bits, before any 8-bit decode).
+std::array<std::byte, 4> DisplayBufferClearTexel(const DisplayBuffer& buffer, Graphics::DccKeys keys);
 std::size_t DisplayBufferKeyBytes(const DisplayBuffer& buffer);
 Graphics::DccKeys DisplayBufferKeys(const DisplayBuffer& buffer);
 

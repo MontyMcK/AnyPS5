@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -13,7 +14,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected) {
+std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected, bool shapeReuse, std::span<const ShaderRecompiler::MemoryRegion> registered, ShaderMemory* shadow) {
     PerformanceTimer timing("Shader.DrawStage");
     using Stage = ShaderRecompiler::ShaderStage;
     phaseTiming.Phase(DrawRowVectors);
@@ -33,10 +34,25 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         auto& stageCapture = stageCaptures[i];
         stageCapture.forgetSerial = GuestMemory::ForgetSerial();
         stageCapture.pushOffset = pushOffset;
-        const auto capture = [&] {
+        // Draw shape reuse (DrawShapeReuse.cpp): a remembered capture of this stage relocated in
+        // place of the walk. With APS5_VERIFY_DRAW_SHAPE_REUSE (`shadow`), every stage is then also
+        // compared with a full capture on a shadow memory.
+        const auto shapeKey = shapeReuse ? drawShapeStaticKey(invocation.Request(), program) : 0;
+        DrawShapeReuse shape;
+        bool shapeFound = false;
+        double fullUs = 0;
+        const auto capture = [&]() -> std::shared_ptr<const ShaderRecompiler::ResourceCapture> {
             const SampledReadScope sampling(evidenceReads);
-            return shaderMemory.Capture(invocation);
+            if (shapeReuse) {
+                shapeFound = lookupDrawShape(program, shapeKey, invocation, shaderMemory, shape);
+                if (shapeFound) return shape.capture;
+            }
+            const auto fullStarted = shapeReuse ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            auto full = shaderMemory.Capture(invocation);
+            if (shapeReuse) fullUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - fullStarted).count();
+            return full;
         }();
+        const bool shapeReused = shapeFound;
 
         stageCapture.regions = shaderMemory.TakeRecentRegions();
         recompiled[i] = true;
@@ -78,7 +94,9 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
 
         timing.Mark("capture_resources");
         try {
-            stageCapture.compiled = invocation.Materialize(*capture);
+            const auto materializeStarted = shapeReuse && !shapeReused ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            stageCapture.compiled = shapeReused ? shape.compiled : invocation.Materialize(*capture);
+            if (shapeReuse && !shapeReused) fullUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - materializeStarted).count();
         } catch (const std::exception& error) {
             static std::mutex dumpMutex;
             static std::set<std::uint64_t> dumped;
@@ -96,6 +114,13 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             throw;
         }
         timing.Mark("materialize");
+        // A full capture made with shape reuse on: counted and remembered for later draws of this
+        // stage.
+        if (shapeReuse && !shapeReused) {
+            ShapeCore::CountFullCapture(ShapeCore::Kind::Draw, fullUs);
+            rememberDrawShape(program, shapeKey, registered, stageCapture.regions, invocation, capture);
+        }
+        if (shapeReuse && shadow != nullptr) verifyDrawStage(program.binary.codeAddress, invocation, *capture, *stageCapture.compiled, stageCapture.regions, shaderMemory.Regions(), *shadow);
         phaseTiming.Phase(DrawRowRecompile);
         // Debug aid: APS5_DUMP_DRAW_SHADER=<hex code address> saves that stage's request once.
         static const std::uint64_t dumpAddress = [] { const char* text = std::getenv("APS5_DUMP_DRAW_SHADER"); return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull; }();
@@ -116,7 +141,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
 }
 
 void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey, const std::shared_ptr<DrawEntry>& dataEntry) {
-    if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu)) {
+    if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu) && (verifyHit || admitDrawKey(drawKey))) {
         phaseTiming.Phase(DrawRowVectors);
         std::uint64_t unstable = 0, mismatches = 0, differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
         for (std::size_t i = 0; i < programs.size(); ++i) {

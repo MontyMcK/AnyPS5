@@ -542,6 +542,17 @@ void ReportAllThreads() {
     if (skippedCount != 0) Report("  %llu further thread(s) left out\n", static_cast<unsigned long long>(skippedCount));
 }
 
+// APS5_DUMP_ON_FILE=<path>: once the file exists (created by a stall watcher when presents stop),
+// every thread's stack is reported and the process aborts, so a deadlock is caught where it sits.
+DWORD WINAPI FileDumpWatchdog(LPVOID param) {
+    const auto* path = static_cast<const char*>(param);
+    while (GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES) Sleep(500);
+    Report("\nFATAL: dump requested by %s (APS5_DUMP_ON_FILE); aborting\n", path);
+    std::fflush(stderr);
+    std::abort();
+    return 0;
+}
+
 DWORD WINAPI HangWatchdog(LPVOID param) {
     const auto seconds = static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(param));
     Sleep(static_cast<DWORD>(seconds * 1000ull));
@@ -597,6 +608,10 @@ const bool g_crashReportInstalled = [] {
             if (end && *end == 0) seconds = value;
         }
         if (seconds > 0) CreateThread(nullptr, 0, HangWatchdog, reinterpret_cast<LPVOID>(static_cast<std::uintptr_t>(seconds)), 0, nullptr);
+    }
+    if (const char* dumpFile = std::getenv("APS5_DUMP_ON_FILE"); dumpFile != nullptr && dumpFile[0] != 0) {
+        DeleteFileA(dumpFile);
+        CreateThread(nullptr, 0, FileDumpWatchdog, const_cast<char*>(dumpFile), 0, nullptr);
     }
     return true;
 }();

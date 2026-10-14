@@ -89,6 +89,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayBuffer.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostHdr.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastEmutls.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Sampler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastHeap.cpp
@@ -102,6 +103,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchLookup.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/DispatchTiming.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/IndirectDispatch.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/ShapeReuse.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Dispatch/VariantValidation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/Draw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawCache.cpp
@@ -113,6 +115,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/ReplayProbe.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPrecheck.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRegisterKey.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawShapeReuse.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawTiming.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/IndirectDraw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Capture/FrameCapture.cpp
@@ -160,6 +163,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/CpuTimeline.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/NvPerfRanges.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderResources.cpp
@@ -380,6 +384,20 @@ target_link_libraries(agc_vop1_control_decode_tests PRIVATE shader_recompiler_ag
 set_target_properties(agc_vop1_control_decode_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_vop1_control_decode_tests)
 
+add_test_executable(agc_pass_run_tests EXCLUDE_FROM_ALL tests/PassRun.cpp)
+target_include_directories(agc_pass_run_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_pass_run_tests PRIVATE libc)
+set_target_properties(agc_pass_run_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_pass_run_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_pass_run_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_pass_run COMMAND agc_pass_run_tests)
+    if(WIN32)
+        set_tests_properties(agc_pass_run PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_performance_controls_tests EXCLUDE_FROM_ALL tests/PerformanceControls.cpp)
 target_include_directories(agc_performance_controls_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_performance_controls_tests PRIVATE libc)
@@ -404,6 +422,20 @@ if(BUILD_TESTING)
     add_test(NAME agc_dcc_key_sharing COMMAND agc_dcc_key_sharing_tests)
     if(WIN32)
         set_tests_properties(agc_dcc_key_sharing PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_host_hdr_tests EXCLUDE_FROM_ALL tests/HostHdr.cpp)
+target_include_directories(agc_host_hdr_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+target_link_libraries(agc_host_hdr_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_host_hdr_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_host_hdr_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_host_hdr_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_host_hdr COMMAND agc_host_hdr_tests)
+    if(WIN32)
+        set_tests_properties(agc_host_hdr PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
@@ -595,6 +627,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/UnitShadow.cpp
         Graphics/src/Sampler.cpp
         Graphics/src/Recorder.cpp
+        Graphics/src/CpuTimeline.cpp
         Graphics/src/NvPerfRanges.cpp
         Graphics/src/ShaderInputState.cpp
         ${agcTextureDetileShaderHeader}
@@ -706,10 +739,84 @@ if(BUILD_TESTING)
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    add_test(NAME agc_driver_dispatch_shape_reuse_verify COMMAND agc_driver_dispatch_shape_reuse_tests verify)
+    set_tests_properties(agc_driver_dispatch_shape_reuse_verify PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_dispatch_shape_reuse_verify PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_dispatch_shape_reuse_descriptors COMMAND agc_driver_dispatch_shape_reuse_tests descriptors verify)
+    set_tests_properties(agc_driver_dispatch_shape_reuse_descriptors PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_dispatch_shape_reuse_descriptors PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    foreach(agcDrawShapeMode IN ITEMS verify keep keep_verify)
+        string(REPLACE "_" ";" agcDrawShapeArguments "${agcDrawShapeMode}")
+        add_test(NAME agc_driver_draw_shape_reuse_${agcDrawShapeMode} COMMAND agc_driver_draw_shape_reuse_tests ${agcDrawShapeArguments})
+        set_tests_properties(agc_driver_draw_shape_reuse_${agcDrawShapeMode} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(agc_driver_draw_shape_reuse_${agcDrawShapeMode} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     add_test(NAME agc_driver_pm4_failure COMMAND agc_driver_pm4_tests failure)
     set_tests_properties(agc_driver_pm4_failure PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77)
     if(WIN32)
         set_tests_properties(agc_driver_pm4_failure PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    set_target_properties(agc_driver_recorder_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_driver_recorder_submit_reasons COMMAND agc_driver_recorder_tests --submit-reasons-only)
+    set_tests_properties(agc_driver_recorder_submit_reasons PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_PROFILE_SUBMITS=1" SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_driver_recorder_submit_reasons PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_recorder_starve_age COMMAND agc_driver_recorder_tests --starve-age-only)
+    set_tests_properties(agc_driver_recorder_starve_age PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_STARVE_AGE_US=60000" SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_driver_recorder_starve_age PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_recorder_fence_nodrain COMMAND agc_driver_recorder_tests --fence-nodrain-only)
+    set_tests_properties(agc_driver_recorder_fence_nodrain PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_RECORDER_THREAD=1;APS5_FENCE_NO_DRAIN=1;APS5_PROFILE_SUBMITS=1" SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_driver_recorder_fence_nodrain PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_recorder_cpu_timeline COMMAND agc_driver_recorder_tests --cpu-timeline-only)
+    set_tests_properties(agc_driver_recorder_cpu_timeline PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_GPU_TIMELINE=0,4" SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_driver_recorder_cpu_timeline PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    foreach(agcCommitTest IN ITEMS commit_paths bind_elide draw_set_writes moved_publish speculated_committer2)
+        if(agcCommitTest STREQUAL "commit_paths")
+            add_test(NAME agc_driver_recorder_${agcCommitTest} COMMAND agc_driver_recorder_tests --commit-paths-only)
+            set_tests_properties(agc_driver_recorder_${agcCommitTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77)
+        elseif(agcCommitTest STREQUAL "bind_elide")
+            add_test(NAME agc_driver_recorder_${agcCommitTest} COMMAND agc_driver_recorder_tests --bind-elide-only)
+            set_tests_properties(agc_driver_recorder_${agcCommitTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_BIND_ELIDE=1" SKIP_RETURN_CODE 77)
+        elseif(agcCommitTest STREQUAL "moved_publish")
+            add_test(NAME agc_driver_recorder_${agcCommitTest} COMMAND agc_driver_recorder_tests --moved-publish-only)
+            set_tests_properties(agc_driver_recorder_${agcCommitTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_TOKENS=1;APS5_MOVED_PUBLISH_CHECK=1;APS5_VERIFY_DRAW_TOKENS=1" SKIP_RETURN_CODE 77)
+        elseif(agcCommitTest STREQUAL "draw_set_writes")
+            add_test(NAME agc_driver_recorder_${agcCommitTest} COMMAND agc_driver_recorder_tests --draw-set-writes-only)
+            set_tests_properties(agc_driver_recorder_${agcCommitTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_SET_WRITES=1" SKIP_RETURN_CODE 77)
+        else()
+            add_test(NAME agc_driver_recorder_${agcCommitTest} COMMAND agc_driver_recorder_tests --speculated-draw-only)
+            set_tests_properties(agc_driver_recorder_${agcCommitTest} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_PLAN=1;APS5_SPEC_PIPELINE=1;APS5_SPEC_KEY_HASH=1;APS5_VERIFY_DRAW_SPECULATION=1;APS5_SPEC_ENTRY_STAMP=1;APS5_SPEC_WINDOW_READS=1;APS5_DEFER_DROPS=1;APS5_BIND_ELIDE=1;APS5_DRAW_SET_WRITES=1" SKIP_RETURN_CODE 77)
+        endif()
+        if(WIN32)
+            set_tests_properties(agc_driver_recorder_${agcCommitTest} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    add_test(NAME agc_driver_recorder_usage_elide COMMAND agc_driver_recorder_tests --usage-elide-only)
+    set_tests_properties(agc_driver_recorder_usage_elide PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_driver_recorder_usage_elide PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
@@ -793,6 +900,7 @@ if(AGC_BUILD_VISUAL_TEST)
             tests/Visual.cpp
             Execution/src/VulkanDevice.cpp
             Execution/src/DisplayFormat.cpp
+            Execution/src/HostHdr.cpp
             Execution/src/AspectFit.cpp
             Execution/src/PresentationScaler.cpp
             Execution/src/GuestMemory.cpp
@@ -914,6 +1022,15 @@ if(ANYPS5_ENABLE_SPIRV_TOOLS)
 endif()
 set_target_properties(agc_shader_replay PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_replay)
+
+# Times a replayed fragment program (agc_shader_replay --bench) over a 4K target on the GPU.
+add_executable(agc_bda_pass_bench EXCLUDE_FROM_ALL
+        tools/BdaPassBench.cpp
+)
+target_include_directories(agc_bda_pass_bench PRIVATE ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Headers/include)
+target_link_libraries(agc_bda_pass_bench PRIVATE libc)
+configure_windows_unwind(agc_bda_pass_bench)
+set_target_properties(agc_bda_pass_bench PROPERTIES CXX_EXTENSIONS OFF)
 
 if(BUILD_TESTING)
     add_test_executable(texture_format_lookup_tests ${LIBS_INCLUDE_DIR}/tests/TextureFormatLookup.cpp)

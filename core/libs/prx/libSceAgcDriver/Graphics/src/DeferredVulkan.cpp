@@ -605,6 +605,16 @@ void DrainDeferredVulkan() {
     Drain();
 }
 
+std::uint64_t DeferredVulkanTicket() {
+    if (!Enabled()) return 0;
+    return TheStream().pushed.load(std::memory_order_acquire);
+}
+
+bool DeferredVulkanExecuted(std::uint64_t ticket) {
+    // `executed` moves after a call returned (RecorderMain), so this never answers early.
+    return !Enabled() || TheStream().executed.load(std::memory_order_acquire) >= ticket;
+}
+
 PFN_vkVoidFunction DeferredVulkanEntry(const char* name, PFN_vkVoidFunction function) {
     if (function == nullptr || !Enabled()) return function;
     const std::string_view n(name);

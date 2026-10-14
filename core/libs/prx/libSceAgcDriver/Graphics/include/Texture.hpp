@@ -278,6 +278,19 @@ public:
     // Results pending in images lying wholly inside the range are dead (a fill overwrites every
     // byte of them): they are dropped instead of stored. Returns how many images were.
     static std::size_t DiscardPendingInside(std::uint64_t address, std::size_t bytes);
+    // The write-back elision by buffer usage (GuestBufferMemory, StorageUsageElide): of the images
+    // with results pending over [address, address + bytes), the tracking units (64 KiB blocks,
+    // layers, or the whole image) lying wholly inside the sorted, disjoint `covered` ranges, which
+    // a dispatch overwriting those bytes lets drop instead of store. `units` gets their guest
+    // ranges, merged; false (and nothing) when an image with results over `covered` cannot have
+    // units dropped: borrowed or lent results, an image being stored or refreshed right now, DCC
+    // keys stored with the image. The caller then flushes the whole range.
+    static bool CoveredUnits(std::uint64_t address, std::size_t bytes, std::span<const std::pair<std::uint64_t, std::uint64_t>> covered, std::vector<std::pair<std::uint64_t, std::uint64_t>>& units);
+    // Drops the pending units lying wholly inside the sorted, disjoint `ranges` (CoveredUnits'
+    // result, once the overwriting dispatch was recorded): their results never reach guest memory,
+    // and the next use of the image takes those units from the dispatch's bytes. Returns the units
+    // and the bytes dropped.
+    static std::pair<std::size_t, std::uint64_t> DropCoveredUnits(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     // A fill of the whole surface (`layer` WholeImage) or of one array layer with the 16-byte
     // `pattern`, done as a GPU clear of the image instead of a store into guest memory: the
     // pattern must be one texel of the storage format repeated, exactly representable as a clear

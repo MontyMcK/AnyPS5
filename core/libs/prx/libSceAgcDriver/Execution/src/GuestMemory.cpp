@@ -2261,6 +2261,10 @@ bool GpuHoldProfiled() {
     return profiled;
 }
 
+// SetGpuHoldHook: the cpu-timeline's hold events (set by the recorder while a timeline window is
+// configured), called for profiled outermost holds of a millisecond or more.
+std::atomic<void (*)(std::chrono::steady_clock::time_point, std::chrono::steady_clock::time_point, std::size_t, const char*)> gpuHoldHook{nullptr};
+
 void BeginHold(std::size_t site) {
     auto& stats = LockStats();
     stats.holdSite = site;
@@ -2271,6 +2275,9 @@ void EndHold() {
     auto& stats = LockStats();
     const auto heldNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - stats.holdStart).count();
     const auto heldMs = static_cast<double>(heldNs) / 1e6;
+    if (heldMs >= 1.0) {
+        if (auto* hook = gpuHoldHook.load(std::memory_order_acquire); hook != nullptr) hook(stats.holdStart, stats.holdStart + std::chrono::nanoseconds(heldNs), stats.holdSite, GpuLockSiteNames[stats.holdSite]);
+    }
     ++stats.siteHolds[stats.holdSite];
     stats.siteHeldMs[stats.holdSite] += heldMs;
     stats.siteMaxHeldMs[stats.holdSite] = std::max(stats.siteMaxHeldMs[stats.holdSite], heldMs);
@@ -2452,6 +2459,10 @@ bool GpuMutexType::try_lock() {
 
 namespace {
 std::atomic<void (*)()> gpuUnlockHook{nullptr};
+}
+
+void SetGpuHoldHook(void (*hook)(std::chrono::steady_clock::time_point begin, std::chrono::steady_clock::time_point end, std::size_t site, const char* siteName)) {
+    gpuHoldHook.store(hook, std::memory_order_release);
 }
 
 void SetGpuUnlockHook(void (*hook)()) {
