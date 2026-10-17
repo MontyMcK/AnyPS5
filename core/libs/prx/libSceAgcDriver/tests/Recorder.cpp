@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -5247,6 +5248,262 @@ void usageElideTests(const Device& device, Recorder& recorder) {
     std::cout << "usage elision: write-only, reuse, read-write, atomic, no grid, partial write, alias and verify cases passed\n";
 }
 
+// Live `lazy_writeback` (Texture.cpp). A thick (3D) surface under block units stores only the units
+// an access touches, byte for byte what the whole-surface store puts there, and a refresh of a
+// GPU-only chain leaves the others on the GPU; a CPU read through the flush hook gets its bytes. A
+// row alias (same base and width, another height, either one refreshing) is taken on the device
+// with its edge units stored first, and guest memory ends exactly as with every result stored
+// eagerly (the flag off).
+void lazyWriteBackTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    if (base.hostImportAlignment == 0) {
+        std::cout << "host imports unavailable: lazy write-back not tested\n";
+        return;
+    }
+    // One surface per MiB of the block.
+    constexpr std::size_t region = 1u << 20u;
+    constexpr std::size_t bytes = 12 * region;
+    constexpr std::size_t unit = 65536;
+    // The keep decisions read the write stamps: watched memory (imports watched, not compared:
+    // APS5_WRITE_WATCH_IMPORTS=watch, as the title runs).
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "no write watching: lazy write-back not tested\n";
+        return;
+    }
+    auto* memory = static_cast<std::uint8_t*>(block);
+    std::memset(memory, 0x55, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true);
+    }
+    struct Unregister {
+        const Context& context;
+        void* block;
+        std::uint64_t address;
+        ~Unregister() {
+            SetLazyWriteBackModes(std::nullopt, std::nullopt);
+            {
+                GuestAllocations::Mutation mutation;
+                mutation.Remove(block);
+            }
+            HostImportFor(context, address, bytes);
+        }
+    } unregister{base, block, address};
+    if (HostImportFor(base, address, bytes) == nullptr) {
+        std::cout << "host import of the lazy write-back block refused: lazy write-back not tested\n";
+        return;
+    }
+    if (!AgcDriver::GuestMemory::Watched(address, bytes)) {
+        std::cout << "host imports are compared, not watched (APS5_WRITE_WATCH_IMPORTS=watch watches them): lazy write-back not tested\n";
+        return;
+    }
+    TextureDetiler detiler(base);
+    auto context = base;
+    context.detiler = &detiler;
+    const auto extentOf = [](const GuestTextureResource& d) { return VkExtent3D{d.width, d.height, d.dimension == TextureDimension::k3D ? d.depthOrLastArray + 1u : 1u}; };
+    // A GPU write of distinct words over every texel (a copy from a host buffer), then MarkDirty.
+    const auto write = [&](const std::shared_ptr<StorageTexture>& target, std::uint32_t seed) {
+        const auto extent = extentOf(target->Descriptor());
+        const std::size_t size = std::size_t{extent.width} * extent.height * extent.depth * BytesPerElement(target->Descriptor().format);
+        Buffer source(context, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        auto words = source.Bytes();
+        for (std::size_t offset = 0; offset + 4 <= size; offset += 4) {
+            const std::uint32_t value = static_cast<std::uint32_t>(offset / 4 + 1) * 2654435761u ^ seed;
+            std::memcpy(words.data() + offset, &value, 4);
+        }
+        const auto commands = recorder.Commands();
+        recorder.Keep(target);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = extent;
+        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, source.Handle(), target->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.Sync();
+        target->MarkDirty();
+    };
+    // The image's texels, read back from the GPU.
+    const auto texels = [&](const std::shared_ptr<StorageTexture>& target) {
+        const auto extent = extentOf(target->Descriptor());
+        const std::size_t size = std::size_t{extent.width} * extent.height * extent.depth * BytesPerElement(target->Descriptor().format);
+        Buffer readback(context, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        recorder.Keep(target);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = extent;
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, target->Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        recorder.Sync();
+        const auto pixels = readback.Bytes();
+        return std::vector<std::uint8_t>(reinterpret_cast<const std::uint8_t*>(pixels.data()), reinterpret_cast<const std::uint8_t*>(pixels.data()) + pixels.size());
+    };
+    // Guest memory: untouched (still the 0x55 fill) over [from, to), or equal in two places.
+    const auto untouched = [&](std::size_t from, std::size_t to) { return std::all_of(memory + from, memory + to, [](std::uint8_t value) { return value == 0x55; }); };
+    const auto same = [&](std::size_t a, std::size_t b, std::size_t length) { return std::memcmp(memory + a, memory + b, length) == 0; };
+    const auto pendingOver = [&](std::size_t from, std::size_t to) {
+        const std::pair<std::uint64_t, std::uint64_t> range{address + from, address + to};
+        return StorageTexture::AnyPendingOverlaps(std::span(&range, 1));
+    };
+
+    // Thick: a 60x50x30 RGBA8 volume in SW_4KB_S (8x16x8 blocks, 4 slabs of 128 KiB, partial blocks
+    // at the right, bottom and last slab), one created under the flag (block units) at 0 and one
+    // without (the whole surface one unit) a MiB further, both written alike.
+    {
+        GuestTextureResource volume{};
+        volume.baseAddress = address;
+        volume.width = 60;
+        volume.height = 50;
+        volume.depthOrLastArray = 29;
+        volume.mipCount = 1;
+        volume.tileMode = TextureTileMode::kStandard4KB;
+        volume.dimension = TextureDimension::k3D;
+        volume.format = 56;
+        volume.dstSelX = 4;
+        volume.dstSelY = 5;
+        volume.dstSelZ = 6;
+        volume.dstSelW = 7;
+        const auto geometry = DescribeSurface(volume);
+        const auto volumeBytes = static_cast<std::size_t>(geometry.guestBytes);
+        Require(geometry.thick && volumeBytes == 8 * unit, "the lazy write-back volume has an unexpected layout");
+        auto eagerVolumeDescriptor = volume;
+        eagerVolumeDescriptor.baseAddress = address + region;
+        SetLazyWriteBackModes(false, false);
+        auto eagerVolume = std::make_shared<StorageTexture>(context, detiler, eagerVolumeDescriptor, 0);
+        SetLazyWriteBackModes(true, false);
+        auto lazyVolume = std::make_shared<StorageTexture>(context, detiler, volume, 0);
+        write(lazyVolume, 7);
+        write(eagerVolume, 7);
+        // A 256-byte access in unit 3 stores unit 3 alone.
+        auto before = CurrentLazyWriteBackCounts();
+        StorageTexture::FlushPending(address + 3 * unit, 256, nullptr, "lazy write-back test");
+        recorder.Sync();
+        auto after = CurrentLazyWriteBackCounts();
+        Require(after.thickStores == before.thickStores + 1 && after.thickStoredBytes == before.thickStoredBytes + unit && after.thickKeptBytes == before.thickKeptBytes + volumeBytes - unit, "lazy write-back: a thick partial store was not counted as one unit stored, seven left pending");
+        Require(untouched(0, 3 * unit) && untouched(4 * unit, volumeBytes), "lazy write-back: a thick access stored units it did not touch");
+        Require(!untouched(3 * unit, 4 * unit) && pendingOver(0, 3 * unit) && pendingOver(4 * unit, volumeBytes), "lazy write-back: the touched unit was not stored, or the others left the GPU");
+        // The volume without units stores everything for the same access; the touched unit matches.
+        StorageTexture::FlushPending(address + region + 3 * unit, 256, nullptr, "lazy write-back test");
+        recorder.Sync();
+        Require(!untouched(region, region + unit), "lazy write-back: the whole-surface volume did not store whole");
+        Require(same(3 * unit, region + 3 * unit, unit), "lazy write-back: a thick partial store differs from the whole-surface store");
+        // A CPU read through the flush hook gets the bytes of the unit it reads, and no more is stored.
+        std::array<std::byte, 64> read{};
+        AgcDriver::GuestMemory::Read(address + 5 * unit + 128, read);
+        Require(std::memcmp(read.data(), memory + region + 5 * unit + 128, read.size()) == 0 && same(5 * unit, region + 5 * unit, unit), "lazy write-back: a CPU read of a lazily held unit did not see the GPU's bytes");
+        Require(untouched(0, 3 * unit) && untouched(6 * unit, volumeBytes) && untouched(4 * unit, 5 * unit), "lazy write-back: a CPU read stored units it did not read");
+        // A refresh with the other units pending and unchanged keeps them on the GPU.
+        static_cast<void>(lazyVolume->Refresh());
+        recorder.Sync();
+        Require(untouched(0, 3 * unit) && untouched(6 * unit, volumeBytes) && pendingOver(6 * unit, volumeBytes), "lazy write-back: a refresh of a GPU-only chain stored its pending units");
+        // A CPU store into the stored unit 3: the refresh uploads that unit through its windows and
+        // keeps the pending ones; the volume without units uploads whole. The texels agree.
+        std::memset(memory + 3 * unit + 4096, 0x33, 8192);
+        std::memset(memory + region + 3 * unit + 4096, 0x33, 8192);
+        static_cast<void>(lazyVolume->Refresh());
+        static_cast<void>(eagerVolume->Refresh());
+        recorder.Sync();
+        Require(pendingOver(6 * unit, volumeBytes) && texels(lazyVolume) == texels(eagerVolume), "lazy write-back: a thick partial upload left the volume differing from the whole upload");
+        // The verify mode checks the next partial store against the whole-surface retile.
+        SetLazyWriteBackModes(true, true);
+        before = CurrentLazyWriteBackCounts();
+        StorageTexture::FlushPending(address + 7 * unit, 64, nullptr, "lazy write-back test");
+        recorder.Sync();
+        after = CurrentLazyWriteBackCounts();
+        Require(after.verifyChecks > before.verifyChecks && after.verifyMismatches == before.verifyMismatches, "lazy write-back verify: a thick partial store was not checked, or differed");
+        Require(same(7 * unit, region + 7 * unit, unit), "lazy write-back: the last (partial-slab) unit differs from the whole-surface store");
+        // The flag off: the next access stores every pending unit at once.
+        SetLazyWriteBackModes(false, false);
+        StorageTexture::FlushPending(address, 64, nullptr, "lazy write-back test");
+        recorder.Sync();
+        Require(!pendingOver(0, volumeBytes), "lazy write-back: the flag off left units pending");
+        // The stores outside the access went into unit shadows: a CPU read of the volume publishes them.
+        std::vector<std::byte> whole(volumeBytes);
+        AgcDriver::GuestMemory::Read(address, whole);
+        for (std::size_t at = 0; at < volumeBytes; at += unit) {
+            if (!same(at, region + at, unit)) throw std::runtime_error("lazy write-back: unit " + std::to_string(at / unit) + " of the volume differs from the whole-surface store");
+        }
+        lazyVolume->Flush();
+        eagerVolume->Flush();
+        recorder.Sync();
+    }
+    // Row aliases: P (256 wide, RGBA16F, SW_64KB_R_X, 128x64 blocks: two per block row) pending,
+    // R of another height (and maybe format) refreshing over it at the same base, then R written
+    // and everything stored. Run with the flag on at one MiB and off at another; R's texels after
+    // the refresh and the final guest bytes must be the same. Block row 3 holds P's or R's padding
+    // rows: its two units are the edge units.
+    const auto rowScenario = [&](bool lazy, std::size_t offset, std::uint32_t pendingHeight, std::uint32_t refreshHeight, std::uint32_t refreshFormat) {
+        SetLazyWriteBackModes(lazy, lazy);
+        GuestTextureResource pending{};
+        pending.baseAddress = address + offset;
+        pending.width = 256;
+        pending.height = pendingHeight;
+        pending.mipCount = 1;
+        pending.tileMode = TextureTileMode::kR64KBX;
+        pending.dimension = TextureDimension::k2D;
+        pending.format = 71;
+        pending.dstSelX = 4;
+        pending.dstSelY = 5;
+        pending.dstSelZ = 6;
+        pending.dstSelW = 7;
+        auto refreshing = pending;
+        refreshing.height = refreshHeight;
+        refreshing.format = refreshFormat;
+        // Two 128x64 blocks per block row: a unit per block, the last block row (padding rows in one of
+        // the two) its two edge units; the units before them are borrowed.
+        const auto unitsOf = [](std::uint32_t height) { return static_cast<std::size_t>((height + 63) / 64) * 2; };
+        const auto borrowedUnits = std::min(unitsOf(pendingHeight), unitsOf(refreshHeight)) - 2;
+        Require(DescribeSurface(pending).guestBytes == unitsOf(pendingHeight) * unit && DescribeSurface(refreshing).guestBytes == unitsOf(refreshHeight) * unit, "the row alias surfaces have unexpected sizes");
+        auto pendingImage = std::make_shared<StorageTexture>(context, detiler, pending, 0);
+        pendingImage->SetCached(true);
+        auto refreshImage = std::make_shared<StorageTexture>(context, detiler, refreshing, 0);
+        write(pendingImage, 11);
+        const auto before = CurrentLazyWriteBackCounts();
+        static_cast<void>(refreshImage->Refresh());
+        recorder.Sync();
+        const auto after = CurrentLazyWriteBackCounts();
+        if (lazy) {
+            Require(after.rowBorrows == before.rowBorrows + 1 && after.edgeUnits == before.edgeUnits + 2, "lazy write-back: a row alias was not borrowed with its two edge units stored first");
+            Require(after.verifyChecks > before.verifyChecks && after.verifyMismatches == before.verifyMismatches, "lazy write-back verify: a row alias borrow was not checked, or differed from the alias's retile");
+            Require(pendingOver(offset, offset + borrowedUnits * unit) && untouched(offset, offset + borrowedUnits * unit), "lazy write-back: a row alias borrow stored the borrowed units");
+        } else {
+            Require(after.rowBorrows == before.rowBorrows && after.edgeUnits == before.edgeUnits, "lazy write-back: the flag off borrowed a row alias");
+        }
+        auto refreshed = texels(refreshImage);
+        write(refreshImage, 13);
+        StorageTexture::FlushPending(address + offset, region, nullptr, "lazy write-back test");
+        recorder.Sync();
+        Require(!pendingOver(offset, offset + region), "lazy write-back: results stayed pending after the final store");
+        pendingImage->Flush();
+        refreshImage->Flush();
+        recorder.Sync();
+        return refreshed;
+    };
+    // The shorter refreshing over the taller (another format of the same size), then the taller
+    // over the shorter.
+    const auto shortLazy = rowScenario(true, 2 * region, 256, 200, 66);
+    const auto shortEager = rowScenario(false, 3 * region, 256, 200, 66);
+    Require(shortLazy == shortEager, "lazy write-back: the shorter alias's texels differ from the eager round trip");
+    Require(same(2 * region, 3 * region, 8 * unit), "lazy write-back: guest memory after a shorter row alias differs from the eager stores");
+    const auto tallLazy = rowScenario(true, 4 * region, 200, 256, 71);
+    const auto tallEager = rowScenario(false, 5 * region, 200, 256, 71);
+    Require(tallLazy == tallEager, "lazy write-back: the taller alias's texels differ from the eager round trip");
+    Require(same(4 * region, 5 * region, 8 * unit), "lazy write-back: guest memory after a taller row alias differs from the eager stores");
+    // Surfaces of different sizes (4 units against 8: the shorter alias's bounds, and the memory
+    // past the shorter surface): both ways, against the eager stores over the whole MiB.
+    const auto smallLazy = rowScenario(true, 6 * region, 256, 100, 66);
+    const auto smallEager = rowScenario(false, 7 * region, 256, 100, 66);
+    Require(smallLazy == smallEager && same(6 * region, 7 * region, region), "lazy write-back: a smaller row alias refreshing differs from the eager round trip");
+    const auto largeLazy = rowScenario(true, 8 * region, 100, 256, 71);
+    const auto largeEager = rowScenario(false, 9 * region, 100, 256, 71);
+    Require(largeLazy == largeEager && same(8 * region, 9 * region, region), "lazy write-back: a larger row alias refreshing differs from the eager round trip");
+    SetLazyWriteBackModes(std::nullopt, std::nullopt);
+    std::cout << "lazy write-back: thick partial store, CPU read, GPU-only refresh, verify, flag off, and row alias (shorter and taller, equal and different sizes, against the eager stores) cases passed\n";
+}
+
 int main(int argc, char** argv) {
     try {
         Device device;
@@ -5412,6 +5669,10 @@ int main(int argc, char** argv) {
             usageElideTests(device, recorder);
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--lazy-writeback-only") {
+            lazyWriteBackTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--cube-only") {
             singleCubeTests(device, recorder);
             std::cout << "Single cube snapshot and storage sampling tests passed\n";
@@ -5457,6 +5718,7 @@ int main(int argc, char** argv) {
         storageRefreshTests(device, recorder, false);
         storageRefreshTests(device, recorder, true);
         usageElideTests(device, recorder);
+        lazyWriteBackTests(device, recorder);
         writeBackPaddingTests(device, recorder, false);
         writeBackPaddingTests(device, recorder, true);
         importWatchTests(device);

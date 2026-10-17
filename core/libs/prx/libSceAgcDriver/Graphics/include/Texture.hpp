@@ -355,7 +355,9 @@ private:
     void writeBack(std::uint64_t address, std::size_t bytes);
     void writeBackLayers(const std::vector<bool>& layers);
     // Tracked units as 64 KiB write-stamp blocks (`blockUnits`: a thin tiled surface at a 64 KiB
-    // aligned base; APS5_NO_BLOCK_TRACKING=1 tracks array layers as above instead): a fill of one
+    // aligned base, or a thick one of one mip created under live `lazy_writeback`, whose windows
+    // are a slab's block rows in each of its depth slices; APS5_NO_BLOCK_TRACKING=1 tracks array
+    // layers as above instead): a fill of one
     // layer, a CPU write or another image's store then costs the blocks it touched, moved through
     // windows of their (layer, mip) slices (whole tile blocks in whole rows, see
     // TextureDetiler::DetileWindow), not the surface. The last unit may be short.
@@ -378,8 +380,9 @@ private:
     // mip whole (its block holds every tail level), in slice order.
     std::vector<SliceWindow> sliceWindows(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) const;
     // The bytes of the surface-relative runs no element of the surface holds (the padding of partly
-    // covered tile blocks and of linear rows, tail blocks, the bytes between mips; every byte of a
-    // thick surface), ascending: a write-back keeps the guest's bytes there.
+    // covered tile blocks and of linear rows, tail blocks, the bytes between mips; of a thick
+    // surface the blocks of partial slab rows and slabs, every byte without block units),
+    // ascending: a write-back keeps the guest's bytes there.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> uncoveredBytes(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) const;
     // The seed of a write-back's tiled scratch where its copies would carry bytes no element holds:
     // those bytes' current contents (a fresh unit shadow's, else the import's), copied into the
@@ -440,7 +443,10 @@ private:
     // (block units, uncompressed, still cached), if any: Refresh takes its pending units from its
     // image on the device (borrowUnits) instead of having them stored and re-read, and the alias
     // stays responsible for storing them until this image's own results supersede them
-    // (markLayersPending). APS5_NO_ALIAS_BORROW=1 stores and re-reads as before.
+    // (markLayersPending). APS5_NO_ALIAS_BORROW=1 stores and re-reads as before. Under live
+    // `lazy_writeback` (or `subrect_borrow` for the shorter one refreshing) also a row alias: same
+    // base, width, tile mode and element size, one mip and layer, another height, either one
+    // refreshing; Refresh stores its edge units first (rowAliasEdges).
     std::shared_ptr<StorageTexture> pendingAlias() const;
     // The pending images FlushPending(address, bytes) would store (not the one a Refresh validates,
     // a pending unit inside the range), kept alive across the caller's use.
@@ -476,6 +482,19 @@ private:
     // Whether the source's pending units over [first, end) may stay pending through this refresh
     // (borrowUnits' rule: tracked, not maybe-written, no results of this image in the same unit).
     bool layerAliasExempt(const LayerAlias& link) const;
+    // A row alias (pendingAlias: same base, width and layout, another height): per unit of this
+    // image, whether its bytes in the span the two surfaces share are not all elements of both
+    // (padding of either, or the unit the shorter surface ends inside). Refresh stores the alias's
+    // results there first instead of borrowing them.
+    std::vector<bool> rowAliasEdges(const StorageTexture& alias) const;
+    // APS5_VERIFY_LAZY_WRITEBACK: the surface-relative runs retiled from the image into a canary-
+    // filled copy of the surface's tiled bytes, through their windows or by the whole-surface
+    // retile (a CommandBatch of its own, waited for); the borrow check compares this image's
+    // retile of the borrowed units with the alias's, the thick check a partial store's windows
+    // with the whole-surface retile.
+    std::vector<std::byte> retiledForVerify(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, bool windowed);
+    void verifyBorrow(StorageTexture& source, const std::vector<bool>& units);
+    void verifyThickWindows(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs);
     // The image copies moving the selected units from the source (this unit + offset), or false
     // when its windows do not pair with this image's one to one.
     bool layerCopies(const StorageTexture& source, std::int64_t offset, const std::vector<bool>& units, std::vector<VkImageCopy>* regions) const;
@@ -602,6 +621,26 @@ private:
     // fails again until `generation` moves, so ClassifyFill skips the layer match meanwhile.
     std::uint64_t layerRefusedGeneration = ~0ull;
 };
+
+// Live `lazy_writeback` (Texture.cpp): totals since start for the tests and the [lazy-wb] line.
+// Thick partial stores (block-unit volumes storing only the units an access touches: bytes stored,
+// bytes left pending), row-alias borrows (units of an image at the same base with another height
+// taken on the device), edge units stored ahead of such a borrow, and the
+// APS5_VERIFY_LAZY_WRITEBACK checks and mismatches.
+struct LazyWriteBackCounts {
+    std::uint64_t thickStores = 0;
+    std::uint64_t thickStoredBytes = 0;
+    std::uint64_t thickKeptBytes = 0;
+    std::uint64_t rowBorrows = 0;
+    std::uint64_t rowBorrowBytes = 0;
+    std::uint64_t edgeUnits = 0;
+    std::uint64_t verifyChecks = 0;
+    std::uint64_t verifyMismatches = 0;
+};
+LazyWriteBackCounts CurrentLazyWriteBackCounts();
+// Test override of the live flag and of the verify mode (nullopt: back to the flag and the
+// environment; a forced verify checks every case).
+void SetLazyWriteBackModes(std::optional<bool> lazy, std::optional<bool> verify);
 
 // APS5_PROFILE_DRAW: what the image lookups on this thread did since the last reset, by outcome
 // (count and time), so a caller running them under the GPU mutex can name what its hold spent on

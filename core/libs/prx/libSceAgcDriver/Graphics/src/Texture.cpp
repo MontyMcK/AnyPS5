@@ -94,6 +94,9 @@ thread_local const char* flushReason = nullptr;
 // (units taken from an alias image on the device); set by the constructor and Refresh around
 // upload() and borrowUnits().
 thread_local const char* uploadReason = "first";
+// The size of the range the FlushPending storing an image asked for (the [wb-cause] line: an access
+// much smaller than the stored surface marks whole-surface stores); 0 outside FlushPending.
+thread_local std::size_t flushRequestBytes = 0;
 // Block-unit traffic, per 10 s like the rest of the [storage] line: partial uploads and write-backs
 // (count and bytes), write-backs that stored nothing (every selected block CPU-written), partial
 // selections widened to every pending unit (the hysteresis in writeBack), units dropped as dead
@@ -108,6 +111,99 @@ std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKep
 // Images stored by a FlushPending after a hook skip of theirs (AccessKeptByCpu), of which by the
 // hook for the read site of the last skip; images evictStale dropped (the [hooksync] and [storage] lines).
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
+
+// Live `lazy_writeback` (default on; APS5_LAZY_WRITEBACK=0 makes the default off): results stay on
+// the GPU for consumers that do not need guest bytes. A thick (3D) surface created while it is on
+// tracks 64 KiB block units like a thin one, so an access to part of it stores the units it
+// touches instead of the whole volume (the flag off stores every pending unit at once, as the
+// whole-surface tracking did); and a refresh takes the pending units of an image at the same base
+// with the same width and layout but another height (the 1920x2160 pool over two 1920x1080 images)
+// on the device, its edge units (bytes one of the two surfaces holds no element of) stored first.
+// APS5_VERIFY_LAZY_WRITEBACK=1 checks each thick partial store's windows against the whole-surface
+// retile and each such borrow against the alias's own retile (a GPU wait each: slow, debug only).
+std::atomic<int> lazyOverride{-1}, lazyVerifyOverride{-1};
+std::atomic<std::uint64_t> lazyThickStores{0}, lazyThickStoredBytes{0}, lazyThickKeptBytes{0}, lazyRowBorrows{0}, lazyRowBorrowBytes{0}, lazyEdgeUnits{0}, lazyVerifyChecks{0}, lazyVerifyMismatches{0};
+
+bool LazyWriteBack() {
+    if (const auto forced = lazyOverride.load(std::memory_order_relaxed); forced >= 0) return forced != 0;
+    static const bool fallback = [] {
+        const char* text = std::getenv("APS5_LAZY_WRITEBACK");
+        return text == nullptr || std::strcmp(text, "0") != 0;
+    }();
+    return LiveFlag("lazy_writeback", fallback);
+}
+
+bool VerifyLazyWriteBack() {
+    if (const auto forced = lazyVerifyOverride.load(std::memory_order_relaxed); forced >= 0) return forced != 0;
+    static const bool requested = [] {
+        const char* text = std::getenv("APS5_VERIFY_LAZY_WRITEBACK");
+        return text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return requested;
+}
+
+// The tile block a write-back or upload window moves whole: {block bytes, width, height} in
+// elements (a thick block also spans blockDepth slices, every one of which a window of its slab
+// carries).
+std::array<std::uint32_t, 3> WindowBlockLayout(const GuestTextureResource& descriptor, const SurfaceGeometry& geometry) {
+    const auto elementBytes = BytesPerElement(descriptor.format);
+    if (!geometry.thick) return ThinBlockLayout(descriptor.tileMode, elementBytes);
+    const auto extent = ThickBlockExtent(descriptor.tileMode, elementBytes);
+    return {descriptor.tileMode == TextureTileMode::kStandard4KB ? 4096u : 65536u, extent[0], extent[1]};
+}
+
+// APS5_PROFILE_DRAW: what each write-back stored and why, per surface (10 s, the [wb-cause] line),
+// and the timeline kind of its range carrying the cause ("writeback-windows/storage-refresh").
+struct WriteBackCauses {
+    std::mutex mutex;
+    std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> totals;
+};
+
+WriteBackCauses& Causes() {
+    static WriteBackCauses causes;
+    return causes;
+}
+
+const char* CauseKind(const char* kind) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile || flushReason == nullptr) return kind;
+    static std::mutex mutex;
+    static std::map<std::pair<const char*, const char*>, std::string> names;
+    std::lock_guard lock(mutex);
+    auto& name = names[{kind, flushReason}];
+    if (name.empty()) {
+        name = std::string(kind) + "/" + flushReason;
+        std::replace(name.begin(), name.end(), ' ', '-');
+    }
+    return name.c_str();
+}
+
+void reportLazyWriteBack() {
+    static std::uint64_t seen[8] = {};
+    const std::uint64_t now[8] = {lazyThickStores.load(std::memory_order_relaxed), lazyThickStoredBytes.load(std::memory_order_relaxed), lazyThickKeptBytes.load(std::memory_order_relaxed), lazyRowBorrows.load(std::memory_order_relaxed), lazyRowBorrowBytes.load(std::memory_order_relaxed), lazyEdgeUnits.load(std::memory_order_relaxed), lazyVerifyChecks.load(std::memory_order_relaxed), lazyVerifyMismatches.load(std::memory_order_relaxed)};
+    std::uint64_t delta[8];
+    for (std::size_t i = 0; i < 8; ++i) {
+        delta[i] = now[i] - seen[i];
+        seen[i] = now[i];
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[lazy-wb] (10 s, lazy_writeback %d) thick partial stores %llu: %.1f MiB stored, %.1f MiB left pending on the GPU; row-alias borrows %llu: %.1f MiB copied on the device, %llu edge units stored first; verify %llu checks, %llu mismatches\n", LazyWriteBack() ? 1 : 0, static_cast<unsigned long long>(delta[0]), delta[1] / 1048576.0, delta[2] / 1048576.0, static_cast<unsigned long long>(delta[3]), delta[4] / 1048576.0, static_cast<unsigned long long>(delta[5]), static_cast<unsigned long long>(delta[6]), static_cast<unsigned long long>(delta[7]));
+    auto& causes = Causes();
+    std::vector<std::pair<std::uint64_t, std::string>> heavy;
+    {
+        std::lock_guard lock(causes.mutex);
+        for (const auto& [name, totals] : causes.totals) heavy.emplace_back(totals.second, std::to_string(totals.first) + "x " + name);
+        causes.totals.clear();
+    }
+    if (heavy.empty()) return;
+    std::sort(heavy.rbegin(), heavy.rend());
+    std::string line = "[wb-cause] (10 s) write-backs by surface and cause:";
+    char text[32];
+    for (std::size_t i = 0; i < std::min<std::size_t>(heavy.size(), 16); ++i) {
+        std::snprintf(text, sizeof(text), " | %.1f MiB ", heavy[i].first / 1048576.0);
+        line += text + heavy[i].second;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
+}
 
 struct StorageTraffic {
     std::mutex mutex;
@@ -152,6 +248,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
+    reportLazyWriteBack();
 }
 
 void countStorageUpload(std::size_t path, std::uint64_t bytes) {
@@ -746,7 +843,10 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         const bool layered = geometry.layers >= 2 && !geometry.thick && geometry.imageDepth == 1 && geometry.layers == geometry.imageLayers && geometry.layerBytes * geometry.layers == guestBytes && geometry.layerBytes % 65536 == 0 && descriptor.baseAddress % 65536 == 0;
         // Tile blocks divide the stamp blocks, so at an aligned base every unit is whole tile blocks
         // of its (layer, mip) slices (sliceWindows).
-        blockUnits = LayerTrackingEnabled() && BlockTrackingEnabled() && !geometry.thick && descriptor.tileMode != TextureTileMode::kLinear && descriptor.baseAddress % 65536 == 0;
+        // A thick surface of one mip (no tail block) takes block units under `lazy_writeback`: its
+        // windows are whole tile blocks of a slab's rows, every depth slice of the slab one window.
+        const bool thickBlocks = geometry.thick && descriptor.mipCount == 1 && !mips.empty() && !mips[0].tail && LazyWriteBack();
+        blockUnits = LayerTrackingEnabled() && BlockTrackingEnabled() && (!geometry.thick || thickBlocks) && descriptor.tileMode != TextureTileMode::kLinear && descriptor.baseAddress % 65536 == 0;
         // APS5_THICK_UNITS=1 (experiment): a thick (3D) surface tracks its 64 KiB blocks as units
         // too, without the windowed block paths: a write-back retiles the whole image on the GPU but
         // stores only the requested units into guest memory, the others staying pending (uploads
@@ -1594,15 +1694,51 @@ bool StorageTexture::Refresh() {
     // images takes the old order (store, then this image re-uploads it).
     auto alias = pendingAlias();
     if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
+    // A row alias (same base, width and layout, another height; `lazy_writeback`): the units the
+    // two share are taken on the device only where every byte holds an element of both surfaces.
+    // An edge unit (the last block row of the shorter one, whose padding rows are the taller one's
+    // texels, or a unit the shorter surface ends inside) has its alias results stored first: this
+    // image then reads it from memory, and no borrow of it can later supersede results of the
+    // alias this image does not hold.
+    std::vector<bool> aliasEdge;
+    const bool rowAlias = alias != nullptr && (alias->guestBytes != guestBytes || alias->descriptor.height != descriptor.height);
+    if (rowAlias) {
+        aliasEdge = rowAliasEdges(*alias);
+        std::vector<bool> stored(trackedLayers, false);
+        bool any = false;
+        for (std::uint32_t unit = 0; unit < std::min(trackedLayers, alias->trackedLayers); ++unit) {
+            if (!aliasEdge[unit] || !alias->layerPending[unit]) continue;
+            stored[unit] = true;
+            any = true;
+            lazyEdgeUnits.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (any) {
+            for (const auto& [begin, end] : unitRuns(stored)) static_cast<void>(FlushPending(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin), nullptr, "alias edge", PublishScope::None));
+        }
+    }
+    // Units of this image the alias has (the shorter of the two surfaces bounds them).
+    const auto aliasUnits = alias != nullptr ? std::min(trackedLayers, alias->trackedLayers) : 0u;
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
-        if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) alias = nullptr;
-        for (std::uint32_t unit = 0; alias != nullptr && unit < trackedLayers; ++unit) {
+        if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(std::min(guestBytes, alias->guestBytes)), alias->layerGeneration, aliasStamped)) alias = nullptr;
+        for (std::uint32_t unit = 0; alias != nullptr && unit < aliasUnits; ++unit) {
             if (!alias->layerPending[unit]) continue;
-            if (alias->layerGeneration[unit] == 0 || aliasStamped[unit] == GuestMemory::BlockMaybeWritten || (aliasStamped[unit] == GuestMemory::BlockUnchanged && layerPending[unit])) {
+            if ((rowAlias && aliasEdge[unit]) || alias->layerGeneration[unit] == 0 || aliasStamped[unit] == GuestMemory::BlockMaybeWritten || (aliasStamped[unit] == GuestMemory::BlockUnchanged && layerPending[unit])) {
                 alias = nullptr;
                 break;
             }
+        }
+    }
+    // Another pending image over a unit the alias holds pending results in: the flush below stores
+    // it and stamps the unit, which the alias (exempt) would then take for a CPU write and drop at
+    // its own write-back though its results may be the newer. The order is unknown: both are stored.
+    if (alias != nullptr) {
+        for (const auto& other : overlappingPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+            if (other == alias) continue;
+            for (std::uint32_t unit = 0; alias != nullptr && unit < aliasUnits; ++unit) {
+                if (alias->layerPending[unit] && other->overlaps(layerBegin(unit), static_cast<std::size_t>(layerBytes(unit))) && other->pendingUnitInside(layerBegin(unit), static_cast<std::size_t>(layerBytes(unit)))) alias = nullptr;
+            }
+            if (alias == nullptr) break;
         }
     }
     // Layer aliases (a cube map and the 2D images of its faces) under the same rule, each over the
@@ -1648,6 +1784,8 @@ bool StorageTexture::Refresh() {
     // Units taken from the alias's image instead of guest memory.
     std::vector<bool> borrowed;
     bool anyBorrowed = false;
+    // APS5_VERIFY_LAZY_WRITEBACK: the alias whose borrowed units the end of the refresh checks.
+    std::shared_ptr<StorageTexture> verifyAlias;
     // Per layer alias: the units taken from it (empty: none).
     std::vector<std::vector<bool>> layerBorrowed;
     bool unchanged = true;
@@ -1720,6 +1858,18 @@ bool StorageTexture::Refresh() {
         // Only the direct path uploads the selected layers alone (see upload); the others replace
         // the whole image, so every pending layer's results are stored first.
         direct = keys == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr && (blockUnits || trackedLayers == arrayLayers || trackedLayers == 1);
+        if (alias != nullptr && !direct) {
+            // The keys moved under the flush (a key store it made): nothing can be borrowed, so the
+            // exempt alias's results reach memory now and this image re-reads those units.
+            std::vector<bool> held(trackedLayers, false);
+            for (std::uint32_t unit = 0; unit < aliasUnits; ++unit) held[unit] = alias->layerPending[unit];
+            static_cast<void>(FlushPending(descriptor.baseAddress, static_cast<std::size_t>(std::min(guestBytes, alias->guestBytes)), nullptr, "storage refresh", PublishScope::None));
+            for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+                if (!held[unit]) continue;
+                changed[unit] = true;
+                unchanged = false;
+            }
+        }
         if (alias != nullptr && direct) {
             // The alias's pending units that nothing stamped since its generation (a CPU store or a
             // driver store there wins over its results, as at its own write-back) are taken from
@@ -1727,10 +1877,11 @@ bool StorageTexture::Refresh() {
             // already holding them at the same alias version stay as they are.
             const bool sameBorrow = borrowedFrom.lock() == alias && borrowedVersion == alias->version && borrowedUnits.size() == trackedLayers;
             std::vector<std::uint8_t> aliasStamped(trackedLayers);
-            const bool aliasTracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped);
+            const bool aliasTracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(std::min(guestBytes, alias->guestBytes)), alias->layerGeneration, aliasStamped);
             borrowed.assign(trackedLayers, false);
-            for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+            for (std::uint32_t unit = 0; unit < aliasUnits; ++unit) {
                 if (!aliasTracked || !alias->layerPending[unit] || aliasStamped[unit] != 0 || alias->layerGeneration[unit] == 0 || layerPending[unit]) continue;
+                if (rowAlias && aliasEdge[unit]) continue;
                 if (sameBorrow && borrowedUnits[unit]) continue;
                 borrowed[unit] = true;
                 anyBorrowed = true;
@@ -1865,7 +2016,13 @@ bool StorageTexture::Refresh() {
     if (anyBorrowed) {
         GuestMemory::NoteProbeEvent("alias borrow");
         uploadReason = "alias";
-        borrowUnits(*alias, borrowed);
+        const auto bytes = borrowUnits(*alias, borrowed);
+        if (rowAlias) {
+            lazyRowBorrows.fetch_add(1, std::memory_order_relaxed);
+            lazyRowBorrowBytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
+        // Checked once the refresh is done (the check waits for the GPU, which runs completions).
+        if (VerifyLazyWriteBack()) verifyAlias = alias;
         for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
             if (borrowed[unit]) layerGeneration[unit] = current;
         }
@@ -1911,6 +2068,7 @@ bool StorageTexture::Refresh() {
     } else {
         uploadedKeys = keys;
     }
+    if (verifyAlias != nullptr) verifyBorrow(*verifyAlias, borrowed);
     return false;
 }
 
@@ -2213,7 +2371,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> StorageTexture::unitRuns(co
 std::vector<StorageTexture::SliceWindow> StorageTexture::sliceWindows(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) const {
     std::vector<SliceWindow> windows;
     const auto elementBytes = BytesPerElement(descriptor.format);
-    const auto block = ThinBlockLayout(descriptor.tileMode, elementBytes);
+    const auto block = WindowBlockLayout(descriptor, geometry);
     for (const auto& [runBegin, runEnd] : runs) {
         for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
             for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
@@ -2300,6 +2458,26 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> StorageTexture::uncoveredBy
                 if (!geometry.HasLayer(level, layer)) continue;
                 const auto sliceBegin = geometry.GuestLayerOffset(layer) + mips[level].tiledOffset;
                 for (const auto& [begin, end] : CoveredMipBytes(descriptor.tileMode, elementBytes, mips[level])) covered.emplace_back(sliceBegin + begin, sliceBegin + end);
+            }
+        }
+        std::sort(covered.begin(), covered.end());
+    } else if (blockUnits && geometry.layerBytes != 0) {
+        // A slab's whole tile blocks, when every depth slice of the slab exists at that level: each
+        // block of a covered row holds one element at every byte (the thin rule per slab).
+        const auto block = WindowBlockLayout(descriptor, geometry);
+        const auto slabs = static_cast<std::uint32_t>(guestBytes / geometry.layerBytes);
+        for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+            const auto& mip = mips[level];
+            if (mip.tail) continue;
+            const auto depth = std::max(geometry.imageDepth >> level, 1u);
+            const auto wholeColumns = std::min(mip.width / block[1], mip.blocksPerRow);
+            const auto wholeRows = mip.height / block[2];
+            for (std::uint32_t slab = 0; slab < slabs && (slab + 1u) * geometry.blockDepth <= depth; ++slab) {
+                const auto sliceBegin = static_cast<std::uint64_t>(slab) * geometry.layerBytes + mip.tiledOffset;
+                for (std::uint32_t row = 0; row < wholeRows && wholeColumns != 0; ++row) {
+                    const auto first = static_cast<std::uint64_t>(row) * mip.blocksPerRow;
+                    covered.emplace_back(sliceBegin + first * block[0], sliceBegin + (first + wholeColumns) * block[0]);
+                }
             }
         }
         std::sort(covered.begin(), covered.end());
@@ -2454,11 +2632,11 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
         if (source.shadow) {
             // The slab holds the piece from the window's first tiled byte: the window's tiled base
             // is its range begin (sliceWindows builds it so), read from the piece's slab offset.
-            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, source.buffer, source.offset + (window.tiledBegin - source.begin), linear->Handle(), positions[i], mip, false, window.layer, false, detile);
+            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, source.buffer, source.offset + (window.tiledBegin - source.begin), linear->Handle(), positions[i], mip, false, window.layer, geometry.thick, detile);
         } else {
             // The import holds the whole mip: the window's tiled base is the mip's.
             detile.tiledBase = 0;
-            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, import.buffer, importOffset + geometry.GuestLayerOffset(window.layer) + mip.tiledOffset, linear->Handle(), positions[i], mip, false, window.layer, false, detile);
+            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, import.buffer, importOffset + geometry.GuestLayerOffset(window.layer) + mip.tiledOffset, linear->Handle(), positions[i], mip, false, window.layer, geometry.thick, detile);
         }
         for (auto region : window.regions) {
             region.bufferOffset += positions[i];
@@ -2635,7 +2813,7 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
             commands = recorder->Commands(&covered);
         }
         timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageWriteBack);
-        recorder->NoteTimedSurface(timing, descriptor.baseAddress, guestBytes, static_cast<std::uint32_t>(storageFormat), descriptor.format, descriptor.width, descriptor.height, "writeback-windows", static_cast<std::uint32_t>(keep.size()));
+        recorder->NoteTimedSurface(timing, descriptor.baseAddress, guestBytes, static_cast<std::uint32_t>(storageFormat), descriptor.format, descriptor.width, descriptor.height, CauseKind("writeback-windows"), static_cast<std::uint32_t>(keep.size()));
         if (linear) recorder->Keep(linear, linear->Size());
         if (tiledScratch) recorder->Keep(tiledScratch, tiledScratch->Size());
         for (const auto& pieces : slabPieces) recorder->Keep(pieces.slab);
@@ -2727,7 +2905,7 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, elided ? VkPipelineStageFlags{VK_PIPELINE_STAGE_TRANSFER_BIT} : VkPipelineStageFlags{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT}, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &importReady, 1, &linearRead, 0, nullptr);
     for (std::size_t i = 0; i < windows.size(); ++i) {
         const auto& window = windows[i];
-        detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear->Handle(), linearPositions[i], tiledScratch->Handle(), scratchPositions[i], mips[window.level], true, window.layer, false, window.window);
+        detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear->Handle(), linearPositions[i], tiledScratch->Handle(), scratchPositions[i], mips[window.level], true, window.layer, geometry.thick, window.window);
     }
     {
         // The retiled scratch (and a seed's slab bytes, which the scratch copies overwrite in
@@ -3115,6 +3293,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::exception_ptr failure;
     const auto previousReason = std::exchange(flushReason, reason);
+    const auto previousBytes = std::exchange(flushRequestBytes, bytes);
     for (const auto& texture : flush) {
         try {
             // Only the pending layers the access overlaps are stored; the others stay pending (the
@@ -3125,6 +3304,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         }
     }
     flushReason = previousReason;
+    flushRequestBytes = previousBytes;
     if (failure) std::rethrow_exception(failure);
     // The stores above went into the unit shadows where slabs took them: the consumer reads the
     // import, so they are published under the same hold, after every store.
@@ -4101,18 +4281,164 @@ void StorageTexture::blockGenerations(std::vector<std::uint64_t>& generations) c
     }
 }
 
+std::vector<bool> StorageTexture::rowAliasEdges(const StorageTexture& alias) const {
+    std::vector<bool> edge(trackedLayers, false);
+    const auto shared = std::min(guestBytes, alias.guestBytes);
+    const std::pair<std::uint64_t, std::uint64_t> span{0, shared};
+    // Padding of both (the right edge's partial blocks at one width) is no surface's element: the
+    // copy leaves it and both write-backs keep the guest's bytes there. Only bytes that are an
+    // element of exactly one of the two make a unit an edge.
+    const auto mine = uncoveredBytes(std::span(&span, 1));
+    const auto theirs = alias.uncoveredBytes(std::span(&span, 1));
+    const auto clipped = [](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t begin, std::uint64_t end) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> inside;
+        for (const auto& [from, to] : ranges) {
+            if (to <= begin || from >= end) continue;
+            inside.emplace_back(std::max(from, begin), std::min(to, end));
+        }
+        return inside;
+    };
+    for (std::uint32_t unit = 0; unit < trackedLayers && static_cast<std::uint64_t>(unit) * trackedLayerBytes < shared; ++unit) {
+        const auto begin = static_cast<std::uint64_t>(unit) * trackedLayerBytes;
+        const auto end = std::min(begin + trackedLayerBytes, shared);
+        // The unit the shared span ends inside holds bytes of one of the surfaces only.
+        if (end - begin != trackedLayerBytes || clipped(mine, begin, end) != clipped(theirs, begin, end)) edge[unit] = true;
+    }
+    return edge;
+}
+
+namespace {
+
+// APS5_VERIFY_LAZY_WRITEBACK=1 checks the first 16 cases of each kind and every 16th after (each
+// waits for the GPU); the test override checks every one.
+bool verifySample(std::atomic<std::uint64_t>& calls) {
+    const auto call = calls.fetch_add(1, std::memory_order_relaxed);
+    return lazyVerifyOverride.load(std::memory_order_relaxed) > 0 || call < 16 || call % 16 == 0;
+}
+
+std::atomic<std::uint64_t> verifyBorrowCalls{0}, verifyThickCalls{0};
+
+void compareRetiled(const char* what, const GuestTextureResource& descriptor, std::span<const std::byte> mine, std::span<const std::byte> reference, std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) {
+    lazyVerifyChecks.fetch_add(1, std::memory_order_relaxed);
+    for (const auto& [begin, end] : runs) {
+        if (end > mine.size() || end > reference.size()) continue;
+        if (std::memcmp(mine.data() + begin, reference.data() + begin, static_cast<std::size_t>(end - begin)) == 0) continue;
+        auto at = begin;
+        while (at < end && mine[static_cast<std::size_t>(at)] == reference[static_cast<std::size_t>(at)]) ++at;
+        lazyVerifyMismatches.fetch_add(1, std::memory_order_relaxed);
+        static std::atomic<int> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 32) {
+            std::fprintf(stderr, "[lazy-wb] APS5_VERIFY_LAZY_WRITEBACK: %s of 0x%llx %ux%u format %u tile %d differs from the eager bytes at +0x%llx (run +0x%llx..+0x%llx)\n", what, static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.format, static_cast<int>(descriptor.tileMode), static_cast<unsigned long long>(at), static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end));
+            std::fflush(stderr);
+        }
+        return;
+    }
+}
+
+}
+
+std::vector<std::byte> StorageTexture::retiledForVerify(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, bool windowed) {
+    // Every byte no retile writes keeps the canary, in both the windowed and the whole result.
+    constexpr std::uint32_t canary = 0xa5c3e1f7u;
+    const auto elementBytes = BytesPerElement(descriptor.format);
+    const auto tiledBytes = (guestBytes + 3) & ~std::uint64_t{3};
+    DeviceBuffer tiled(context, static_cast<std::size_t>(tiledBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    Buffer host(context, static_cast<std::size_t>(tiledBytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    std::vector<SliceWindow> windows;
+    std::vector<std::uint64_t> positions;
+    std::uint64_t linearTotal = sliceLinearBytes * arrayLayers;
+    if (windowed) {
+        windows = sliceWindows(runs);
+        linearTotal = 0;
+        for (const auto& window : windows) {
+            positions.push_back(linearTotal);
+            linearTotal += (window.linearBytes + 255) & ~std::uint64_t{255};
+        }
+    }
+    DeviceBuffer linear(context, static_cast<std::size_t>(std::max<std::uint64_t>(linearTotal, 256)), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    detiler.BeginBatch();
+    CommandBatch batch(context);
+    const auto commands = batch.Handle();
+    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, tiled.Handle(), 0, VK_WHOLE_SIZE, canary);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    std::vector<VkBufferImageCopy> regions;
+    if (windowed) {
+        for (std::size_t i = 0; i < windows.size(); ++i) {
+            for (auto region : windows[i].regions) {
+                region.bufferOffset += positions[i];
+                regions.push_back(region);
+            }
+        }
+    } else {
+        regions = CopyRegions();
+    }
+    if (!regions.empty()) context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_GENERAL, linear.Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    if (windowed) {
+        for (std::size_t i = 0; i < windows.size(); ++i) {
+            const auto& window = windows[i];
+            const auto& mip = mips[window.level];
+            // The tiled buffer holds the whole surface: the window's tiled bytes at their own place.
+            auto range = window.window;
+            range.tiledBase = 0;
+            detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear.Handle(), positions[i], tiled.Handle(), geometry.GuestLayerOffset(window.layer) + mip.tiledOffset, mip, true, window.layer, geometry.thick, range);
+        }
+    } else {
+        for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+            for (std::uint32_t level = 0; level < mips.size(); ++level) {
+                if (!geometry.HasLayer(level, layer)) continue;
+                const auto& mip = mips[level];
+                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear.Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, tiled.Handle(), geometry.GuestLayerOffset(layer) + mip.tiledOffset, mip, true, layer, geometry.thick);
+            }
+        }
+    }
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    CopyBuffer(context, commands, tiled.Handle(), 0, host.Handle(), 0, static_cast<std::size_t>(tiledBytes));
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    batch.SubmitAndWait();
+    const auto bytes = host.Bytes();
+    return std::vector<std::byte>(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(guestBytes));
+}
+
+void StorageTexture::verifyBorrow(StorageTexture& source, const std::vector<bool>& units) {
+    if (!verifySample(verifyBorrowCalls)) return;
+    // Outside the refresh's exemption: a completion the wait runs flushes this image like any other.
+    struct Exempt {
+        const StorageTexture* previous;
+        ~Exempt() { refreshing = previous; }
+    } exempt{std::exchange(refreshing, nullptr)};
+    if (auto* recorder = Recorder::Active()) recorder->Sync();
+    // The borrowed units as this image's retile stores them, against the alias's: what its eager
+    // write-back would have put in memory for this image to read.
+    const auto runs = unitRuns(units);
+    const auto mine = retiledForVerify(runs, true);
+    const auto theirs = source.retiledForVerify(runs, true);
+    compareRetiled("an alias borrow", descriptor, mine, theirs, runs);
+}
+
+void StorageTexture::verifyThickWindows(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs) {
+    if (!verifySample(verifyThickCalls)) return;
+    if (auto* recorder = Recorder::Active()) recorder->Sync();
+    const auto windowed = retiledForVerify(runs, true);
+    const auto whole = retiledForVerify(runs, false);
+    compareRetiled("a thick partial write-back", descriptor, windowed, whole, runs);
+}
+
 std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
     static const bool disabled = std::getenv("APS5_NO_ALIAS_BORROW") != nullptr;
     if (disabled || !blockUnits) return nullptr;
     static const bool subrectDefault = std::getenv("APS5_SUBRECT_BORROW") != nullptr;
-    const bool subrect = LiveFlag("subrect_borrow", subrectDefault) && descriptor.mipCount == 1 && geometry.imageLayers == 1 && geometry.imageDepth == 1;
+    // Row aliases both ways under `lazy_writeback` (Refresh stores their edge units first), the
+    // shorter refreshing over the taller alone under `subrect_borrow` as before.
+    const bool lazy = LazyWriteBack();
+    const bool subrect = (lazy || LiveFlag("subrect_borrow", subrectDefault)) && descriptor.mipCount == 1 && geometry.imageLayers == 1 && geometry.imageDepth == 1;
     std::vector<std::shared_ptr<StorageTexture>> candidates;
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
         for (auto* texture : pending.textures) {
             if (texture == this || texture->descriptor.baseAddress != descriptor.baseAddress || !texture->blockUnits) continue;
-            if (texture->guestBytes != guestBytes && !(subrect && texture->guestBytes > guestBytes)) continue;
+            if (texture->guestBytes != guestBytes && !(subrect && (texture->guestBytes > guestBytes || lazy))) continue;
             if (auto alive = texture->weak_from_this().lock()) candidates.push_back(std::move(alive));
         }
     }
@@ -4123,7 +4449,9 @@ std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
         // for bit, as the guest bytes would.
         const bool sameShape = mine.width == theirs.width && mine.height == theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && mine.mipCount == theirs.mipCount && mine.tileMode == theirs.tileMode && mine.dimension == theirs.dimension && BytesPerElement(mine.format) == BytesPerElement(theirs.format) && geometry.imageLayers == candidate->geometry.imageLayers && geometry.imageDepth == candidate->geometry.imageDepth && trackedLayers == candidate->trackedLayers;
         const bool topRows = subrect && mine.width == theirs.width && mine.height <= theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && theirs.mipCount == 1 && mine.tileMode == theirs.tileMode && mine.dimension == theirs.dimension && BytesPerElement(mine.format) == BytesPerElement(theirs.format) && candidate->geometry.imageLayers == 1 && candidate->geometry.imageDepth == 1 && trackedLayers <= candidate->trackedLayers;
-        if ((sameShape || topRows) && candidate->Cached() && candidate->uploadedKeys == DccKeys::Uncompressed) return candidate;
+        // The taller one refreshing over the shorter: its rows below the alias's are its own.
+        const bool tallRows = subrect && lazy && mine.width == theirs.width && mine.height > theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && theirs.mipCount == 1 && mine.tileMode == theirs.tileMode && mine.dimension == theirs.dimension && BytesPerElement(mine.format) == BytesPerElement(theirs.format) && candidate->geometry.imageLayers == 1 && candidate->geometry.imageDepth == 1 && candidate->trackedLayers <= trackedLayers;
+        if ((sameShape || topRows || tallRows) && candidate->Cached() && candidate->uploadedKeys == DccKeys::Uncompressed) return candidate;
     }
     return nullptr;
 }
@@ -4348,6 +4676,22 @@ void StorageTexture::writeBack(std::uint64_t address, std::size_t bytes) {
         reconcilePending();
         return;
     }
+    // A thick surface's units under `lazy_writeback` off: every pending one at once, as the whole-
+    // surface tracking stored it; on, the units the access touches (the others stay on the GPU).
+    if (geometry.thick && blockUnits && selected < pendingCount) {
+        if (!LazyWriteBack()) {
+            layers = layerPending;
+        } else {
+            std::uint64_t storedBytes = 0, keptBytes = 0;
+            for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+                if (!layerPending[layer]) continue;
+                (layers[layer] ? storedBytes : keptBytes) += layerBytes(layer);
+            }
+            lazyThickStores.fetch_add(1, std::memory_order_relaxed);
+            lazyThickStoredBytes.fetch_add(storedBytes, std::memory_order_relaxed);
+            lazyThickKeptBytes.fetch_add(keptBytes, std::memory_order_relaxed);
+        }
+    }
     if (blockUnits && !each && selected < pendingCount) {
         const auto present = Recorder::Presents();
         if (present - partialWindowStart >= window) {
@@ -4379,6 +4723,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         StorageTexture& texture;
         ~Reconcile() { texture.reconcilePending(); }
     } reconcile{*this};
+    // APS5_VERIFY_LAZY_WRITEBACK: a thick block-unit store's windows against the whole-surface
+    // retile, before the keep decision below reads the stamps (the check's GPU wait runs
+    // completions, whose stores that decision must see).
+    if (geometry.thick && blockUnits && VerifyLazyWriteBack() && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr) verifyThickWindows(unitRuns(layers));
     const auto elementBytes = BytesPerElement(descriptor.format);
     // 64 KiB blocks the CPU wrote since the layer was last in sync keep the CPU's bytes: the game
     // may have reused the memory for something else entirely (see layerGeneration). A generation of
@@ -4486,6 +4834,27 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         settle(true);
         return;
     }
+    if (profile) {
+        // The [wb-cause] attribution: the surface, why it is stored, and for another image's
+        // refresh which image refreshes over it.
+        std::uint64_t storedBytes = 0;
+        for (const auto& [from, to] : keep) storedBytes += to - from;
+        char by[112] = "";
+        if (refreshing != nullptr && refreshing != this) {
+            const auto& other = refreshing->descriptor;
+            std::snprintf(by, sizeof(by), " for 0x%llx %ux%u fmt%u tile%d dim%d", static_cast<unsigned long long>(other.baseAddress), other.width, other.height, other.format, static_cast<int>(other.tileMode), static_cast<int>(other.dimension));
+        }
+        // The access the store answers, to a power of two (its own refresh or an eviction: none).
+        char access[32] = "";
+        if (flushRequestBytes != 0 && flushRequestBytes < guestBytes) std::snprintf(access, sizeof(access), " (access <=%llu KiB)", static_cast<unsigned long long>(std::bit_ceil(static_cast<std::uint64_t>(flushRequestBytes)) / 1024));
+        char key[288];
+        std::snprintf(key, sizeof(key), "0x%llx+0x%llx %ux%ux%u fmt%u tile%d dim%d%s <- %s%s%s", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.width, descriptor.height, descriptor.depthOrLastArray + 1u, descriptor.format, static_cast<int>(descriptor.tileMode), static_cast<int>(descriptor.dimension), blockUnits ? "" : " whole", flushReason != nullptr ? flushReason : "other", access, by);
+        auto& causes = Causes();
+        std::lock_guard lock(causes.mutex);
+        auto& totals = causes.totals[key];
+        ++totals.first;
+        totals.second += storedBytes;
+    }
     if (const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
         if (blockUnits) {
             // The kept blocks alone pass through the retiler (windows of their slices).
@@ -4534,7 +4903,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                 commands = recorder->Commands();
             }
             timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageWriteBack);
-            recorder->NoteTimedSurface(timing, descriptor.baseAddress, guestBytes, static_cast<std::uint32_t>(storageFormat), descriptor.format, descriptor.width, descriptor.height, "writeback-layers", static_cast<std::uint32_t>(keep.size()));
+            recorder->NoteTimedSurface(timing, descriptor.baseAddress, guestBytes, static_cast<std::uint32_t>(storageFormat), descriptor.format, descriptor.width, descriptor.height, CauseKind("writeback-layers"), static_cast<std::uint32_t>(keep.size()));
             recorder->Keep(linear, linear->Size());
             recorder->Keep(tiledScratch, tiledScratch->Size());
             for (const auto& slab : padding.slabs) recorder->Keep(slab);
@@ -4787,6 +5156,24 @@ std::uint64_t StorageTexture::GuestBytes() const {
 
 VkImageView StorageTexture::View() const {
     return view;
+}
+
+LazyWriteBackCounts CurrentLazyWriteBackCounts() {
+    LazyWriteBackCounts counts;
+    counts.thickStores = lazyThickStores.load(std::memory_order_relaxed);
+    counts.thickStoredBytes = lazyThickStoredBytes.load(std::memory_order_relaxed);
+    counts.thickKeptBytes = lazyThickKeptBytes.load(std::memory_order_relaxed);
+    counts.rowBorrows = lazyRowBorrows.load(std::memory_order_relaxed);
+    counts.rowBorrowBytes = lazyRowBorrowBytes.load(std::memory_order_relaxed);
+    counts.edgeUnits = lazyEdgeUnits.load(std::memory_order_relaxed);
+    counts.verifyChecks = lazyVerifyChecks.load(std::memory_order_relaxed);
+    counts.verifyMismatches = lazyVerifyMismatches.load(std::memory_order_relaxed);
+    return counts;
+}
+
+void SetLazyWriteBackModes(std::optional<bool> lazy, std::optional<bool> verify) {
+    lazyOverride.store(lazy.has_value() ? (*lazy ? 1 : 0) : -1, std::memory_order_relaxed);
+    lazyVerifyOverride.store(verify.has_value() ? (*verify ? 1 : 0) : -1, std::memory_order_relaxed);
 }
 
 }
