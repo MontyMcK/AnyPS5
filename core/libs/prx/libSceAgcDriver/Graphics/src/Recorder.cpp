@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CpuTimeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredVulkan.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/NativeFillCounters.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/NvPerfRanges.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
@@ -47,6 +48,73 @@ PerformanceControls& LivePerformanceControls() {
         return flags;
     }());
     return controls;
+}
+
+namespace {
+
+struct NativeFillTotals {
+    std::uint64_t fills = 0, bytes = 0, cpuFills = 0, refused = 0, verified = 0, mismatched = 0;
+    std::map<std::string, std::uint64_t> refusals;
+};
+
+struct NativeFillCounts {
+    std::mutex mutex;
+    NativeFillTotals total;
+    std::array<NativeFillTotals, 2> reported;
+};
+
+NativeFillCounts& NativeFills() {
+    static NativeFillCounts counts;
+    return counts;
+}
+
+}
+
+void CountNativeFill(std::size_t bytes, bool cpu) {
+    auto& counts = NativeFills();
+    std::lock_guard lock(counts.mutex);
+    ++counts.total.fills;
+    counts.total.bytes += bytes;
+    if (cpu) ++counts.total.cpuFills;
+}
+
+void CountNativeFillRefusal(const char* reason) {
+    auto& counts = NativeFills();
+    std::lock_guard lock(counts.mutex);
+    ++counts.total.refused;
+    ++counts.total.refusals[reason];
+}
+
+void CountNativeFillVerify(bool matched) {
+    auto& counts = NativeFills();
+    std::lock_guard lock(counts.mutex);
+    ++counts.total.verified;
+    if (!matched) ++counts.total.mismatched;
+}
+
+std::string NativeFillSummary(int consumer) {
+    auto& counts = NativeFills();
+    std::lock_guard lock(counts.mutex);
+    const auto& total = counts.total;
+    if (total.fills == 0 && total.refused == 0 && total.verified == 0) return {};
+    auto& last = counts.reported[consumer == 0 ? 0 : 1];
+    char text[256];
+    std::snprintf(text, sizeof(text), "native pattern fills: %llu replaced (%.1f MiB, %llu stored by the CPU), %llu refused", static_cast<unsigned long long>(total.fills - last.fills), static_cast<double>(total.bytes - last.bytes) / 1048576.0, static_cast<unsigned long long>(total.cpuFills - last.cpuFills), static_cast<unsigned long long>(total.refused - last.refused));
+    std::string line = text;
+    std::string reasons;
+    for (const auto& [reason, count] : total.refusals) {
+        const auto previous = last.refusals.find(reason);
+        const auto delta = count - (previous != last.refusals.end() ? previous->second : 0u);
+        if (delta == 0) continue;
+        reasons += (reasons.empty() ? " (" : ", ") + reason + " " + std::to_string(delta);
+    }
+    if (!reasons.empty()) line += reasons + ")";
+    if (total.verified != last.verified) {
+        std::snprintf(text, sizeof(text), ", verified %llu (%llu mismatched)", static_cast<unsigned long long>(total.verified - last.verified), static_cast<unsigned long long>(total.mismatched - last.mismatched));
+        line += text;
+    }
+    last = total;
+    return line;
 }
 
 namespace {
@@ -3278,7 +3346,9 @@ void Recorder::readGpuTiming(Batch& batch) {
     const double spanMs = spanLastTick > spanFirstTick ? static_cast<double>(spanLastTick - spanFirstTick) * period / 1e6 : 0.0;
     AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command, summed per batch; GPU busy %.0f ms = union of every timed range over all batches, %.0f%% of the %.0f ms GPU clock span from the first batch start to the last batch end; batch busy %.0f ms = union of the batch spans, GPU idle %.0f ms = span - batch busy; the leading figure is the program (dispatch) ranges alone; classes %.0f ms, all ranges %.0f ms summed per batch, untimed %.0f ms inside batches outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, busyMs, spanMs > 0 ? 100.0 * busyMs / spanMs : 0.0, spanMs, batchBusyMs, std::max(0.0, spanMs - batchBusyMs), timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
     for (std::size_t i = 0; i < hot.size() && i < 30; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
-    AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
+    // The native pattern fills of the window (they are timed in the "fill" class above).
+    const auto nativeFills = NativeFillSummary(0);
+    AgcDriver::ProfilePrint_nid_no_patch("; by class:%s%s%s\n", classes.c_str(), nativeFills.empty() ? "" : "; ", nativeFills.c_str());
     timingByKey.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
     // The marks stay: they are absolute GPU times, so the next report still merges against them.

@@ -210,10 +210,17 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
         return;
     }
+    // Live `native_pattern_fill` (default on): the title's dword pattern-fill kernel with one pattern
+    // dword and a known range runs as a native GPU fill (NativePatternFill.cpp).
+    NativeFillVerify nativeVerify;
+    if (nativePatternFill(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, indirectArguments != 0, localDevice, address, nativeVerify)) {
+        pendingDispatchPhases().outcome = DispatchOutcome::NativeFill;
+        return;
+    }
     // APS5_PIPELINED_DISPATCHES=1: a direct dispatch on the draw pipeline's queue keeps the pipeline
     // running; its device work becomes the committer's next job instead of a drain.
     static const bool pipelinedDispatches = std::getenv("APS5_PIPELINED_DISPATCHES") != nullptr;
-    bool deferDrain = pipelinedDispatches && DrawPipeline::Active() && indirectArguments == 0 && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
+    bool deferDrain = pipelinedDispatches && !nativeVerify.active && DrawPipeline::Active() && indirectArguments == 0 && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
     if (DrawPipeline::Active() && !deferDrain) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
     if (indirectArguments == 0 && copyBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice, address)) {
         pendingDispatchPhases().outcome = DispatchOutcome::CopyHle;
@@ -451,6 +458,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
+        // The re-entered dispatch stores the range again (natively or by the kernel) over the
+        // verify sample's poison: this sample is dropped, not compared.
+        nativeVerify.active = false;
         dispatch(queue, packet, submission, indirectArguments);
         return;
     }
@@ -655,6 +665,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     phaseTiming.Phase(PhaseDevice);
     if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, submission.queue, compiled);
     noteDwordFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, packet, indirectArguments, compute);
+    finishNativeFillVerify(nativeVerify);
     static const std::uint64_t traceWrite = [] { const char* text = std::getenv("APS5_TRACE_WRITE_ADDRESS"); return text != nullptr ? std::strtoull(text, nullptr, 0) : 0ull; }();
     if (traceWrite != 0) {
         for (const auto& binding : compiled.bindings) {

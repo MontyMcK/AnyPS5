@@ -13,13 +13,13 @@ enum DriverPhase { PhasePrologue, PhaseKey, PhaseLookup, PhaseValidate, PhaseVal
 
 enum DispatchClass : std::size_t { Queue0Direct, Queue0Indirect, OtherQueues, DispatchClassCount };
 
-enum class DispatchOutcome : std::size_t { Skipped = 0, Real, CopyHle, FillHle, SkippedMemo, Count };
+enum class DispatchOutcome : std::size_t { Skipped = 0, Real, CopyHle, FillHle, SkippedMemo, NativeFill, Count };
 
 inline constexpr const char* DriverPhaseNames[DriverPhaseCount] = {"prologue", "key", "lookup", "validate", "validate GPU wait", "relock", "capture", "recompile", "insert", "queued-label check", "snapshots", "prepare: key", "prepare: find", "prepare: precollect", "prepare: presync", "prepare: stage A (miss)", "prepare: other", "recipe pre-check", "lock wait", "labels", "note writers", "device call", "tail", "epilogue"};
 
 inline constexpr const char* DispatchClassNames[DispatchClassCount] = {"queue 0 direct", "queue 0 indirect", "other queues"};
 
-inline constexpr const char* DispatchOutcomeNames[static_cast<std::size_t>(DispatchOutcome::Count)] = {"skipped", "real", "copy HLE", "fill HLE", "skipped (memo)"};
+inline constexpr const char* DispatchOutcomeNames[static_cast<std::size_t>(DispatchOutcome::Count)] = {"skipped", "real", "copy HLE", "fill HLE", "skipped (memo)", "native fill"};
 
 struct DriverPhaseTotals {
     std::array<double, DriverPhaseCount> ms{};

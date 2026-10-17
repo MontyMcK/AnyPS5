@@ -1969,7 +1969,11 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
 }
 
 bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern) {
-    if (!state->recorder || bytes == 0 || bytes % 16 != 0 || address % 16 != 0) return false;
+    // A 16-byte pattern is stored in whole patterns; one repeated dword (vkCmdFillBuffer) needs only
+    // dword alignment (the native pattern fill of the title's dword fill kernel).
+    const bool dwordUniform = pattern[0] == pattern[1] && pattern[1] == pattern[2] && pattern[2] == pattern[3];
+    const std::size_t granule = dwordUniform ? 4u : 16u;
+    if (!state->recorder || bytes == 0 || bytes % granule != 0 || address % granule != 0) return false;
     auto& recorder = *state->recorder;
     // Finished batches are retired first (one fence status check, as WriteLabelOnGpu does): their
     // completion labels landed and their copied writers are delisted, so a batch the idle GPU already
@@ -1978,7 +1982,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     if (OpportunisticReap()) recorder.Reap();
     const auto context = graphicsContext();
     const Graphics::HostImport* import = Graphics::HostImportFor(context, address, bytes);
-    if (import == nullptr) return false;
+    if (import == nullptr || (address - import->base) % 4u != 0) return false;
     // Earlier recorded work that stores into the range must land before the fill, or it would
     // overwrite the fill later. Stores the GPU makes (direct dispatch writes, GPU labels, earlier
     // fills, GPU-direct write-backs) are ordered by the fill's own barrier below (ALL_COMMANDS ->
@@ -2033,7 +2037,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
             // The sync ran completions, whose write-backs can refresh the import table and retire
             // the import looked up above; the caller stores the fill itself when it is gone.
             import = Graphics::HostImportFor(context, address, bytes);
-            if (import == nullptr) return false;
+            if (import == nullptr || (address - import->base) % 4u != 0) return false;
         } else {
             ++ordered;
         }
