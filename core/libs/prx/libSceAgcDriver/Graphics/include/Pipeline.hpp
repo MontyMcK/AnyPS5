@@ -92,6 +92,13 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
 // `setLayout` is the layout the DescriptorCache builds from it): the journal replay's entry, which
 // has no ShaderResources. `created` reports whether this call built and inserted the pipeline.
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, std::span<const std::uint32_t> layoutKey, VkDescriptorSetLayout setLayout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool* created = nullptr);
+// The journal replay's build of one configuration (on a replay thread): Present when the store
+// holds it or the title or another replay thread is building it, Deferred when a title build is
+// held (GamePipelineBuild; nothing is built), else Built once the pipeline is built and inserted.
+// While it builds, the configuration is listed as in flight: a draw that needs it waits for this
+// build (an asynchronous draw as for its own compile) instead of building it again.
+enum class PipelineReplayOutcome;
+PipelineReplayOutcome ReplayCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, std::span<const std::uint32_t> layoutKey, VkDescriptorSetLayout setLayout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout);
 // Cumulative pipeline store outcomes since start-up (the [pipecache] line reports 10 s windows).
 struct PipelineStoreCounters {
     std::uint64_t hits = 0;

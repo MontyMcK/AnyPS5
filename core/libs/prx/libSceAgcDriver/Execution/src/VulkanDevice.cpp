@@ -45,6 +45,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <map>
+#include <set>
 #include <mutex>
 #include <SDL_loadso.h>
 #include <SDL_error.h>
@@ -362,6 +363,11 @@ struct VulkanDevice::State {
     // touch the map, recipes hold weak references to its objects.
     std::mutex computePipelinesMutex;
     std::map<ComputePipelineKey, std::shared_ptr<ComputePipelineObjects>> computePipelines;
+    // Modules the journal replay is building now, with the set layout each is built over (under
+    // computePipelinesMutex): a dispatch of one over the same layout waits on computeReplayIdle for
+    // that build instead of building the pipeline again.
+    std::map<ComputePipelineKey, VkDescriptorSetLayout> computeReplaying;
+    std::condition_variable computeReplayIdle;
     // The journal replay building this device's pipelines on its own threads; drained first at
     // teardown and before a replacement.
     std::shared_ptr<Graphics::PipelineJournalReplay> journalReplay;
@@ -1532,6 +1538,9 @@ void VulkanDevice::startJournalReplay() {
 // dispatch builds at the first use of a module, and what the journal replay builds on its own
 // threads before that use.
 std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress) {
+    // The title first: the journal replay starts no build while a dispatch's runs (a no-op on a
+    // replay thread).
+    const Graphics::GamePipelineBuild game;
     const auto context = graphicsContext();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto objects = std::make_shared<ComputePipelineObjects>();
@@ -1565,7 +1574,11 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     pipelineInfo.layout = objects->layout;
     if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
     const auto createStarted = std::chrono::steady_clock::now();
-    check(state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(state->device, context.pipelineCache, 1, &pipelineInfo, nullptr, &objects->pipeline), "vkCreateComputePipelines");
+    {
+        // A replay thread compiles at low priority (raised while the title builds).
+        const Graphics::ReplayCompileScope compile;
+        check(state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(state->device, context.pipelineCache, 1, &pipelineInfo, nullptr, &objects->pipeline), "vkCreateComputePipelines");
+    }
     const auto createSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - createStarted).count();
     if (createSeconds > 0.25) std::fprintf(stderr, "[dispatch] compute pipeline for %zu SPIR-V words (program 0x%llx) took %.2f s%s\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress), createSeconds, Graphics::PipelineJournalReplaying() ? " (journal replay)" : "");
     Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);
@@ -1587,22 +1600,52 @@ std::uint64_t VulkanDevice::ComputePipelinesCreated() const {
     return state->computePipelinesCreated.load(std::memory_order_relaxed);
 }
 
-bool VulkanDevice::ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants, std::span<const std::uint32_t> layoutKey) {
+Graphics::PipelineReplayOutcome VulkanDevice::ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants, std::span<const std::uint32_t> layoutKey) {
+    using Outcome = Graphics::PipelineReplayOutcome;
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     const auto key = ComputePipelineKey::Of(shader, pushConstants);
-    if (key.identity.Empty()) return false;
-    {
+    if (key.identity.Empty()) return Outcome::Rejected;
+    const auto resident = [&] {
         std::lock_guard pipelines(state->computePipelinesMutex);
-        if (state->computePipelines.contains(key)) return false;
-    }
+        return state->computePipelines.contains(key) || state->computeReplaying.contains(key);
+    };
+    if (resident()) return Outcome::Present;
     const auto context = graphicsContext();
     std::vector<VkDescriptorSetLayoutBinding> description;
-    if (context.descriptorCache == nullptr || !Graphics::DescribeLayoutKey(layoutKey, description)) return false;
+    if (context.descriptorCache == nullptr || !Graphics::DescribeLayoutKey(layoutKey, description)) return Outcome::Rejected;
     const auto setLayout = context.descriptorCache->Layout(layoutKey, description);
-    auto objects = createComputePipeline(shader, setLayout, pushConstants ? VK_SHADER_STAGE_COMPUTE_BIT : 0u, 0);
-    objects->replayed = true;
-    std::lock_guard pipelines(state->computePipelinesMutex);
-    return state->computePipelines.try_emplace(key, std::move(objects)).second;
+    {
+        // Nothing resident or in flight is built again, and no build starts while the title builds.
+        std::lock_guard pipelines(state->computePipelinesMutex);
+        if (state->computePipelines.contains(key) || state->computeReplaying.contains(key)) return Outcome::Present;
+        if (Graphics::GamePipelineBuildPending()) return Outcome::Deferred;
+        state->computeReplaying.emplace(key, setLayout);
+    }
+    // Listed as in flight until it ends, however it ends: a dispatch of the module waits for it.
+    // The objects are inserted and the module taken off the in-flight list in one step, also when
+    // the build throws (nothing is inserted then).
+    struct InFlight {
+        State& state;
+        const ComputePipelineKey& key;
+        bool& inserted;
+        std::shared_ptr<ComputePipelineObjects> objects;
+        ~InFlight() {
+            {
+                std::lock_guard pipelines(state.computePipelinesMutex);
+                if (objects != nullptr) inserted = state.computePipelines.try_emplace(key, objects).second;
+                state.computeReplaying.erase(key);
+            }
+            state.computeReplayIdle.notify_all();
+        }
+    };
+    bool inserted = false;
+    {
+        InFlight flight{*state, key, inserted, nullptr};
+        auto objects = createComputePipeline(shader, setLayout, pushConstants ? VK_SHADER_STAGE_COMPUTE_BIT : 0u, 0);
+        objects->replayed = true;
+        flight.objects = std::move(objects);
+    }
+    return inserted ? Outcome::Built : Outcome::Present;
 }
 
 // The swapchain and presentation state for the device's surface (state->surface, made for
@@ -4512,6 +4555,24 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     // the module: a dispatch whose own layout differs builds its pipeline and takes the slot (the
     // replayed objects go with their last holder).
     if (objects != nullptr && objects->replayed && objects->resourcesLayout != resources->Layout()) objects = nullptr;
+    // A miss holds a title build from here on (taken under the compute map's mutex, so a replay
+    // thread checking the map meanwhile defers instead of building the module too).
+    std::optional<Graphics::GamePipelineBuild> titleBuild;
+    if (objects == nullptr && !pipelineKey.identity.Empty()) {
+        std::unique_lock pipelines(state->computePipelinesMutex);
+        titleBuild.emplace();
+        if (const auto replaying = state->computeReplaying.find(pipelineKey); replaying != state->computeReplaying.end() && replaying->second == resources->Layout()) {
+            // The journal replay is building this module's pipeline over this dispatch's layout:
+            // wait for that build rather than build it again (the held title build raises it to
+            // normal priority and holds the replay's other threads back; the build needs nothing
+            // this thread holds). A failed build leaves nothing mapped and this dispatch builds it.
+            const auto waitStart = std::chrono::steady_clock::now();
+            state->computeReplayIdle.wait(pipelines, [&] { return !state->computeReplaying.contains(pipelineKey); });
+            Graphics::CountGameWaitOnReplay(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count());
+        }
+        if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end() && !(found->second->replayed && found->second->resourcesLayout != resources->Layout())) objects = found->second;
+        if (objects != nullptr) titleBuild.reset();
+    }
     static const bool verifySetLayouts = std::getenv("APS5_VERIFY_SET_LAYOUTS") != nullptr;
     if (verifySetLayouts && objects != nullptr) require(objects->resourcesLayout == resources->Layout(), "the resident compute pipeline's set layout differs from the dispatch's");
     if (objects == nullptr) {
@@ -4535,6 +4596,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             }
         }
         timer.phase(PhasePipeline);
+        titleBuild.reset();
     }
     // Recorded into the device's open batch: the CPU moves on to the next command while the GPU
     // works; the batch is waited for where the guest expects results (labels, flips, CPU reads).

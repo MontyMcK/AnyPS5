@@ -55,6 +55,50 @@ void EncodePipelineModule(const ShaderRecompiler::RecompileResult& result, std::
 // exactly these four fields), for DescriptorCache::Layout; false for a malformed key.
 [[nodiscard]] bool DescribeLayoutKey(std::span<const std::uint32_t> key, std::vector<VkDescriptorSetLayoutBinding>& bindings);
 
+// The title first: a pipeline build on behalf of a draw or dispatch (or a wait for one) is held in
+// a GamePipelineBuild for its duration. While one is held the replay starts no build (a worker
+// waits until none has been held for a short quiet window), and a replay build already running is
+// raised from its low priority to normal until it ends, so nothing the title then waits on (the
+// build itself, a driver lock it holds) is starved by the title's own threads. A no-op on a replay
+// thread. Process-wide: one device replays at a time. Lock-free: it may be held under the store's
+// or the compute map's mutex.
+class GamePipelineBuild {
+public:
+    GamePipelineBuild();
+    ~GamePipelineBuild();
+    GamePipelineBuild(const GamePipelineBuild&) = delete;
+    GamePipelineBuild& operator=(const GamePipelineBuild&) = delete;
+
+private:
+    bool counted = false;
+};
+// Around a driver pipeline compile (vkCreate*Pipelines) on a replay thread: the thread runs at
+// THREAD_PRIORITY_LOWEST for the compile unless a title build is held, and is raised back to
+// normal by a title build that starts meanwhile and when the scope ends. Replay threads run at
+// normal priority everywhere else, so the store, descriptor cache and compute map locks they take
+// briefly (which every draw and dispatch also takes) are never held by a starved thread. A no-op
+// on other threads.
+class ReplayCompileScope {
+public:
+    ReplayCompileScope();
+    ~ReplayCompileScope();
+    ReplayCompileScope(const ReplayCompileScope&) = delete;
+    ReplayCompileScope& operator=(const ReplayCompileScope&) = delete;
+
+private:
+    bool active = false;
+};
+// Whether a title pipeline build is held now (the replay defers a build it was about to start).
+[[nodiscard]] bool GamePipelineBuildPending();
+// A title build that found its pipeline being built by the replay and waited for that build
+// instead of building it again (APS5_PROFILE_DRAW counters).
+void CountGameWaitOnReplay(double milliseconds);
+
+// What one replay entry came to: built and inserted, present (resident, or already being built by
+// the title or another replay thread), rejected (unusable), or deferred (a title build started; the
+// entry is tried again once the title is quiet).
+enum class PipelineReplayOutcome { Built, Present, Rejected, Deferred };
+
 struct PipelineJournalCounters {
     std::uint64_t loadedRecipes = 0;
     std::uint64_t loadedModules = 0;
@@ -74,6 +118,18 @@ struct PipelineJournalCounters {
     std::uint64_t recordedModules = 0;
     std::uint64_t writtenBytes = 0;
     std::uint64_t writeFailures = 0;
+    // The game-first gate: worker pauses for title builds (and their total), entries deferred
+    // because a title build started, title builds that started while a replay build ran (each
+    // raised the running replay builds' priority), title waits on a replay build of the same
+    // pipeline (and their total), and the replay's own build time (total and longest).
+    std::uint64_t replayPauses = 0;
+    double replayPausedMs = 0;
+    std::uint64_t replayDeferred = 0;
+    std::uint64_t gameBuildsOverlapped = 0;
+    std::uint64_t gameWaitsOnReplay = 0;
+    double gameWaitOnReplayMs = 0;
+    double replayBuildMs = 0;
+    double replayLongestBuildMs = 0;
 };
 
 // A decimal switch of the pipeline store or journal, or its default when unset or malformed (reported once).
@@ -89,8 +145,10 @@ void RecordComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool
 void FlushPipelineJournal();
 void ReportPipelineJournal();
 
-// Cancel stops the threads taking further entries (the pipeline each is building completes);
-// Wait joins them. A device cancels its replay before it is replaced or destroyed.
+// The replay runs on a few low-priority threads (APS5_PIPELINE_JOURNAL_THREADS, 2 by default) and
+// yields to the title (GamePipelineBuild). Cancel stops the threads taking further entries and
+// wakes a paused one (the pipeline each is building completes); Wait joins them. A device cancels
+// its replay before it is replaced or destroyed.
 class PipelineJournalReplay {
 public:
     virtual ~PipelineJournalReplay() = default;
@@ -100,7 +158,7 @@ public:
 };
 
 struct PipelineJournalHooks {
-    std::function<bool(const ShaderRecompiler::RecompileResult& shader, bool pushConstants, std::span<const std::uint32_t> layoutKey)> compute;
+    std::function<PipelineReplayOutcome(const ShaderRecompiler::RecompileResult& shader, bool pushConstants, std::span<const std::uint32_t> layoutKey)> compute;
 };
 
 // The journal belongs to the device that wrote it, named by the same properties as the driver's

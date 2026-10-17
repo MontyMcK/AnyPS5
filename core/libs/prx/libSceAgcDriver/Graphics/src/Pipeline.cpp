@@ -19,6 +19,7 @@
 #include <functional>
 #include <list>
 #include <mutex>
+#include <optional>
 #include <pthread.h>
 #include <string_view>
 #include <thread>
@@ -122,6 +123,9 @@ void ValidateViewport(const Context& context, const VkViewport& viewport) {
 Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : Pipeline(context, state, vertexInput, resources.Layout(), shaders, attachmentLayout) {}
 
 Pipeline::Pipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, VkDescriptorSetLayout setLayout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) : context(context), _modules(shaders.size()), attachments(state.colors.size() + (state.depth ? 1u : 0u)), colorAttachments(state.colors.size()), depthBounds(state.depth.has_value() && state.depthBoundsTest), depthBias(state.depth.has_value() && state.depthBias) {
+    // The title first: the journal replay starts no build while this one runs (a no-op on a
+    // replay thread).
+    const GamePipelineBuild game;
     PerformanceTimer timing("Vulkan.GraphicsPipeline");
     // A cached pipeline may outlive its device's teardown (see ClearCachedPipelines); it must not keep
     // the buffer pool, which is reset with the device, alive past it.
@@ -306,9 +310,13 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         pipelineInfo.renderPass = renderPass;
         timing.Mark("modules_and_state");
         const auto createStarted = std::chrono::steady_clock::now();
-        Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
+        {
+            // A replay thread compiles at low priority (raised while the title builds).
+            const ReplayCompileScope compile;
+            Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
+        }
         const auto createSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - createStarted).count();
-        if (createSeconds > 0.25) std::fprintf(stderr, "[draw] graphics pipeline took %.2f s\n", createSeconds);
+        if (createSeconds > 0.25) std::fprintf(stderr, "[draw] graphics pipeline took %.2f s%s\n", createSeconds, PipelineJournalReplaying() ? " (journal replay)" : "");
         timing.Mark("create");
         if (context.pipelineExecutableInfo) {
             // Names the pipeline's stages (their variant ids) in its statistics line.
@@ -787,6 +795,9 @@ struct PipelineStore {
     std::uint64_t generation = 1;
     std::uint64_t identityHits = 0;
     std::unordered_map<std::uint64_t, std::vector<std::byte>> pending;
+    // Journal replay builds in flight, by key hash (the key): a draw of the same configuration waits
+    // for the build (idle is notified when one ends) instead of building it again.
+    std::unordered_map<std::uint64_t, std::vector<std::byte>> replaying;
     std::unordered_set<std::uint64_t> failed;
     std::size_t inflight = 0;
     std::condition_variable idle;
@@ -998,18 +1009,31 @@ void compileInBackground(PipelineStore& store, const Context& context, const Sta
     });
 }
 
-std::shared_ptr<Pipeline> cachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, std::span<const std::uint32_t> layoutKey, VkDescriptorSetLayout setLayout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool mayDefer, bool* created) {
+// `replayOutcome` is set for the journal replay's call (ReplayCachedPipeline), null for a draw's.
+std::shared_ptr<Pipeline> cachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, std::span<const std::uint32_t> layoutKey, VkDescriptorSetLayout setLayout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool mayDefer, bool* created, PipelineReplayOutcome* replayOutcome = nullptr) {
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (created != nullptr) *created = false;
+    if (replayOutcome != nullptr) *replayOutcome = PipelineReplayOutcome::Present;
+    // The replay builds nothing a draw could not find again.
+    if (disabled && replayOutcome != nullptr) return nullptr;
     if (disabled) ForkTrap("pipeline uncached");
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, setLayout, shaders, attachmentLayout);
     auto& store = Pipelines();
     std::unique_lock lock(store.mutex);
     reportPipelines(store);
     // A pipeline this configuration may not share is built without the store's mutex.
-    const auto buildPrivate = [&] {
+    const auto buildPrivate = [&]() -> std::shared_ptr<Pipeline> {
+        if (replayOutcome != nullptr) return nullptr;
+        // Held before the mutex is released, so a replay thread never sees the miss unclaimed.
+        const GamePipelineBuild game;
         lock.unlock();
         return std::make_shared<Pipeline>(context, state, vertexInput, setLayout, shaders, attachmentLayout);
+    };
+    // The title's [pipecache] counters: a replay's private configuration builds nothing.
+    const auto countUncached = [&] {
+        if (replayOutcome != nullptr) return;
+        ++store.uncached;
+        ++store.totals.uncached;
     };
     const bool identity = pipelineIdentity();
     auto* last = identity ? &ThreadLastPipeline() : nullptr;
@@ -1035,38 +1059,131 @@ std::shared_ptr<Pipeline> cachedPipeline(const Context& context, const State& st
     };
     if (key.empty()) {
         ForkTrap("pipeline uncached");
-        ++store.uncached;
-        ++store.totals.uncached;
+        countUncached();
         return buildPrivate();
     }
     const auto hash = hashKey(key);
-    if (const auto found = store.index.find(hash); found != store.index.end()) {
-        const auto it = found->second;
-        if (it->key == key) {
-            // The key names the device handle, which the loader may reuse for a device created after
-            // this one was destroyed without ClearCachedPipelines: such an entry is a miss.
+    // A resident entry of this key at `found`: the hit (an entry of a device that is gone is
+    // dropped first).
+    const auto residentAt = [&](decltype(store.index)::iterator found, const std::vector<std::byte>& wanted) -> std::shared_ptr<Pipeline> {
+        if (found == store.index.end() || found->second->key != wanted) return nullptr;
+        // The key names the device handle, which the loader may reuse for a device created after
+        // this one was destroyed without ClearCachedPipelines: such an entry is a miss.
+        if (!alive(*found->second, context)) {
+            ForkTrap("pipeline abandoned");
+            abandon(store, found->second);
+            return nullptr;
+        }
+        ++store.hits;
+        ++store.totals.hits;
+        store.entries.splice(store.entries.end(), store.entries, found->second);
+        remember(found->second, wanted);
+        return found->second->pipeline;
+    };
+    const auto resident = [&](const std::vector<std::byte>& wanted) { return residentAt(store.index.find(hash), wanted); };
+    const auto found = store.index.find(hash);
+    if (found != store.index.end() && found->second->key != key) {
+        // A different configuration with the same hash keeps the resident entry; this one stays private.
+        ForkTrap("pipeline collision");
+        countUncached();
+        return buildPrivate();
+    }
+    // A miss built here, outside the mutex: a draw that finds its pipeline resident is not held
+    // behind another thread's build, and the driver compiles in parallel when several threads build
+    // at once. A replay build is listed as in flight meanwhile (store.replaying) so a draw of the
+    // same configuration waits for it; a concurrent build of the same key that was inserted first
+    // is kept.
+    const auto buildMissed = [&](std::vector<std::byte> ownKey, PipelineReplayOutcome* outcome) -> std::shared_ptr<Pipeline> {
+        ++store.misses;
+        ++store.totals.misses;
+        const bool replaying = outcome != nullptr || PipelineJournalReplaying();
+        if (outcome != nullptr) store.replaying.emplace(hash, ownKey);
+        // A title build is held before the mutex is released, so a replay thread checking the
+        // store meanwhile defers rather than building this pipeline too.
+        std::optional<GamePipelineBuild> game;
+        if (outcome == nullptr) game.emplace();
+        const auto settle = [&] {
+            if (outcome == nullptr) return;
+            store.replaying.erase(hash);
+            store.idle.notify_all();
+        };
+        lock.unlock();
+        std::shared_ptr<Pipeline> pipeline;
+        try {
+            pipeline = std::make_shared<Pipeline>(context, state, vertexInput, setLayout, shaders, attachmentLayout);
+        } catch (...) {
+            lock.lock();
+            settle();
+            throw;
+        }
+        lock.lock();
+        // Waiters wake once the mutex is released, after the insert below.
+        settle();
+        if (const auto found = store.index.find(hash); found != store.index.end()) {
+            const auto it = found->second;
+            if (it->key != ownKey) {
+                // Another configuration took the hash meanwhile: this one stays private.
+                ++store.uncached;
+                ++store.totals.uncached;
+                return pipeline;
+            }
             if (alive(*it, context)) {
-                ++store.hits;
-                ++store.totals.hits;
+                // A concurrent build of the same key (a draw, an async compile) was inserted first
+                // and is kept; this one goes with its last holder.
                 store.entries.splice(store.entries.end(), store.entries, it);
-                remember(it, key);
+                remember(it, ownKey);
                 return it->pipeline;
             }
-            ForkTrap("pipeline abandoned");
             abandon(store, it);
-        } else {
-            // A different configuration with the same hash keeps the resident entry; this one stays private.
-            ForkTrap("pipeline collision");
-            ++store.uncached;
-            ++store.totals.uncached;
-            return buildPrivate();
+        }
+        // Entries of another device belong to one the driver replaced (it does so under the
+        // GpuMutex before any draw reaches the new device), whose objects went with it: forget them.
+        for (auto it = store.entries.begin(); it != store.entries.end();) {
+            it = alive(*it, context) ? std::next(it) : abandon(store, it);
+        }
+        if (!insertPipeline(store, context.device, context.bufferPool, hash, ownKey, pipeline, replaying)) return pipeline;
+        if (const auto found = store.index.find(hash); found != store.index.end() && found->second->pipeline == pipeline) remember(found->second, ownKey);
+        lock.unlock();
+        if (created != nullptr) *created = true;
+        if (outcome != nullptr) *outcome = PipelineReplayOutcome::Built;
+        recordPipeline(state, vertexInput, layoutKey, shaders, attachmentLayout);
+        return pipeline;
+    };
+    if (auto hit = residentAt(found, key)) return hit;
+    ForkTrap("pipeline miss");
+    // The replay never builds what is resident, or in flight for a draw (an asynchronous compile)
+    // or another replay thread, and starts no build while the title holds one (it defers; the entry
+    // is tried again once the title is quiet).
+    if (replayOutcome != nullptr) {
+        if (store.pending.contains(hash) || store.replaying.contains(hash)) return nullptr;
+        if (GamePipelineBuildPending()) {
+            *replayOutcome = PipelineReplayOutcome::Deferred;
+            return nullptr;
         }
     }
-    ForkTrap("pipeline miss");
-    if (const auto found = store.pending.find(hash); found != store.pending.end() && (!mayDefer || found->second != key)) {
-        ++store.uncached;
-        ++store.totals.uncached;
+    const auto replayBuild = store.replaying.find(hash);
+    const auto asyncBuild = store.pending.find(hash);
+    if ((replayBuild != store.replaying.end() && replayBuild->second != key) || (asyncBuild != store.pending.end() && (!mayDefer || asyncBuild->second != key))) {
+        countUncached();
         return buildPrivate();
+    }
+    const bool replayBuilding = replayBuild != store.replaying.end();
+    if (replayBuilding && !(asyncPipelines() && mayDefer && !store.failed.contains(hash))) {
+        // The replay is building exactly this pipeline: wait for its build rather than build it
+        // again (the title's wait raises the build to normal priority, and holds the other replay
+        // threads back). A build that failed leaves nothing resident and this call builds it.
+        std::vector<std::byte> wanted(key.begin(), key.end());
+        const GamePipelineBuild game;
+        const auto waitStart = std::chrono::steady_clock::now();
+        store.idle.wait(lock, [&] { return !store.replaying.contains(hash); });
+        CountGameWaitOnReplay(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count());
+        if (auto hit = resident(wanted)) return hit;
+        if (const auto found = store.index.find(hash); found != store.index.end() || store.pending.contains(hash) || store.replaying.contains(hash)) {
+            // Another configuration took the hash meanwhile, or another build of it started: private.
+            countUncached();
+            return buildPrivate();
+        }
+        return buildMissed(std::move(wanted), nullptr);
     }
     if (asyncPipelines() && mayDefer && !store.failed.contains(hash)) {
         static const auto waitMs = [] {
@@ -1081,14 +1198,20 @@ std::shared_ptr<Pipeline> cachedPipeline(const Context& context, const State& st
             }
             if (waitMs == 0 || store.waitedInWindow > std::chrono::milliseconds(100)) return nullptr;
             const std::vector<std::byte> wanted = key;
-            store.idle.wait_for(lock, std::chrono::milliseconds(waitMs), [&] { return !store.pending.contains(hash); });
+            // A replay build waited for holds the replay's other threads back and runs at normal
+            // priority meanwhile, as the title's own compile would.
+            std::optional<GamePipelineBuild> game;
+            const bool onReplay = store.replaying.contains(hash);
+            if (onReplay) game.emplace();
+            store.idle.wait_for(lock, std::chrono::milliseconds(waitMs), [&] { return !store.pending.contains(hash) && !store.replaying.contains(hash); });
             store.waitedInWindow += std::chrono::steady_clock::now() - now;
+            if (onReplay) CountGameWaitOnReplay(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - now).count());
             const auto found = store.index.find(hash);
             if (found == store.index.end() || found->second->key != wanted || !alive(*found->second, context)) return nullptr;
             store.entries.splice(store.entries.end(), store.entries, found->second);
             return found->second->pipeline;
         };
-        if (store.pending.contains(hash)) {
+        if (replayBuilding || store.pending.contains(hash)) {
             if (auto ready = waitForCompile()) return ready;
             ++store.asyncSkips;
             return nullptr;
@@ -1103,45 +1226,9 @@ std::shared_ptr<Pipeline> cachedPipeline(const Context& context, const State& st
         ++store.asyncSkips;
         return nullptr;
     }
-    ++store.misses;
-    ++store.totals.misses;
-    // Built outside the mutex: a draw that finds its pipeline resident is not held behind another
-    // thread's build (the journal replay builds here too), and the driver compiles in parallel when
-    // several threads build at once. The key is this thread's copy: the shared scratch key (identity
-    // switch off) belongs to whoever holds the mutex.
-    std::vector<std::byte> ownKey(key.begin(), key.end());
-    const bool replaying = PipelineJournalReplaying();
-    lock.unlock();
-    auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, setLayout, shaders, attachmentLayout);
-    lock.lock();
-    if (const auto found = store.index.find(hash); found != store.index.end()) {
-        const auto it = found->second;
-        if (it->key != ownKey) {
-            // Another configuration took the hash meanwhile: this one stays private.
-            ++store.uncached;
-            ++store.totals.uncached;
-            return pipeline;
-        }
-        if (alive(*it, context)) {
-            // A concurrent build of the same key (a draw, the replay, an async compile) was inserted
-            // first and is kept; this one goes with its last holder.
-            store.entries.splice(store.entries.end(), store.entries, it);
-            remember(it, ownKey);
-            return it->pipeline;
-        }
-        abandon(store, it);
-    }
-    // Entries of another device belong to one the driver replaced (it does so under the GpuMutex
-    // before any draw reaches the new device), whose objects went with it: forget them.
-    for (auto it = store.entries.begin(); it != store.entries.end();) {
-        it = alive(*it, context) ? std::next(it) : abandon(store, it);
-    }
-    if (!insertPipeline(store, context.device, context.bufferPool, hash, ownKey, pipeline, replaying)) return pipeline;
-    if (const auto found = store.index.find(hash); found != store.index.end() && found->second->pipeline == pipeline) remember(found->second, ownKey);
-    lock.unlock();
-    if (created != nullptr) *created = true;
-    recordPipeline(state, vertexInput, layoutKey, shaders, attachmentLayout);
-    return pipeline;
+    // The key is this thread's copy: the shared scratch key (identity switch off) belongs to
+    // whoever holds the mutex.
+    return buildMissed(std::vector<std::byte>(key.begin(), key.end()), replayOutcome);
 }
 
 }
@@ -1152,6 +1239,12 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
 
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, std::span<const std::uint32_t> layoutKey, VkDescriptorSetLayout setLayout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool* created) {
     return cachedPipeline(context, state, vertexInput, layoutKey, setLayout, shaders, attachmentLayout, false, created);
+}
+
+PipelineReplayOutcome ReplayCachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, std::span<const std::uint32_t> layoutKey, VkDescriptorSetLayout setLayout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    auto outcome = PipelineReplayOutcome::Present;
+    static_cast<void>(cachedPipeline(context, state, vertexInput, layoutKey, setLayout, shaders, attachmentLayout, false, nullptr, &outcome));
+    return outcome;
 }
 
 void BuildPipelineStoreKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& vertexInput, std::span<const std::uint32_t> layoutKey, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
@@ -1203,7 +1296,7 @@ std::shared_ptr<Pipeline> TakePeekedPipeline(const Context& context, const Pipel
 void ClearCachedPipelines(VkDevice device) {
     auto& store = Pipelines();
     std::unique_lock lock(store.mutex);
-    store.idle.wait(lock, [&] { return store.inflight == 0; });
+    store.idle.wait(lock, [&] { return store.inflight == 0 && store.replaying.empty(); });
     store.failed.clear();
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         if (it->device != device) {

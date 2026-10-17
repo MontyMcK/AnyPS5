@@ -37,24 +37,36 @@
 
 namespace AgcDriver::Graphics {
 
+namespace {
+
+// Per thread, by the word buffer's address. An entry's pin keeps its buffer alive, so a live
+// buffer at the entry's address with the entry's size is the very buffer it hashed. The modules
+// are the recompiler's cached variants and specialized modules (results share their buffers),
+// which outlive the entries anyway; past the bound the thread forgets them all.
+struct ModuleHashEntry {
+    ShaderRecompiler::SharedSpirv pin;
+    std::size_t size = 0;
+    SpirvContentHash hash;
+};
+
+using ModuleHashes = std::unordered_map<const std::uint32_t*, ModuleHashEntry>;
+
+ModuleHashes& threadModuleHashes() {
+    thread_local ModuleHashes known;
+    return known;
+}
+
+}
+
 SpirvContentHash ModuleContentHash(const ShaderRecompiler::SharedSpirv& spirv) {
     const auto& words = spirv.Words();
     if (words.empty()) return {};
-    // Per thread, by the word buffer's address. An entry's pin keeps its buffer alive, so a live
-    // buffer at the entry's address with the entry's size is the very buffer it hashed. The modules
-    // are the recompiler's cached variants and specialized modules (results share their buffers),
-    // which outlive the entries anyway; past the bound the thread forgets them all.
-    struct Entry {
-        ShaderRecompiler::SharedSpirv pin;
-        std::size_t size = 0;
-        SpirvContentHash hash;
-    };
     constexpr std::size_t bound = 16384;
-    thread_local std::unordered_map<const std::uint32_t*, Entry> known;
+    auto& known = threadModuleHashes();
     if (const auto found = known.find(words.data()); found != known.end() && found->second.size == words.size()) return found->second.hash;
     const auto hash = HashSpirvWordsTwice(words, 0x5eed5a1d00000001ull, 0x5eed5a1d00000002ull);
     if (known.size() >= bound) known.clear();
-    known.insert_or_assign(words.data(), Entry{spirv, words.size(), hash});
+    known.insert_or_assign(words.data(), ModuleHashEntry{spirv, words.size(), hash});
     return hash;
 }
 
@@ -915,6 +927,8 @@ struct ReplayCounters {
     std::atomic<std::uint64_t> graphics{0}, compute{0}, present{0}, skipped{0}, rejected{0}, failed{0};
     std::atomic<std::uint32_t> threads{0};
     std::atomic<double> ms{0};
+    std::atomic<std::uint64_t> pauses{0}, deferred{0}, overlapped{0}, gameWaits{0};
+    std::atomic<double> pausedMs{0}, gameWaitMs{0}, buildMs{0}, longestBuildMs{0};
 };
 
 ReplayCounters& replayCounters() {
@@ -922,11 +936,151 @@ ReplayCounters& replayCounters() {
     return counters;
 }
 
-// Builds the journal's pipelines for one device on a pool: the first thread loads the file, every
-// thread then takes the next entry. A pipeline the store already holds counts as present; an entry
-// whose modules are missing, or whose layout key does not describe a layout, is rejected. The
-// threads get 64 MiB stacks like the driver's other pipeline compile threads (a driver's pipeline
-// compile can run deep).
+void addMs(std::atomic<double>& total, double ms) {
+    auto value = total.load(std::memory_order_relaxed);
+    while (!total.compare_exchange_weak(value, value + ms, std::memory_order_relaxed)) {
+    }
+}
+
+void maxMs(std::atomic<double>& longest, double ms) {
+    auto value = longest.load(std::memory_order_relaxed);
+    while (value < ms && !longest.compare_exchange_weak(value, ms, std::memory_order_relaxed)) {
+    }
+}
+
+std::int64_t nowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// A replay worker's handle to itself, for the title to raise its priority during a compile.
+#ifdef _WIN32
+using ThreadHandle = HANDLE;
+#else
+using ThreadHandle = void*;
+#endif
+
+// The priority a replay compile runs at, and the normal priority of everything else a replay
+// thread does (the title's own threads run at normal priority; a starved low-priority thread
+// holding a lock or a driver resource the title needs would stall it).
+void setThreadPriority(ThreadHandle thread, bool raised) {
+#ifdef _WIN32
+    if (thread != nullptr) SetThreadPriority(thread, raised ? THREAD_PRIORITY_NORMAL : THREAD_PRIORITY_LOWEST);
+#else
+    static_cast<void>(thread);
+    static_cast<void>(raised);
+#endif
+}
+
+// The game-first gate (GamePipelineBuild). `pending` counts the title builds and waits held now,
+// `lastGameNs` is when one last started or ended: a worker starts a build only once none is held
+// and none was for the quiet window, so a burst of title builds (a scene load) is not interleaved
+// with replay builds between its members. `workers` publishes every live worker's handle for the
+// whole of its life; a title build raises them all (lock-free, so it may run under the store's or
+// the compute map's mutex), and a worker lowers itself only inside a compile (ReplayCompileScope),
+// re-checking `pending` after lowering. The handles are never closed (the pooled threads never
+// end). The mutex and condition only wake paused workers on cancel; title threads never take them.
+struct ReplayGate {
+    static constexpr std::int64_t QuietNs = 250'000'000;
+    static constexpr std::size_t Slots = 16;
+    std::atomic<std::uint32_t> pending{0};
+    std::atomic<std::int64_t> lastGameNs{0};
+    std::atomic<std::uint32_t> lowered{0};
+    std::array<std::atomic<ThreadHandle>, Slots> workers{};
+    std::mutex mutex;
+    std::condition_variable wake;
+
+    [[nodiscard]] bool quiet() const {
+        return pending.load() == 0 && nowNs() - lastGameNs.load() >= QuietNs;
+    }
+
+    // A published worker slot, or Slots when all are taken (that worker is then never lowered).
+    std::size_t publish(ThreadHandle thread) {
+        if (thread == ThreadHandle{}) return Slots;
+        for (std::size_t slot = 0; slot < Slots; ++slot) {
+            ThreadHandle empty{};
+            if (workers[slot].compare_exchange_strong(empty, thread)) return slot;
+        }
+        return Slots;
+    }
+
+    void raiseAll() {
+        for (auto& worker : workers) setThreadPriority(worker.load(), true);
+    }
+};
+
+ReplayGate& replayGate() {
+    static auto* gate = new ReplayGate();
+    return *gate;
+}
+
+// This replay thread's published handle (null when it has none, or on other threads).
+thread_local ThreadHandle replayThreadHandle{};
+
+// The replay's threads: started on demand, never ending (like the driver's pipeline compile pool),
+// with 64 MiB stacks like the driver's other pipeline compile threads (a driver's pipeline compile
+// can run deep). Each publishes its handle to the gate once, for the title to raise it during a
+// compile, and runs at normal priority outside ReplayCompileScope.
+class ReplayWorkers {
+public:
+    static ReplayWorkers& Instance() {
+        static auto* workers = new ReplayWorkers();
+        return *workers;
+    }
+
+    // Queues `count` runs of `task`, starting threads so at least `count` exist; returns how
+    // many runs were queued (fewer when threads could not be started).
+    unsigned Submit(unsigned count, const std::function<void()>& task) {
+        std::lock_guard lock(mutex);
+        pthread_attr_t attributes;
+        pthread_attr_init(&attributes);
+        pthread_attr_setstacksize(&attributes, std::size_t{64} << 20u);
+        while (threads < count) {
+            pthread_t thread;
+            if (pthread_create(&thread, &attributes, &ReplayWorkers::Main, this) != 0) break;
+            pthread_detach(thread);
+            ++threads;
+        }
+        pthread_attr_destroy(&attributes);
+        const auto queued = std::min(count, threads);
+        for (unsigned index = 0; index < queued; ++index) tasks.push_back(task);
+        ready.notify_all();
+        return queued;
+    }
+
+private:
+    static void* Main(void* argument) {
+        auto& pool = *static_cast<ReplayWorkers*>(argument);
+        ThreadHandle self{};
+#ifdef _WIN32
+        if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &self, THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, 0)) self = nullptr;
+#endif
+        // Published for the thread's whole (endless) life; only a published thread lowers itself
+        // to compile.
+        if (replayGate().publish(self) != ReplayGate::Slots) replayThreadHandle = self;
+        for (;;) {
+            std::function<void()> task;
+            {
+                std::unique_lock lock(pool.mutex);
+                pool.ready.wait(lock, [&] { return !pool.tasks.empty(); });
+                task = std::move(pool.tasks.front());
+                pool.tasks.pop_front();
+            }
+            task();
+        }
+        return nullptr;
+    }
+
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<std::function<void()>> tasks;
+    unsigned threads = 0;
+};
+
+// Builds the journal's pipelines for one device on a few pooled threads: the first thread
+// loads the file, every thread then takes the next entry once the title is quiet (ReplayGate). A
+// pipeline the store already holds, or one the title or another thread is building, counts as
+// present; an entry whose modules are missing, or whose layout key does not describe a layout, is
+// rejected; an entry deferred because a title build started is tried again once the title is quiet.
 class Replay : public PipelineJournalReplay {
 public:
     // The context keeps the device's buffer pool: a store entry is alive for a draw only while its
@@ -935,20 +1089,10 @@ public:
     Replay(Context context, PipelineJournalHooks hooks, unsigned threads) : context(std::move(context)), hooks(std::move(hooks)), active(threads) {
         started = std::chrono::steady_clock::now();
         replayCounters().threads.store(threads, std::memory_order_relaxed);
-        pthread_attr_t attributes;
-        pthread_attr_init(&attributes);
-        pthread_attr_setstacksize(&attributes, std::size_t{64} << 20u);
-        workers.reserve(threads);
-        for (unsigned index = 0; index < threads; ++index) {
-            pthread_t thread;
-            if (pthread_create(&thread, &attributes, &Replay::Main, this) == 0) {
-                workers.push_back(thread);
-            } else if (active.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-                // The last thread that could not start: none runs (or every one already left).
-                finish();
-            }
-        }
-        pthread_attr_destroy(&attributes);
+        const auto submitted = ReplayWorkers::Instance().Submit(threads, [this] { run(); });
+        // Workers that could not be started never run: the replay ends once the started ones did
+        // (at once when none started).
+        for (auto missing = submitted; missing < threads; ++missing) leave();
     }
 
     ~Replay() override {
@@ -956,20 +1100,49 @@ public:
         Wait();
     }
 
-    void Cancel() override { cancelled.store(true, std::memory_order_relaxed); }
+    void Cancel() override {
+        cancelled.store(true, std::memory_order_relaxed);
+        auto& gate = replayGate();
+        {
+            std::lock_guard lock(gate.mutex);
+        }
+        gate.wake.notify_all();
+    }
 
+    // The workers are pooled threads that outlive the replay (a thread's exit runs its
+    // thread_local destructors, which faulted on replay threads in tests): waiting is for every
+    // worker to have left run().
     void Wait() override {
-        std::lock_guard lock(joinMutex);
-        for (auto& worker : workers) pthread_join(worker, nullptr);
-        workers.clear();
+        std::unique_lock lock(doneMutex);
+        doneCondition.wait(lock, [&] { return active.load(std::memory_order_acquire) == 0; });
     }
 
     [[nodiscard]] bool Done() const override { return finished.load(std::memory_order_acquire); }
 
 private:
-    static void* Main(void* argument) {
-        static_cast<Replay*>(argument)->run();
-        return nullptr;
+    // One worker left run() (or never started): the last one finishes the replay. The count
+    // drops and the waiters are woken under the mutex, so a waiter that sees zero and destroys
+    // the replay does so only after this thread is done with it.
+    void leave() {
+        std::lock_guard lock(doneMutex);
+        if (active.load(std::memory_order_acquire) == 1) finish();
+        active.fetch_sub(1, std::memory_order_acq_rel);
+        doneCondition.notify_all();
+    }
+
+    // Blocks until the title holds no build and has been quiet for the gate's window; false once
+    // the replay is cancelled. A wait that had to pause is counted (and its length).
+    bool waitForTurn() {
+        auto& gate = replayGate();
+        if (cancelled.load(std::memory_order_relaxed)) return false;
+        if (gate.quiet()) return true;
+        const auto pausedAt = std::chrono::steady_clock::now();
+        replayCounters().pauses.fetch_add(1, std::memory_order_relaxed);
+        std::unique_lock lock(gate.mutex);
+        while (!cancelled.load(std::memory_order_relaxed) && !gate.quiet()) gate.wake.wait_for(lock, std::chrono::milliseconds(25));
+        lock.unlock();
+        addMs(replayCounters().pausedMs, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - pausedAt).count());
+        return !cancelled.load(std::memory_order_relaxed);
     }
 
     void run() {
@@ -982,23 +1155,43 @@ private:
                 // builds a run no longer reaches).
                 if (journal.entries.size() > limit) journal.entries.erase(journal.entries.begin(), journal.entries.end() - static_cast<std::ptrdiff_t>(limit));
                 loaded = std::move(journal);
+                if (!loaded.entries.empty()) std::fprintf(stderr, "[pipeline-journal] replaying %zu pipelines on %u low-priority threads, paused while the title builds pipelines\n", loaded.entries.size(), replayCounters().threads.load(std::memory_order_relaxed));
             } catch (const std::exception& error) {
                 std::fprintf(stderr, "[pipeline-journal] cannot load %s: %s\n", Journal::Instance().Path().string().c_str(), error.what());
             }
         });
         for (;;) {
-            if (cancelled.load(std::memory_order_relaxed)) break;
+            if (!waitForTurn()) break;
             const auto index = cursor.fetch_add(1, std::memory_order_relaxed);
             if (index >= loaded.entries.size()) break;
-            try {
-                replay(loaded.entries[index]);
-            } catch (const std::exception& error) {
-                replayCounters().failed.fetch_add(1, std::memory_order_relaxed);
-                static std::atomic<std::uint64_t> reported{0};
-                if (reported.fetch_add(1) < 8) std::fprintf(stderr, "[pipeline-journal] replay failed: %s\n", error.what());
+            for (;;) {
+                PipelineReplayOutcome outcome = PipelineReplayOutcome::Rejected;
+                try {
+                    outcome = replay(loaded.entries[index]);
+                } catch (const std::exception& error) {
+                    replayCounters().failed.fetch_add(1, std::memory_order_relaxed);
+                    static std::atomic<std::uint64_t> reported{0};
+                    if (reported.fetch_add(1) < 8) std::fprintf(stderr, "[pipeline-journal] replay failed: %s\n", error.what());
+                }
+                if (outcome != PipelineReplayOutcome::Deferred) break;
+                replayCounters().deferred.fetch_add(1, std::memory_order_relaxed);
+                if (!waitForTurn()) break;
             }
+            reportProgress();
         }
-        if (active.fetch_sub(1, std::memory_order_acq_rel) == 1) finish();
+        // The module hashes this thread pinned (the journal's modules, freed with the replay)
+        // are released with it rather than kept by the pooled thread.
+        ModuleHashes().swap(threadModuleHashes());
+        leave();
+    }
+
+    // APS5_PROFILE_DRAW: the replay's progress every 10 s while it runs.
+    void reportProgress() {
+        if (!profiling()) return;
+        const auto now = nowNs();
+        auto last = lastReportNs.load(std::memory_order_relaxed);
+        if (now - last < 10'000'000'000 || !lastReportNs.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+        ReportPipelineJournal();
     }
 
     void finish() {
@@ -1006,59 +1199,84 @@ private:
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
         replayCounters().ms.store(ms, std::memory_order_relaxed);
         finished.store(true, std::memory_order_release);
+        const auto totals = PipelineJournalTotals();
+        if (totals.loadedRecipes != 0) std::fprintf(stderr, "[pipeline-journal] replay %s after %.1f s: %llu graphics and %llu compute built (%.1f s building, longest %.0f ms), %llu present, %llu rejected, %llu failed; paused %llu times (%.1f s) for the title's builds, %llu title waits on a replayed build (%.0f ms)\n",
+                                                     cancelled.load(std::memory_order_relaxed) ? "cancelled" : "done", ms / 1000.0, static_cast<unsigned long long>(totals.replayedGraphics), static_cast<unsigned long long>(totals.replayedCompute), totals.replayBuildMs / 1000.0, totals.replayLongestBuildMs, static_cast<unsigned long long>(totals.replayPresent + totals.replaySkipped), static_cast<unsigned long long>(totals.replayRejected), static_cast<unsigned long long>(totals.replayFailed),
+                                                     static_cast<unsigned long long>(totals.replayPauses), totals.replayPausedMs / 1000.0, static_cast<unsigned long long>(totals.gameWaitsOnReplay), totals.gameWaitOnReplayMs);
         ReportPipelineJournal();
     }
 
-    void replay(const LoadedEntry& entry) {
+    // One entry. The thread compiles at low priority (ReplayCompileScope, around the driver call)
+    // and does everything else, the locks it shares with the title included, at normal priority.
+    PipelineReplayOutcome replay(const LoadedEntry& entry) {
         struct Replaying {
             Replaying() { replayingHere = true; }
             ~Replaying() { replayingHere = false; }
         } replaying;
         auto& counters = replayCounters();
+        // The time of one entry's build (outcome Built), for the counters.
+        struct Timed {
+            std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
+            void Done() const {
+                const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - at).count();
+                addMs(replayCounters().buildMs, ms);
+                maxMs(replayCounters().longestBuildMs, ms);
+            }
+        };
+        const auto count = [&](PipelineReplayOutcome outcome) {
+            switch (outcome) {
+                case PipelineReplayOutcome::Built: break;
+                case PipelineReplayOutcome::Present: counters.present.fetch_add(1, std::memory_order_relaxed); break;
+                case PipelineReplayOutcome::Rejected: counters.rejected.fetch_add(1, std::memory_order_relaxed); break;
+                case PipelineReplayOutcome::Deferred: break;
+            }
+            return outcome;
+        };
         if (entry.kind == ComputeRecord) {
             const auto module = loaded.modules.find(entry.compute);
-            if (module == loaded.modules.end() || module->second.stage != ShaderRecompiler::ShaderStage::Compute || !hooks.compute) {
-                counters.rejected.fetch_add(1, std::memory_order_relaxed);
-                return;
+            if (module == loaded.modules.end() || module->second.stage != ShaderRecompiler::ShaderStage::Compute || !hooks.compute) return count(PipelineReplayOutcome::Rejected);
+            const Timed timed;
+            const auto outcome = hooks.compute(*module->second.result, entry.pushConstants, entry.computeLayoutKey);
+            if (outcome == PipelineReplayOutcome::Built) {
+                counters.compute.fetch_add(1, std::memory_order_relaxed);
+                timed.Done();
             }
-            (hooks.compute(*module->second.result, entry.pushConstants, entry.computeLayoutKey) ? counters.compute : counters.present).fetch_add(1, std::memory_order_relaxed);
-            return;
+            return count(outcome);
         }
         std::vector<CompiledShader> shaders;
         for (const auto& stage : entry.graphics.stages) {
             const auto module = loaded.modules.find(stage.identity);
-            if (module == loaded.modules.end() || module->second.stage != stage.stage) {
-                counters.rejected.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
+            if (module == loaded.modules.end() || module->second.stage != stage.stage) return count(PipelineReplayOutcome::Rejected);
             shaders.push_back({stage.stage, module->second.result.get(), stage.pushConstantOffset});
         }
         std::vector<VkDescriptorSetLayoutBinding> description;
-        if (shaders.empty() || context.descriptorCache == nullptr || !DescribeLayoutKey(entry.graphics.layoutKey, description)) {
-            counters.rejected.fetch_add(1, std::memory_order_relaxed);
-            return;
-        }
+        if (shaders.empty() || context.descriptorCache == nullptr || !DescribeLayoutKey(entry.graphics.layoutKey, description)) return count(PipelineReplayOutcome::Rejected);
         const auto store = PipelineStoreTotals();
         if (store.cached >= store.bound) {
             counters.skipped.fetch_add(1, std::memory_order_relaxed);
-            return;
+            return PipelineReplayOutcome::Present;
         }
         const auto setLayout = context.descriptorCache->Layout(entry.graphics.layoutKey, description);
-        bool created = false;
-        static_cast<void>(CachedPipeline(context, entry.graphics.state, entry.graphics.vertexInput, entry.graphics.layoutKey, setLayout, shaders, entry.graphics.attachmentLayout, &created));
-        (created ? counters.graphics : counters.present).fetch_add(1, std::memory_order_relaxed);
+        const Timed timed;
+        const auto outcome = ReplayCachedPipeline(context, entry.graphics.state, entry.graphics.vertexInput, entry.graphics.layoutKey, setLayout, shaders, entry.graphics.attachmentLayout);
+        if (outcome == PipelineReplayOutcome::Built) {
+            counters.graphics.fetch_add(1, std::memory_order_relaxed);
+            timed.Done();
+        }
+        return count(outcome);
     }
 
     Context context;
     PipelineJournalHooks hooks;
-    std::mutex joinMutex;
-    std::vector<pthread_t> workers;
+    std::mutex doneMutex;
+    std::condition_variable doneCondition;
     std::once_flag loadOnce;
     LoadedJournal loaded;
     std::atomic<std::size_t> cursor{0};
     std::atomic<unsigned> active{0};
     std::atomic<bool> finished{false};
     std::atomic<bool> cancelled{false};
+    std::atomic<std::int64_t> lastReportNs{0};
     std::chrono::steady_clock::time_point started;
 };
 
@@ -1202,6 +1420,55 @@ bool PipelineJournalReplaying() {
     return replayingHere;
 }
 
+GamePipelineBuild::GamePipelineBuild() {
+    if (replayingHere) return;
+    auto& gate = replayGate();
+    counted = true;
+    // Sequentially consistent with ReplayCompileScope: either the worker sees this build pending
+    // after lowering itself, or this build sees the worker published and raises it.
+    gate.pending.fetch_add(1);
+    gate.lastGameNs.store(nowNs());
+    if (gate.lowered.load() != 0) replayCounters().overlapped.fetch_add(1, std::memory_order_relaxed);
+    gate.raiseAll();
+}
+
+GamePipelineBuild::~GamePipelineBuild() {
+    if (!counted) return;
+    auto& gate = replayGate();
+    gate.lastGameNs.store(nowNs());
+    // A paused worker polls (it waits for the quiet window after the last build anyway), so the
+    // end of a build needs no wake-up.
+    gate.pending.fetch_sub(1);
+}
+
+ReplayCompileScope::ReplayCompileScope() {
+    const auto self = replayThreadHandle;
+    if (!replayingHere || self == ThreadHandle{}) return;
+    auto& gate = replayGate();
+    active = true;
+    gate.lowered.fetch_add(1);
+    if (gate.pending.load() != 0) return;
+    setThreadPriority(self, false);
+    // A title build that started before the lowering raised a thread still at normal priority:
+    // raise again (one that starts after this check raises it itself).
+    if (gate.pending.load() != 0) setThreadPriority(self, true);
+}
+
+ReplayCompileScope::~ReplayCompileScope() {
+    if (!active) return;
+    setThreadPriority(replayThreadHandle, true);
+    replayGate().lowered.fetch_sub(1);
+}
+
+bool GamePipelineBuildPending() {
+    return replayGate().pending.load() != 0;
+}
+
+void CountGameWaitOnReplay(double milliseconds) {
+    replayCounters().gameWaits.fetch_add(1, std::memory_order_relaxed);
+    addMs(replayCounters().gameWaitMs, milliseconds);
+}
+
 std::filesystem::path PipelineJournalPath() {
     return Journal::Instance().Path();
 }
@@ -1217,6 +1484,14 @@ PipelineJournalCounters PipelineJournalTotals() {
     totals.replayFailed = replay.failed.load(std::memory_order_relaxed);
     totals.replayMs = replay.ms.load(std::memory_order_relaxed);
     totals.replayThreads = replay.threads.load(std::memory_order_relaxed);
+    totals.replayPauses = replay.pauses.load(std::memory_order_relaxed);
+    totals.replayPausedMs = replay.pausedMs.load(std::memory_order_relaxed);
+    totals.replayDeferred = replay.deferred.load(std::memory_order_relaxed);
+    totals.gameBuildsOverlapped = replay.overlapped.load(std::memory_order_relaxed);
+    totals.gameWaitsOnReplay = replay.gameWaits.load(std::memory_order_relaxed);
+    totals.gameWaitOnReplayMs = replay.gameWaitMs.load(std::memory_order_relaxed);
+    totals.replayBuildMs = replay.buildMs.load(std::memory_order_relaxed);
+    totals.replayLongestBuildMs = replay.longestBuildMs.load(std::memory_order_relaxed);
     return totals;
 }
 
@@ -1239,6 +1514,8 @@ void ReportPipelineJournal() {
                                          static_cast<unsigned long long>(totals.loadedRecipes), static_cast<unsigned long long>(totals.loadedModules), static_cast<double>(totals.loadedBytes) / (1024.0 * 1024.0), totals.loadMs, totals.replayThreads,
                                          static_cast<unsigned long long>(totals.replayedGraphics), static_cast<unsigned long long>(totals.replayedCompute), static_cast<unsigned long long>(totals.replayPresent), static_cast<unsigned long long>(totals.replaySkipped), static_cast<unsigned long long>(totals.replayRejected), static_cast<unsigned long long>(totals.replayFailed), totals.replayMs,
                                          static_cast<unsigned long long>(totals.recordedGraphics), static_cast<unsigned long long>(totals.recordedCompute), static_cast<unsigned long long>(totals.recordedModules), static_cast<double>(totals.writtenBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(totals.writeFailures));
+    AgcDriver::ProfilePrint_nid_no_patch("[pipeline-journal] game first: replay paused %llu times (%.0f ms), %llu entries deferred; %llu title builds started during a replay compile (raised it), %llu title waits on a replayed build (%.1f ms); replay building %.0f ms (longest %.1f ms)\n",
+                                         static_cast<unsigned long long>(totals.replayPauses), totals.replayPausedMs, static_cast<unsigned long long>(totals.replayDeferred), static_cast<unsigned long long>(totals.gameBuildsOverlapped), static_cast<unsigned long long>(totals.gameWaitsOnReplay), totals.gameWaitOnReplayMs, totals.replayBuildMs, totals.replayLongestBuildMs);
 }
 
 std::uint64_t PipelineJournalDeviceFingerprint(const VkPhysicalDeviceProperties& properties) {
@@ -1250,7 +1527,9 @@ std::uint64_t PipelineJournalDeviceFingerprint(const VkPhysicalDeviceProperties&
 
 std::shared_ptr<PipelineJournalReplay> StartPipelineJournalReplay(const Context& context, std::uint64_t deviceFingerprint, PipelineJournalHooks hooks) {
     if (!Journal::Instance().Enabled() || !Journal::Instance().Bind(deviceFingerprint)) return nullptr;
-    const auto threads = static_cast<unsigned>(configured("APS5_PIPELINE_JOURNAL_THREADS", std::max(1u, std::thread::hardware_concurrency() / 2u)));
+    // Few threads: the replay is background work that yields to the title (ReplayGate), not a race
+    // to finish before the title's first use.
+    const auto threads = static_cast<unsigned>(configured("APS5_PIPELINE_JOURNAL_THREADS", 2u));
     if (threads == 0) return nullptr;
     return std::make_shared<Replay>(context, std::move(hooks), threads);
 }

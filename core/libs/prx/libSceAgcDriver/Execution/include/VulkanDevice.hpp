@@ -22,6 +22,7 @@ namespace Graphics {
 class StorageTexture;
 struct DrawSpeculation;
 struct DrawPrebuild;
+enum class PipelineReplayOutcome;
 }
 
 class PresentationScaler;
@@ -38,9 +39,12 @@ class VulkanDevice {
 public:
     explicit VulkanDevice(const PresentationWindow* window = nullptr);
     // Builds the pipeline of a journaled compute result over the set layout `layoutKey` describes,
-    // ahead of its first dispatch (the journal replay's hook, on its threads): false when the device
-    // already holds a pipeline for the module or the key describes no layout.
-    bool ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants, std::span<const std::uint32_t> layoutKey);
+    // ahead of its first dispatch (the journal replay's hook, on its threads): Present when the
+    // device holds or is building a pipeline for the module, Rejected when the key describes no
+    // layout, Deferred when a title pipeline build is held (Graphics::GamePipelineBuild). While it
+    // builds, a dispatch of the module over the same set layout waits for this build instead of
+    // building it again.
+    Graphics::PipelineReplayOutcome ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants, std::span<const std::uint32_t> layoutKey);
     // Starts the journal replay if the device has not (a headless device starts it at its first
     // draw or dispatch, or when it takes the window) and joins it (tests; the teardown joins it anyway).
     void WaitForPipelineJournalReplay();

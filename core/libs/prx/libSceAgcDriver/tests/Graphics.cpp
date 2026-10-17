@@ -16,7 +16,9 @@
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -30,6 +32,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <type_traits>
 #include <vector>
@@ -1316,6 +1319,8 @@ struct MockVulkan {
     VkPipelineBindPoint boundPoint = VK_PIPELINE_BIND_POINT_MAX_ENUM;
     std::map<VkPipelineLayout, VkDeviceSize> pipelineLayoutPushConstantSize;
     std::uint32_t pipelineCreateCount = 0;
+    // Runs at the start of every graphics pipeline creation (the journal tests stall a replay build).
+    std::function<void()> onGraphicsPipelineCreate;
     std::vector<std::array<std::uint32_t, 3>> pipelineSpecializations;
     VkPipeline boundPipeline = VK_NULL_HANDLE;
     std::vector<std::byte> lastPushConstants;
@@ -1486,6 +1491,7 @@ VKAPI_ATTR void VKAPI_CALL mockDestroyRenderPass(VkDevice, VkRenderPass, const V
 
 VKAPI_ATTR VkResult VKAPI_CALL mockCreateGraphicsPipelines(VkDevice, VkPipelineCache, std::uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks*, VkPipeline* pipelines) {
     Require(count == 1 && infos[0].renderPass != VK_NULL_HANDLE && infos[0].layout != VK_NULL_HANDLE, "mock expects one graphics pipeline with a render pass and a layout");
+    if (mock.onGraphicsPipelineCreate) mock.onGraphicsPipelineCreate();
     *pipelines = makeHandle<VkPipeline>();
     ++mock.pipelineCreateCount;
     ++mock.live;
@@ -3158,12 +3164,17 @@ void pipelineJournalTests() {
         std::vector<std::uint32_t> receivedKey;
         bool receivedPush = false;
         std::uint32_t computeCalls = 0;
+        std::uint32_t deferNext = 0;
         PipelineJournalHooks hooks{[&](const ShaderRecompiler::RecompileResult& shader, bool pushConstants, std::span<const std::uint32_t> key) {
             ++computeCalls;
+            if (deferNext != 0) {
+                --deferNext;
+                return PipelineReplayOutcome::Deferred;
+            }
             received = shader;
             receivedPush = pushConstants;
             receivedKey.assign(key.begin(), key.end());
-            return true;
+            return PipelineReplayOutcome::Built;
         }};
         auto replay = StartPipelineJournalReplay(context, fingerprint, hooks);
         Require(replay != nullptr, "the replay did not start");
@@ -3217,6 +3228,100 @@ void pipelineJournalTests() {
             cancelled->Wait();
             const auto after = PipelineJournalTotals();
             Require(cancelled->Done() && after.replayFailed == 0 && after.replayRejected == 0, "a cancelled replay did not stop cleanly");
+        }
+        {
+            // The title first. The journal now holds the compute pipeline recorded into the fresh
+            // file and, recorded again here, the graphics pipeline; the store is emptied before
+            // each replay so the graphics entry is built.
+            RecordGraphicsPipeline(recipe, shaders);
+            FlushPipelineJournal();
+            using namespace std::chrono_literals;
+            // A held title build pauses the replay: nothing is built until it ends.
+            {
+                ClearCachedPipelines(context.device);
+                const auto before = PipelineJournalTotals();
+                const auto createdBefore = mock.pipelineCreateCount;
+                computeCalls = 0;
+                std::optional<GamePipelineBuild> title;
+                title.emplace();
+                Require(GamePipelineBuildPending(), "a held title build is not pending");
+                auto paused = StartPipelineJournalReplay(context, fingerprint, hooks);
+                Require(paused != nullptr, "the replay held back by a title build did not start");
+                std::this_thread::sleep_for(400ms);
+                Require(!paused->Done() && computeCalls == 0 && mock.pipelineCreateCount == createdBefore, "the replay built a pipeline while a title build was held");
+                Require(PipelineJournalTotals().replayPauses > before.replayPauses, "the replay did not count its pause for the title build");
+                title.reset();
+                Require(!GamePipelineBuildPending(), "an ended title build is still pending");
+                paused->Wait();
+                const auto after = PipelineJournalTotals();
+                Require(paused->Done() && computeCalls == 1 && mock.pipelineCreateCount == createdBefore + 1 && after.replayedGraphics == before.replayedGraphics + 1 && after.replayedCompute == before.replayedCompute + 1, "the replay did not build its two entries once the title build ended");
+            }
+            // An entry deferred because a title build started is tried again, not dropped.
+            {
+                ClearCachedPipelines(context.device);
+                const auto before = PipelineJournalTotals();
+                computeCalls = 0;
+                deferNext = 1;
+                auto deferred = StartPipelineJournalReplay(context, fingerprint, hooks);
+                Require(deferred != nullptr, "the deferring replay did not start");
+                deferred->Wait();
+                const auto after = PipelineJournalTotals();
+                Require(computeCalls == 2 && deferNext == 0 && after.replayDeferred == before.replayDeferred + 1 && after.replayedCompute == before.replayedCompute + 1 && after.replayedGraphics == before.replayedGraphics + 1, "a deferred entry was not tried again and built");
+            }
+            // A draw that needs the pipeline the replay is building waits for that build: one
+            // creation, the draw gets the replayed pipeline, and the wait holds a title build.
+            {
+                ClearCachedPipelines(context.device);
+                const auto before = PipelineJournalTotals();
+                const auto storeBefore = PipelineStoreTotals();
+                const auto createdBefore = mock.pipelineCreateCount;
+                std::atomic<int> phase{0};
+                mock.onGraphicsPipelineCreate = [&] {
+                    if (!PipelineJournalReplaying()) return;
+                    phase.store(1);
+                    while (phase.load() != 2) std::this_thread::sleep_for(1ms);
+                };
+                auto flight = StartPipelineJournalReplay(context, fingerprint, hooks);
+                Require(flight != nullptr, "the in-flight replay did not start");
+                const auto deadline = std::chrono::steady_clock::now() + 10s;
+                while (phase.load() != 1 && std::chrono::steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+                Require(phase.load() == 1, "the replay never started its graphics build");
+                std::atomic<bool> drawn{false};
+                std::shared_ptr<Pipeline> waited;
+                bool built = true;
+                std::thread title([&] {
+                    waited = CachedPipeline(context, state, input, layoutKey, setLayout, shaders, VK_IMAGE_LAYOUT_GENERAL, &built);
+                    drawn.store(true);
+                });
+                std::this_thread::sleep_for(150ms);
+                const bool waiting = !drawn.load() && GamePipelineBuildPending();
+                phase.store(2);
+                title.join();
+                flight->Wait();
+                mock.onGraphicsPipelineCreate = nullptr;
+                Require(waiting, "the draw did not wait for the replay's build of its pipeline");
+                const auto after = PipelineJournalTotals();
+                const auto storeAfter = PipelineStoreTotals();
+                Require(waited != nullptr && !built && mock.pipelineCreateCount == createdBefore + 1 && after.replayedGraphics == before.replayedGraphics + 1, "the draw built the pipeline the replay was building again");
+                Require(after.gameWaitsOnReplay == before.gameWaitsOnReplay + 1 && storeAfter.hits == storeBefore.hits + 1 && storeAfter.misses == storeBefore.misses + 1, "the draw's wait for the replayed build was not counted as one wait and one hit");
+                bool again = true;
+                Require(CachedPipeline(context, state, input, layoutKey, setLayout, shaders, VK_IMAGE_LAYOUT_GENERAL, &again) == waited && !again, "the replayed pipeline the draw waited for is not the resident one");
+                // The replay skips what is resident.
+                Require(ReplayCachedPipeline(context, decoded.state, decoded.vertexInput, decoded.layoutKey, setLayout, shaders, decoded.attachmentLayout) == PipelineReplayOutcome::Present && mock.pipelineCreateCount == createdBefore + 1, "the replay built a resident pipeline again");
+            }
+            // A replay paused for the title stops at once when cancelled.
+            {
+                std::optional<GamePipelineBuild> title;
+                title.emplace();
+                auto stopped = StartPipelineJournalReplay(context, fingerprint, hooks);
+                Require(stopped != nullptr, "the replay to cancel did not start");
+                std::this_thread::sleep_for(50ms);
+                const auto cancelledAt = std::chrono::steady_clock::now();
+                stopped->Cancel();
+                stopped->Wait();
+                Require(stopped->Done() && std::chrono::steady_clock::now() - cancelledAt < 2s, "a replay paused for the title did not stop promptly when cancelled");
+                title.reset();
+            }
         }
         Require(!StartPipelineJournalReplay(context, fingerprint + 1, hooks), "a replay for another device started");
         ClearCachedPipelines(context.device);
