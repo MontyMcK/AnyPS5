@@ -8,6 +8,9 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <atomic>
 #include <stdexcept>
 #include "prx/libc/include/Shutdown.hpp"
@@ -30,6 +33,11 @@ std::atomic<bool> exitStarted{false};
 using GuestExitCallback = void (APS5_VABI*)();
 std::mutex exitCallbackMutex;
 std::vector<GuestExitCallback> exitCallbacks;
+std::mutex exitPreparationMutex;
+std::vector<void (*)()> exitPreparations;
+std::condition_variable exitPreparationChanged;
+bool exitPreparing = false;
+bool exitPrepared = false;
 
 void runGuestExitCallback() {
     GuestExitCallback callback;
@@ -51,10 +59,39 @@ extern "C" void LibcRequestShutdown_nid_postfix() {
     shutdownSource.request_stop();
 }
 
+extern "C" void LibcRegisterExitPreparation_nid_postfix(void (*callback)()) {
+    if (callback == nullptr) throw std::runtime_error("libc: invalid exit preparation");
+    std::lock_guard lock(exitPreparationMutex);
+    exitPreparations.push_back(callback);
+}
+
+extern "C" void LibcRunExitPreparations_nid_postfix() {
+    std::vector<void (*)()> callbacks;
+    {
+        std::unique_lock lock(exitPreparationMutex);
+        if (exitPreparing) {
+            exitPreparationChanged.wait(lock, [] { return exitPrepared; });
+            return;
+        }
+        exitPreparing = true;
+        callbacks = exitPreparations;
+    }
+    for (auto it = callbacks.rbegin(); it != callbacks.rend(); ++it) {
+        try { (*it)(); }
+        catch (...) {}
+    }
+    {
+        std::lock_guard lock(exitPreparationMutex);
+        exitPrepared = true;
+    }
+    exitPreparationChanged.notify_all();
+}
+
 extern "C" void LibcRequestExit_nid_postfix(int code) {
     if (exitRequested.exchange(true)) return;
+    LibcRunExitPreparations_nid_postfix();
     LibcRequestShutdown_nid_postfix();
-    std::thread([code] { LibcExit_nid_no_patch(code); }).detach();
+    std::thread([code] { LibcExitWithoutHandlers_nid_no_patch(code); }).detach();
 }
 
 extern "C" [[noreturn]] void LibcAwaitExit_nid_postfix() {
@@ -73,6 +110,7 @@ extern "C" void LibcRegisterShutdown_nid_postfix(void (*callback)()) {
 }
 
 extern "C" void LibcRunShutdown_nid_postfix() {
+    LibcRunExitPreparations_nid_postfix();
     std::unique_lock lock(shutdownMutex);
     if (shutdownStarted) {
         if (!shutdownFinished && shutdownThread == std::this_thread::get_id()) throw std::runtime_error("libc: recursive shutdown");
@@ -109,11 +147,27 @@ extern "C" {
     std::_Exit(code);
 }
 
+[[noreturn]] void LibcTerminate_nid_no_patch(int code) {
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code));
+#endif
+    std::_Exit(code);
+}
+
 [[noreturn]] void LibcExit_nid_no_patch(int code) {
     exitRequested.store(true);
     if (exitStarted.exchange(true)) LibcAwaitExit_nid_postfix();
     LibcRunShutdown_nid_postfix();
     std::exit(code);
+}
+
+[[noreturn]] void LibcExitWithoutHandlers_nid_no_patch(int code) {
+    exitRequested.store(true);
+    if (exitStarted.exchange(true)) LibcAwaitExit_nid_postfix();
+    try { LibcRunShutdown_nid_postfix(); }
+    catch (...) {}
+    std::fflush(nullptr);
+    LibcTerminate_nid_no_patch(code);
 }
 
 void APS5_VABI exit_nid_postfix(int code) {

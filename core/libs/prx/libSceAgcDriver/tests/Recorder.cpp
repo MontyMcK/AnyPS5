@@ -2,6 +2,7 @@
 #include "Triangle_vert_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CpuTimeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredVulkan.hpp"
@@ -50,6 +51,8 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -215,6 +218,11 @@ public:
 
     ~Device() { release(); }
     const Context& GetContext() const { return context; }
+    VkPhysicalDeviceProperties Properties() const {
+        VkPhysicalDeviceProperties properties{};
+        function<PFN_vkGetPhysicalDeviceProperties>("vkGetPhysicalDeviceProperties")(context.physical, &properties);
+        return properties;
+    }
     void WaitQueue() const { Check(context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue), "vkQueueWaitIdle"); }
 
 private:
@@ -3524,6 +3532,218 @@ void pipelineCacheTests(const Device& device, bool benchmark) {
     std::cout << "Pipeline cache key and retained lifetime tests passed\n";
 }
 
+// PipelineCache's file: the periodic save on any change after the interval, the exit save, the
+// durable write and what a save leaves alone (a file another object wrote with more data).
+int pipelineCacheFileTests(const Device& device) {
+    const auto& context = device.GetContext();
+    const auto directory = std::filesystem::temp_directory_path() / ("aps5-pipeline-cache-file-test-" + std::to_string(std::random_device{}()));
+    struct RemoveDirectory {
+        std::filesystem::path directory;
+        ~RemoveDirectory() {
+            std::error_code error;
+            std::filesystem::remove_all(directory, error);
+        }
+    } removeDirectory{directory};
+    std::filesystem::create_directories(directory);
+#ifdef _WIN32
+    _putenv_s("ANYPS5_NO_SHADER_CACHE", "0");
+    _putenv_s("ANYPS5_SHADER_CACHE_DIR", directory.string().c_str());
+#else
+    setenv("ANYPS5_NO_SHADER_CACHE", "0", 1);
+    setenv("ANYPS5_SHADER_CACHE_DIR", directory.string().c_str(), 1);
+#endif
+    const auto properties = device.Properties();
+    struct Objects {
+        const Context& context;
+        VkDescriptorSetLayout setLayout = VK_NULL_HANDLE;
+        std::array<VkPipelineLayout, 3> layouts{};
+        std::array<VkShaderModule, 2> modules{};
+        ~Objects() {
+            for (const auto module : modules) {
+                if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            }
+            for (const auto layout : layouts) {
+                if (layout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, layout, nullptr);
+            }
+            if (setLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyDescriptorSetLayout>("vkDestroyDescriptorSetLayout")(context.device, setLayout, nullptr);
+        }
+    } objects{context};
+    const std::array bindings{VkDescriptorSetLayoutBinding{0, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}, VkDescriptorSetLayoutBinding{1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo setLayoutInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    setLayoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
+    setLayoutInfo.pBindings = bindings.data();
+    Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &setLayoutInfo, nullptr, &objects.setLayout), "vkCreateDescriptorSetLayout");
+    for (std::size_t index = 0; index < objects.layouts.size(); ++index) {
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, static_cast<std::uint32_t>(sizeof(float) * (index == 0 ? 2 : index == 1 ? 32 : 16))};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.setLayoutCount = 1;
+        layoutInfo.pSetLayouts = &objects.setLayout;
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &push;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &objects.layouts[index]), "vkCreatePipelineLayout");
+    }
+    const std::array<std::span<const std::uint32_t>, 2> codes{std::span<const std::uint32_t>(SAMPLE_LOD_SPV), std::span<const std::uint32_t>(SAMPLE_ARRAY_SPV)};
+    for (std::size_t index = 0; index < codes.size(); ++index) {
+        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+        moduleInfo.codeSize = codes[index].size_bytes();
+        moduleInfo.pCode = codes[index].data();
+        Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &objects.modules[index]), "vkCreateShaderModule");
+    }
+    // Six distinct pipelines: two modules, each with three pipeline layouts.
+    const auto build = [&](VkPipelineCache cache, std::size_t variant) {
+        VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT, objects.modules[variant % 2], "main", nullptr};
+        info.layout = objects.layouts[variant / 2];
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, cache, 1, &info, nullptr, &pipeline), "vkCreateComputePipelines");
+        context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, pipeline, nullptr);
+    };
+    const auto bytes = [&](VkPipelineCache cache) {
+        std::size_t size = 0;
+        Check(context.Function<PFN_vkGetPipelineCacheData>("vkGetPipelineCacheData")(context.device, cache, &size, nullptr), "vkGetPipelineCacheData");
+        return size;
+    };
+    const auto holds = [&](VkPipelineCache cache, std::size_t variant) {
+        const auto before = bytes(cache);
+        build(cache, variant);
+        return bytes(cache) == before;
+    };
+    const auto contents = [](const std::filesystem::path& path) {
+        std::ifstream stream(path, std::ios::binary);
+        return std::vector<char>(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+    };
+    const auto temporaries = [&] {
+        std::size_t count = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(directory)) count += entry.path().filename().string().find(".tmp.") != std::string::npos;
+        return count;
+    };
+    {
+        VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        VkPipelineCache probe = VK_NULL_HANDLE;
+        Check(context.Function<PFN_vkCreatePipelineCache>("vkCreatePipelineCache")(context.device, &info, nullptr, &probe), "vkCreatePipelineCache");
+        bool stored = true;
+        for (std::size_t variant = 0; variant < 6 && stored; ++variant) stored = !holds(probe, variant);
+        context.Function<PFN_vkDestroyPipelineCache>("vkDestroyPipelineCache")(context.device, probe, nullptr);
+        if (!stored) {
+            std::cout << "skipped, the driver does not keep all six test pipelines in a pipeline cache\n";
+            return 77;
+        }
+    }
+    const auto interval = PipelineCache::PeriodicInterval();
+    Require(interval == std::chrono::seconds(PipelineCache::PeriodicSaveSeconds), "the periodic interval is not the default (APS5_PIPELINE_CACHE_SAVE_SECONDS set?)");
+    const auto later = [&](std::chrono::seconds by) { return PipelineCache::Clock::now() + by; };
+
+    std::filesystem::path path;
+    {
+        PipelineCache first(context, properties);
+        path = first.Path();
+        Require(!path.empty() && path.parent_path() == directory, "the pipeline cache file is not in the test's cache directory");
+        Require(!first.SaveIfDue(later(interval * 2)), "an unchanged empty cache was written");
+        build(first.Handle(), 0);
+        Require(!first.SaveIfDue(later(std::chrono::seconds(0))), "a small change was written before the periodic interval passed");
+        Require(!std::filesystem::exists(path), "a cache file appeared before the periodic interval passed");
+        Require(first.SaveIfDue(later(interval + std::chrono::seconds(1))), "a changed cache was not written once the periodic interval passed");
+        Require(std::filesystem::exists(path), "the periodic save wrote no file");
+        const auto written = contents(path);
+        Require(!first.SaveIfDue(later(interval * 4)), "an unchanged cache was written again");
+        Require(contents(path) == written, "the file changed without a change in the cache");
+        build(first.Handle(), 1);
+        Require(!first.SaveIfDue(later(interval / 2)), "a small change was written before the interval since the last save passed");
+        Require(first.SaveIfDue(later(interval + std::chrono::seconds(1))), "a second change was not written after the interval");
+        Require(temporaries() == 0, "the periodic saves left temporaries next to the cache file");
+    }
+    const auto twoPipelines = contents(path);
+    {
+        PipelineCache reloaded(context, properties);
+        Require(holds(reloaded.Handle(), 0) && holds(reloaded.Handle(), 1), "a reloaded cache lacks the periodically saved pipelines");
+    }
+    Require(contents(path) == twoPipelines, "an object that added nothing rewrote the file at teardown");
+
+    {
+        PipelineCache exiting(context, properties);
+        build(exiting.Handle(), 2);
+        const auto started = std::chrono::steady_clock::now();
+        PipelineCache::SaveAllForExit(std::chrono::seconds(20));
+        Require(std::chrono::steady_clock::now() - started < std::chrono::seconds(20), "the exit save ran into its bound");
+        Require(contents(path) != twoPipelines, "the exit save did not write the changed cache");
+        const auto afterExit = contents(path);
+        PipelineCache::SaveAllForExit(std::chrono::seconds(20));
+        Require(contents(path) == afterExit, "a second exit save rewrote an unchanged cache");
+    }
+    {
+        PipelineCache reloaded(context, properties);
+        Require(holds(reloaded.Handle(), 2), "the exit save lost the pipeline built before it");
+    }
+
+    {
+        // Two objects loaded the same file and the one with more new pipelines writes first: the
+        // other must not replace that file, at the interval or at teardown.
+        auto larger = std::make_unique<PipelineCache>(context, properties);
+        auto smaller = std::make_unique<PipelineCache>(context, properties);
+        build(larger->Handle(), 3);
+        build(smaller->Handle(), 3);
+        build(larger->Handle(), 4);
+        Require(bytes(smaller->Handle()) < bytes(larger->Handle()), "the fixture's smaller cache is not smaller");
+        Require(larger->SaveIfDue(later(interval * 2)), "the object with more pipelines did not write its cache");
+        const auto largerFile = contents(path);
+        Require(!smaller->SaveIfDue(later(interval * 2)), "a cache with less data replaced a file another object wrote");
+        smaller.reset();
+        Require(contents(path) == largerFile, "a cache with less data replaced another object's file at teardown");
+        larger.reset();
+        Require(contents(path) == largerFile, "the writing object rewrote its unchanged file at teardown");
+    }
+    const auto beforeDamage = contents(path);
+
+    {
+        // A save that stopped part way leaves a temporary; a load removes it and still reads the file.
+        auto stale = path;
+        stale += ".tmp.1.0";
+        std::ofstream(stale, std::ios::binary) << "partial";
+        PipelineCache cleaned(context, properties);
+        Require(!std::filesystem::exists(stale), "a load left a stale temporary in place");
+        Require(holds(cleaned.Handle(), 3), "a stale temporary disturbed the load");
+    }
+    Require(contents(path) == beforeDamage, "a load with a stale temporary rewrote the file");
+
+    for (const bool truncate : {true, false}) {
+        auto damaged = beforeDamage;
+        if (truncate) damaged.resize(damaged.size() / 2);
+        else damaged.back() ^= 0x5a;
+        std::ofstream(path, std::ios::binary | std::ios::trunc).write(damaged.data(), static_cast<std::streamsize>(damaged.size()));
+        {
+            PipelineCache replacing(context, properties);
+            Require(!holds(replacing.Handle(), 0), truncate ? "a truncated cache file was loaded" : "a cache file with a bad checksum was loaded");
+            Require(replacing.SaveIfDue(later(interval * 2)), truncate ? "a truncated cache file was not replaced" : "a cache file with a bad checksum was not replaced");
+        }
+        PipelineCache reloaded(context, properties);
+        Require(holds(reloaded.Handle(), 0), "the replacement of a damaged file lost its pipeline");
+    }
+
+    {
+        const auto target = directory / "durable.bin";
+        std::vector<std::byte> payload(3 * 1024 * 1024 + 17);
+        for (std::size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<std::byte>(i * 131u);
+        Require(PipelineCache::WriteFileDurably(target, payload), "the durable write failed");
+        Require(contents(target).size() == payload.size(), "the durable write wrote a partial file");
+        Require(PipelineCache::WriteFileDurably(target, std::span(payload).first(1000)), "the durable write over an existing file failed");
+        const auto read = contents(target);
+        Require(read.size() == 1000 && std::memcmp(read.data(), payload.data(), 1000) == 0, "the durable write did not replace the file whole");
+        Require(temporaries() == 0, "the durable write left a temporary");
+#ifdef _WIN32
+        // A reader holding the file open (as another process's load does) keeps it whole: the rename
+        // fails, the old file stays and the temporary goes.
+        const HANDLE reader = CreateFileW(target.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        Require(reader != INVALID_HANDLE_VALUE, "cannot open the durable file for reading");
+        const bool replaced = PipelineCache::WriteFileDurably(target, payload);
+        CloseHandle(reader);
+        Require(!replaced && contents(target).size() == 1000, "a write replaced a file another reader held open");
+        Require(temporaries() == 0, "a failed durable write left a temporary");
+#endif
+    }
+    std::cout << "Pipeline cache file periodic, exit and durable write tests passed\n";
+    return 0;
+}
+
 // The committer paths behind live `spec_key_hash`, `spec_pipeline` and `spec_own_pending`: the
 // resource cache's lookup with a precomputed hash, the pipeline store's peek and take, and the
 // pending verdict of a speculated proof.
@@ -5031,6 +5251,7 @@ int main(int argc, char** argv) {
             pipelineCacheTests(device, std::string_view(argv[1]) == "--benchmark-pipeline-cache");
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--pipeline-cache-file-only") return pipelineCacheFileTests(device);
         if (argc == 2 && std::string_view(argv[1]) == "--commit-paths-only") {
             commitPathTests(device);
             entryStampTests(device);

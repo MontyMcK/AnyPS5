@@ -13,7 +13,17 @@ extern "C" int APS5_VABI at_quick_exit_nid_postfix(GuestQuickExitCallback);
 extern "C" void APS5_VABI quick_exit_nid_postfix(int);
 namespace {
 bool cleaned = false;
-void Cleanup() { cleaned = true; }
+bool prepared = false;
+void Prepare() {
+    if (LibcShutdownToken_nid_postfix().stop_requested()) std::_Exit(4);
+    prepared = true;
+}
+void Cleanup() { cleaned = prepared; }
+void ShutdownAfterPreparation() {
+    if (!prepared) std::_Exit(5);
+    std::puts("Exit preparation ran before the shutdown");
+    std::fflush(stdout);
+}
 void VerifyExit() {
     if (!cleaned) std::_Exit(1);
     std::puts("Guest shutdown and atexit completed");
@@ -26,7 +36,11 @@ void APS5_VABI QuickFirst() {
     std::fflush(stdout);
 }
 void Require(bool value) { if (!value) std::abort(); }
-void UnexpectedCleanup() { std::_Exit(3); }
+void UnexpectedCleanup() {
+    std::puts("Unexpected cleanup ran");
+    std::fflush(stdout);
+    std::_Exit(3);
+}
 }
 int main(int argc, char** argv) {
     if (argc > 1 && std::strcmp(argv[1], "--immediate") == 0) {
@@ -34,6 +48,14 @@ int main(int argc, char** argv) {
         Require(std::atexit(UnexpectedCleanup) == 0);
         _Exit_nid_postfix(0);
         return 2;
+    }
+    if (argc > 1 && std::strcmp(argv[1], "--requested-exit") == 0) {
+        LibcRegisterExitPreparation_nid_postfix(Prepare);
+        LibcRegisterShutdown_nid_postfix(ShutdownAfterPreparation);
+        Require(std::atexit(UnexpectedCleanup) == 0);
+        LibcRequestExit_nid_postfix(0);
+        Require(prepared);
+        LibcAwaitExit_nid_postfix();
     }
     if (argc > 1 && std::strcmp(argv[1], "--return-from-main") == 0) {
         catchReturnFromMain_nid_postfix(0);
@@ -46,6 +68,7 @@ int main(int argc, char** argv) {
         return 2;
     }
     if (argc > 1) {
+        LibcRegisterExitPreparation_nid_postfix(Prepare);
         LibcRegisterShutdown_nid_postfix(Cleanup);
         Require(std::atexit(VerifyExit) == 0);
         sceSystemServiceLoadExec("exit", nullptr);
