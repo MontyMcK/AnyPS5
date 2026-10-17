@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/NvPerfRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "BdaAbi.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DebugControls.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSpeculation.hpp"
@@ -232,8 +233,8 @@ VulkanDevice::PresentStatistics presentCounters{};
 
 }
 
-// A compute dispatch's Vulkan objects, shared by every dispatch of the same compiled variant and
-// kept by the recorder until the batches using them completed (a Recipe references them weakly).
+// A compute dispatch's Vulkan objects, shared by every dispatch of the same module and kept by the
+// recorder until the batches using them completed (a Recipe references them weakly).
 struct ComputePipelineObjects {
     VkDevice device = VK_NULL_HANDLE;
     PFN_vkDestroyShaderModule destroyModule = nullptr;
@@ -242,11 +243,25 @@ struct ComputePipelineObjects {
     VkShaderModule module = VK_NULL_HANDLE;
     VkPipelineLayout layout = VK_NULL_HANDLE;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    // The set layout the pipeline layout was made over, and whether the journal replay built the
+    // objects (over the layout of an earlier run's first dispatch of the module).
+    VkDescriptorSetLayout resourcesLayout = VK_NULL_HANDLE;
+    bool replayed = false;
     ~ComputePipelineObjects() {
         if (pipeline != VK_NULL_HANDLE) destroyPipeline(device, pipeline, nullptr);
         if (layout != VK_NULL_HANDLE) destroyLayout(device, layout, nullptr);
         if (module != VK_NULL_HANDLE) destroyModule(device, module, nullptr);
     }
+};
+
+// Pipelines are shared by dispatches of one module (the result's run-stable identity) with the
+// same push constant use; descriptor set layouts built from the same bindings are compatible, so
+// the pipeline layout of the first dispatch, or of the journal replay, serves them all.
+struct ComputePipelineKey {
+    Graphics::PipelineIdentity identity;
+    bool pushConstants = false;
+    auto operator<=>(const ComputePipelineKey&) const = default;
+    static ComputePipelineKey Of(const ShaderRecompiler::RecompileResult& shader, bool pushConstants) { return {Graphics::StageIdentity(shader), pushConstants}; }
 };
 
 struct VulkanDevice::State {
@@ -342,11 +357,17 @@ struct VulkanDevice::State {
     // Device-local buffers of a repeated 16-byte fill pattern (FillBuffer), most recently used
     // last; each is filled once by a doubling chain in device memory.
     std::vector<std::pair<std::array<std::uint32_t, 4>, std::shared_ptr<Graphics::DeviceBuffer>>> patternBuffers;
-    // Compute pipeline objects by variant (and push-constant use), under their own mutex: the
-    // dispatch's find-or-insert and the verify switch's lookups touch the map, recipes hold weak
-    // references to its objects.
+    // Compute pipeline objects by module identity (and push-constant use), under their own mutex:
+    // the dispatch's find-or-insert, the journal replay's insert and the verify switch's lookups
+    // touch the map, recipes hold weak references to its objects.
     std::mutex computePipelinesMutex;
-    std::map<std::uint64_t, std::shared_ptr<ComputePipelineObjects>> computePipelines;
+    std::map<ComputePipelineKey, std::shared_ptr<ComputePipelineObjects>> computePipelines;
+    // The journal replay building this device's pipelines on its own threads; drained first at
+    // teardown and before a replacement.
+    std::shared_ptr<Graphics::PipelineJournalReplay> journalReplay;
+    std::mutex journalReplayMutex;
+    std::atomic<bool> journalReplayPending{false};
+    std::atomic<std::uint64_t> computePipelinesCreated{0};
     std::unique_ptr<Graphics::GpuColorTransfer> colorTransfer;
     std::shared_ptr<Graphics::BufferPool> bufferPool;
     std::unique_ptr<Graphics::Buffer> emptyBuffer;
@@ -631,6 +652,13 @@ struct VulkanDevice::State {
     }
 
     ~State() {
+        journalReplayPending.store(false, std::memory_order_release);
+        if (journalReplay != nullptr) {
+            journalReplay->Cancel();
+            journalReplay->Wait();
+            journalReplay.reset();
+            Graphics::ReportPipelineJournal();
+        }
         if (timelineCalibration) Graphics::CpuTimeline::ClearCalibration(this);
         contextReady = false;
         if (device != VK_NULL_HANDLE) {
@@ -1486,6 +1514,95 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     state->context = buildContext();
     state->contextReady = true;
     if (window != nullptr) setupPresentation(*window);
+    // A device without a window starts its replay at its first draw or dispatch, or when it takes
+    // the window (AttachWindow), rather than at creation: the driver replaces a headless device that
+    // cannot present, so the journal is replayed once, on the device the title draws with.
+    state->journalReplayPending.store(true, std::memory_order_release);
+    if (window != nullptr) startJournalReplay();
+}
+
+void VulkanDevice::startJournalReplay() {
+    if (!state->journalReplayPending.load(std::memory_order_acquire)) return;
+    std::lock_guard lock(state->journalReplayMutex);
+    if (!state->journalReplayPending.exchange(false, std::memory_order_acq_rel)) return;
+    state->journalReplay = Graphics::StartPipelineJournalReplay(graphicsContext(), Graphics::PipelineJournalDeviceFingerprint(state->properties), {[this](const ShaderRecompiler::RecompileResult& shader, bool pushConstants, std::span<const std::uint32_t> layoutKey) { return ReplayComputePipeline(shader, pushConstants, layoutKey); }});
+}
+
+// The module, pipeline layout and pipeline of a compute result over `resourcesLayout`: what a
+// dispatch builds at the first use of a module, and what the journal replay builds on its own
+// threads before that use.
+std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress) {
+    const auto context = graphicsContext();
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto objects = std::make_shared<ComputePipelineObjects>();
+    objects->device = state->device;
+    objects->destroyModule = state->DeviceFunction<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
+    objects->destroyLayout = state->DeviceFunction<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
+    objects->destroyPipeline = state->DeviceFunction<PFN_vkDestroyPipeline>("vkDestroyPipeline");
+    VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    moduleInfo.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
+    moduleInfo.pCode = shader.spirv.Words().data();
+    check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, nullptr, &objects->module), "vkCreateShaderModule");
+    objects->resourcesLayout = resourcesLayout;
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::PipelinePushConstantBytes};
+    VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layoutInfo.setLayoutCount = 1;
+    layoutInfo.pSetLayouts = &resourcesLayout;
+    layoutInfo.pushConstantRangeCount = pushStages != 0 ? 1 : 0;
+    layoutInfo.pPushConstantRanges = pushStages != 0 ? &push : nullptr;
+    check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, nullptr, &objects->layout), "vkCreatePipelineLayout");
+    VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    pipelineInfo.flags = context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0;
+    pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    pipelineInfo.stage.module = objects->module;
+    pipelineInfo.stage.pName = "main";
+    const Graphics::PipelineSpecialization specialization(shader);
+    pipelineInfo.stage.pSpecializationInfo = specialization.Info();
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT requiredSubgroup{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT};
+    requiredSubgroup.requiredSubgroupSize = std::min(shader.hostSubgroupSize, state->maxComputeSubgroupSize);
+    if (state->computeWave32 && (shader.hostSubgroupSize == 32u || shader.hostSubgroupSize > state->maxComputeSubgroupSize)) pipelineInfo.stage.pNext = &requiredSubgroup;
+    pipelineInfo.layout = objects->layout;
+    if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
+    const auto createStarted = std::chrono::steady_clock::now();
+    check(state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(state->device, context.pipelineCache, 1, &pipelineInfo, nullptr, &objects->pipeline), "vkCreateComputePipelines");
+    const auto createSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - createStarted).count();
+    if (createSeconds > 0.25) std::fprintf(stderr, "[dispatch] compute pipeline for %zu SPIR-V words (program 0x%llx) took %.2f s%s\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress), createSeconds, Graphics::PipelineJournalReplaying() ? " (journal replay)" : "");
+    Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);
+    state->computePipelinesCreated.fetch_add(1, std::memory_order_relaxed);
+    return objects;
+}
+
+void VulkanDevice::WaitForPipelineJournalReplay() {
+    startJournalReplay();
+    std::shared_ptr<Graphics::PipelineJournalReplay> replay;
+    {
+        std::lock_guard lock(state->journalReplayMutex);
+        replay = state->journalReplay;
+    }
+    if (replay != nullptr) replay->Wait();
+}
+
+std::uint64_t VulkanDevice::ComputePipelinesCreated() const {
+    return state->computePipelinesCreated.load(std::memory_order_relaxed);
+}
+
+bool VulkanDevice::ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants, std::span<const std::uint32_t> layoutKey) {
+    ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
+    const auto key = ComputePipelineKey::Of(shader, pushConstants);
+    if (key.identity.Empty()) return false;
+    {
+        std::lock_guard pipelines(state->computePipelinesMutex);
+        if (state->computePipelines.contains(key)) return false;
+    }
+    const auto context = graphicsContext();
+    std::vector<VkDescriptorSetLayoutBinding> description;
+    if (context.descriptorCache == nullptr || !Graphics::DescribeLayoutKey(layoutKey, description)) return false;
+    const auto setLayout = context.descriptorCache->Layout(layoutKey, description);
+    auto objects = createComputePipeline(shader, setLayout, pushConstants ? VK_SHADER_STAGE_COMPUTE_BIT : 0u, 0);
+    objects->replayed = true;
+    std::lock_guard pipelines(state->computePipelinesMutex);
+    return state->computePipelines.try_emplace(key, std::move(objects)).second;
 }
 
 // The swapchain and presentation state for the device's surface (state->surface, made for
@@ -1609,16 +1726,36 @@ bool VulkanDevice::AttachWindow(const PresentationWindow& window) {
     state->window = window.context;
     APS5_LOG_OUT("Vulkan surface attached surface=%p window=%p", reinterpret_cast<void*>(state->surface), state->window);
     setupPresentation(window);
+    // The headless device keeps serving with the window: its journal replay starts now if no draw
+    // or dispatch started it.
+    startJournalReplay();
     return true;
 }
 
 void VulkanDevice::PrepareForReplacement() {
     GuestMemory::AssertGpuLockHeld("VulkanDevice::PrepareForReplacement");
     require(state->recorder != nullptr && Graphics::Recorder::Active() == state->recorder.get(), "device replacement requires its active recorder");
+    state->journalReplayPending.store(false, std::memory_order_release);
+    {
+        std::shared_ptr<Graphics::PipelineJournalReplay> replay;
+        {
+            std::lock_guard lock(state->journalReplayMutex);
+            replay = std::move(state->journalReplay);
+        }
+        if (replay != nullptr) {
+            replay->Cancel();
+            replay->Wait();
+        }
+    }
     Graphics::FlushCachedTextures(state->device);
     Graphics::PublishAllShadows(state->context, Graphics::PublishReason::Teardown);
     WaitIdle();
     Graphics::DestroyShadows(state->device);
+    // The replacement's draws never find this device's pipelines (the store keys on the device), and
+    // the device lives on until the driver stops: destroy them now rather than then.
+    Graphics::ClearCachedPipelines(state->device);
+    std::lock_guard pipelines(state->computePipelinesMutex);
+    state->computePipelines.clear();
 }
 
 void VulkanDevice::WaitIdle() {
@@ -3218,6 +3355,7 @@ bool VulkanDevice::ApplyForkedDraw(const Graphics::Context& context, std::span<c
 }
 
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {
+    startJournalReplay();
     for (const auto& shader : shaders) {
         require(shader.program != nullptr, "missing compiled shader");
         ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
@@ -4202,6 +4340,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut) {
+    startJournalReplay();
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     PerformanceTimer timing("Vulkan.Dispatch");
     if (recipeOut != nullptr) *recipeOut = nullptr;
@@ -4224,11 +4363,10 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     if (arguments == 0 && (x > limit[0] || y > limit[1] || z > limit[2])) {
         throw std::runtime_error("Vulkan dispatch: workgroup count exceeds device limits");
     }
-    // Pipelines are shared by dispatches of one compiled variant; descriptor set layouts built from the
-    // same bindings are compatible, so the pipeline layout of the first dispatch serves them all.
-    const std::uint64_t pipelineKey = shader.PipelineVariantId() != 0 ? (shader.PipelineVariantId() << 1u) | (pushStages != 0 ? 1u : 0u) : 0u;
+    // Pipelines are shared by dispatches of one module (ComputePipelineKey).
+    const auto pipelineKey = ComputePipelineKey::Of(shader, pushStages != 0);
     std::shared_ptr<ComputePipelineObjects> objects;
-    if (pipelineKey != 0) {
+    if (!pipelineKey.identity.Empty()) {
         std::lock_guard pipelines(state->computePipelinesMutex);
         if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end()) objects = found->second;
     }
@@ -4370,49 +4508,31 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     }
     timing.Mark("shader_resources");
     timer.phase(PhaseResources);
+    // A pipeline the journal replay built is over the layout of an earlier run's first dispatch of
+    // the module: a dispatch whose own layout differs builds its pipeline and takes the slot (the
+    // replayed objects go with their last holder).
+    if (objects != nullptr && objects->replayed && objects->resourcesLayout != resources->Layout()) objects = nullptr;
+    static const bool verifySetLayouts = std::getenv("APS5_VERIFY_SET_LAYOUTS") != nullptr;
+    if (verifySetLayouts && objects != nullptr) require(objects->resourcesLayout == resources->Layout(), "the resident compute pipeline's set layout differs from the dispatch's");
     if (objects == nullptr) {
-        objects = std::make_shared<ComputePipelineObjects>();
-        objects->device = state->device;
-        objects->destroyModule = state->DeviceFunction<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
-        objects->destroyLayout = state->DeviceFunction<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
-        objects->destroyPipeline = state->DeviceFunction<PFN_vkDestroyPipeline>("vkDestroyPipeline");
-        VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
-        moduleInfo.codeSize = shader.spirv.size() * sizeof(std::uint32_t);
-        moduleInfo.pCode = shader.spirv.data();
-        check(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule")(state->device, &moduleInfo, nullptr, &objects->module), "vkCreateShaderModule");
         timing.Mark("validate_shader_module");
-        const auto setLayout = resources->Layout();
-        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::PipelinePushConstantBytes};
-        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        layoutInfo.setLayoutCount = 1;
-        layoutInfo.pSetLayouts = &setLayout;
-        layoutInfo.pushConstantRangeCount = pushStages != 0 ? 1 : 0;
-        layoutInfo.pPushConstantRanges = pushStages != 0 ? &push : nullptr;
-        check(state->DeviceFunction<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(state->device, &layoutInfo, nullptr, &objects->layout), "vkCreatePipelineLayout");
-        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        pipelineInfo.flags = context.pipelineExecutableInfo ? VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR : 0;
-        pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
-        pipelineInfo.stage.module = objects->module;
-        pipelineInfo.stage.pName = "main";
-        const Graphics::PipelineSpecialization specialization(shader);
-        pipelineInfo.stage.pSpecializationInfo = specialization.Info();
-        VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT requiredSubgroup{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT};
-        requiredSubgroup.requiredSubgroupSize = std::min(shader.hostSubgroupSize, state->maxComputeSubgroupSize);
-        if (state->computeWave32 && (shader.hostSubgroupSize == 32u || shader.hostSubgroupSize > state->maxComputeSubgroupSize)) pipelineInfo.stage.pNext = &requiredSubgroup;
-        pipelineInfo.layout = objects->layout;
-        if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] creating a pipeline for %zu SPIR-V words (program 0x%llx)\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress));
-        const auto createStarted = std::chrono::steady_clock::now();
-        check(state->DeviceFunction<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(state->device, context.pipelineCache, 1, &pipelineInfo, nullptr, &objects->pipeline), "vkCreateComputePipelines");
-        const auto createSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - createStarted).count();
-        if (createSeconds > 0.25) std::fprintf(stderr, "[dispatch] compute pipeline for %zu SPIR-V words (program 0x%llx) took %.2f s\n", shader.spirv.size(), static_cast<unsigned long long>(programAddress), createSeconds);
-        Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);
+        objects = createComputePipeline(shader, resources->Layout(), pushStages, programAddress);
         timing.Mark("pipeline_create");
-        if (pipelineKey != 0) {
-            // Find-or-insert: objects another dispatch of the variant mapped meanwhile serve this
-            // one too (this call's go with the batch that keeps them).
+        if (!pipelineKey.identity.Empty()) {
+            // Find-or-insert: objects another dispatch of the module mapped meanwhile (or the journal
+            // replay, unless they were replayed over another layout) serve this one too (this call's
+            // go with the batch that keeps them).
             std::lock_guard pipelines(state->computePipelinesMutex);
-            objects = state->computePipelines.try_emplace(pipelineKey, objects).first->second;
+            auto [slot, inserted] = state->computePipelines.try_emplace(pipelineKey, objects);
+            if (!inserted && slot->second->replayed && slot->second->resourcesLayout != objects->resourcesLayout) slot->second = objects;
+            else objects = slot->second;
+        }
+        if (Graphics::PipelineJournalEnabled()) {
+            try {
+                Graphics::RecordComputePipeline(shader, pushStages != 0, resources->LayoutKey());
+            } catch (...) {
+                // Best effort: the dispatch does not fail for its journal record.
+            }
         }
         timer.phase(PhasePipeline);
     }
@@ -4547,7 +4667,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
             return RecipeOutcome::Rebuild;
         }
         std::shared_ptr<ComputePipelineObjects> mapped;
-        const auto pipelineKey = (shader.PipelineVariantId() << 1u) | (recipe.pushes ? 1u : 0u);
+        const auto pipelineKey = ComputePipelineKey::Of(shader, recipe.pushes);
         {
             std::lock_guard pipelines(state->computePipelinesMutex);
             if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end()) mapped = found->second;

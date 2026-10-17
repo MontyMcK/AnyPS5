@@ -78,13 +78,32 @@ private:
     std::vector<CachedFramebuffer> framebuffers;
 };
 
-// The pipeline for this configuration, shared across draws and frames: keyed by the stages' variant
-// ids (the rect-list tessellation pair by the vertex and fragment ids that generate it), the vertex
-// input layout, the descriptor set layout key, push constant stages and every pipeline state field.
-// A configuration whose stage has no variant id gets a private pipeline. Entries are LRU-bounded and
-// only evicted once no recorded draw holds them. Debug aid: APS5_NO_PIPELINE_CACHE=1 builds one per
-// draw as before.
+// The pipeline for this configuration, shared across draws and frames: keyed by the stages'
+// identities (StageIdentity: the module, specialization constants, subgroup width and bindings'
+// shape, the same on every run; the rect-list tessellation pair by its generated modules'), the
+// vertex input layout, the descriptor set layout key, push constant stages and every pipeline state
+// field. A configuration whose stage has no module gets a private pipeline. A miss builds the
+// pipeline outside the store's mutex (a concurrent build of the same key keeps the first inserted)
+// and records its recipe in the pipeline journal. Entries are LRU-bounded
+// (APS5_PIPELINE_STORE_ENTRIES, else APS5_PIPELINE_CACHE_ENTRIES, 4096) and only evicted once no
+// recorded draw holds them. Debug aid: APS5_NO_PIPELINE_CACHE=1 builds one per draw as before.
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, bool mayDefer = false);
+// The same over a descriptor set layout named by its key (what ShaderResources::LayoutKey lists;
+// `setLayout` is the layout the DescriptorCache builds from it): the journal replay's entry, which
+// has no ShaderResources. `created` reports whether this call built and inserted the pipeline.
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, std::span<const std::uint32_t> layoutKey, VkDescriptorSetLayout setLayout, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool* created = nullptr);
+// Cumulative pipeline store outcomes since start-up (the [pipecache] line reports 10 s windows).
+struct PipelineStoreCounters {
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+    std::uint64_t uncached = 0;
+    std::uint64_t evicted = 0;
+    std::uint64_t cached = 0;
+    std::uint64_t bound = 0;
+};
+PipelineStoreCounters PipelineStoreTotals();
+// The pipeline store's key of a configuration (empty when the configuration gets a private pipeline).
+void BuildPipelineStoreKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& vertexInput, std::span<const std::uint32_t> layoutKey, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout);
 // A pipeline store hit found off the committer (a draw speculation's pipeline, live
 // `spec_pipeline`): the entry's key hash, its pipeline (weakly: a peek must not pin the entry against
 // eviction or outlive the device; while it locks, its identity is the entry's) and the resources

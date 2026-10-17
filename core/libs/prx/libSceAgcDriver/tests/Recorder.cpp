@@ -3512,10 +3512,13 @@ void pipelineCacheTests(const Device& device, bool benchmark) {
     input = {};
     Require(lookup(input) == first, "pipeline cache retained bytes from a larger key");
     vertex.variantId = 0;
-    const auto unidentified = lookup(input);
-    Require(lookup(input) != unidentified, "pipeline cache retained an unidentified shader");
+    Require(lookup(input) == first, "pipeline cache keyed on the variant id instead of the module");
+    vertex.spirv[2] ^= 1u;
+    const auto other = lookup(input);
+    Require(other != first && lookup(input) == other, "pipeline cache ignored another module");
+    vertex.spirv[2] ^= 1u;
     vertex.variantId = 1;
-    Require(lookup(input) == first, "an unidentified shader disturbed the retained pipeline");
+    Require(lookup(input) == first, "another module disturbed the retained pipeline");
     ClearCachedPipelines(context.device);
     Require(lookup(input) != first, "clearing the pipeline cache retained its old entry");
     std::cout << "Pipeline cache key and retained lifetime tests passed\n";
@@ -3584,7 +3587,10 @@ void commitPathTests(const Device& device) {
     Require(rebuilt != cached && TakePeekedPipeline(context, peek, *resources) == nullptr, "a take served a replaced entry");
     Require(TakePeekedPipeline(context, PeekCachedPipeline(context, state, input, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL), *resources) == rebuilt, "a fresh peek missed the replacement");
     vertex.variantId = 0;
-    Require(PeekCachedPipeline(context, state, input, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL).pipeline.expired(), "a peek served a private configuration");
+    Require(PeekCachedPipeline(context, state, input, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL).pipeline.lock() == rebuilt, "a peek keyed on the variant id instead of the module");
+    vertex.spirv[2] ^= 1u;
+    Require(PeekCachedPipeline(context, state, input, *resources, shaders, VK_IMAGE_LAYOUT_GENERAL).pipeline.expired(), "a peek served another module's pipeline");
+    vertex.spirv[2] ^= 1u;
     vertex.variantId = 11;
 
     // Pending verdicts: one query per surface; the own-source rule accepts only a view whose own

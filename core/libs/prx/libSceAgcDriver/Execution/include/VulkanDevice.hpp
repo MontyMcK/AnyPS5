@@ -31,10 +31,21 @@ struct PreparedDispatch;
 struct RecipeHit;
 // The record tail shared by an ordinary dispatch and a recipe hit (VulkanDevice::recordDispatch).
 struct RecordedDispatch;
+// The module, layout and pipeline a compute dispatch binds (VulkanDevice::createComputePipeline).
+struct ComputePipelineObjects;
 
 class VulkanDevice {
 public:
     explicit VulkanDevice(const PresentationWindow* window = nullptr);
+    // Builds the pipeline of a journaled compute result over the set layout `layoutKey` describes,
+    // ahead of its first dispatch (the journal replay's hook, on its threads): false when the device
+    // already holds a pipeline for the module or the key describes no layout.
+    bool ReplayComputePipeline(const ShaderRecompiler::RecompileResult& shader, bool pushConstants, std::span<const std::uint32_t> layoutKey);
+    // Starts the journal replay if the device has not (a headless device starts it at its first
+    // draw or dispatch, or when it takes the window) and joins it (tests; the teardown joins it anyway).
+    void WaitForPipelineJournalReplay();
+    // Compute pipelines this device built, by dispatches and by the journal replay (tests).
+    std::uint64_t ComputePipelinesCreated() const;
     ~VulkanDevice();
     VulkanDevice(const VulkanDevice&) = delete;
     VulkanDevice& operator=(const VulkanDevice&) = delete;
@@ -54,6 +65,7 @@ public:
     // three-step form below so the GPU wait happens without the mutex.
     void WaitIdle();
     void PrepareForReplacement();
+    void startJournalReplay();
     // Gives a headless device the window (surface, swapchain, presentation state) instead of the
     // driver replacing it with a windowed device; false when this device cannot present to it.
     // Requires the GPU mutex.
@@ -335,6 +347,7 @@ private:
     // The device's Graphics::Context: a copy of the one built at setup (its instance functions
     // resolved then, its function table filled then), or with APS5_NO_CONTEXT_CACHE=1 built anew.
     Graphics::Context graphicsContext() const;
+    std::shared_ptr<ComputePipelineObjects> createComputePipeline(const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout resourcesLayout, VkShaderStageFlags pushStages, std::uint64_t programAddress);
     void setupPresentation(const PresentationWindow& window);
     ShaderRecompiler::SpirvTarget buildTarget() const;
     Graphics::Context buildContext() const;
