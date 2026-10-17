@@ -352,6 +352,8 @@ public:
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
+    bool ReadsInPlace(std::uint64_t address, std::uint64_t bytes) const;
+    bool InPlaceReadsOverlap(std::uint64_t address, std::uint64_t bytes) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> TrackedReads() const;
     // The same split: the cached address space's serial (0 without one) and its in-place regions,
     // and the regions of this build outside it.

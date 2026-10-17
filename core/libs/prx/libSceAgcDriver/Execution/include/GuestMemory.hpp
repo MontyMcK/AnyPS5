@@ -174,6 +174,7 @@ private:
     // elsewhere or with APS5_STD_GPU_MUTEX=1.
     bool rawTryLock();
     void rawLock();
+    void rawLockSpinning();
     void rawUnlock();
     std::recursive_mutex mutex;
     void* srwLock = nullptr;

@@ -21,6 +21,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
 #include <algorithm>
@@ -757,11 +758,29 @@ std::set<std::uint32_t> CachedFragmentOutputs(const Context& context, std::span<
     std::vector<std::uint64_t> key;
     const bool keyed = ValidationKey(context, shaders, state, key);
     static std::map<std::vector<std::uint64_t>, std::set<std::uint32_t>> memo;
+    struct LastValidation {
+        std::vector<std::uint64_t> key;
+        std::set<std::uint32_t> outputs;
+        bool valid = false;
+    };
+    struct LastValidationStorage {};
+    auto& last = HostThreadLocal<LastValidation, LastValidationStorage>();
+    auto& lastKey = last.key;
+    auto& lastOutputs = last.outputs;
+    auto& lastValid = last.valid;
+    if (keyed && lastValid && key == lastKey) {
+        memoized = true;
+        hit = true;
+        return lastOutputs;
+    }
     if (keyed) {
         memoized = true;
         std::lock_guard lock(validationMutex());
         if (const auto found = memo.find(key); found != memo.end()) {
             hit = true;
+            lastKey = key;
+            lastOutputs = found->second;
+            lastValid = true;
             return found->second;
         }
     }

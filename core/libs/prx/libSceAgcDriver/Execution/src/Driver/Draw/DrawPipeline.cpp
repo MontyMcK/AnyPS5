@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -701,6 +702,11 @@ void DrawPipeline::run() {
     };
     for (;;) {
         if (hold.owns_lock() && !passRun.Active() && (outstanding.load(std::memory_order_acquire) == 0 || GuestMemory::GpuMutex().Contenders() != 0 || std::chrono::steady_clock::now() - heldSince > holdBudget || !Graphics::CommitHoldEnabled())) hold.unlock();
+        if (!hold.owns_lock() && outstanding.load(std::memory_order_acquire) == 0) {
+            committerIdle.store(true, std::memory_order_relaxed);
+            SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
+            committerIdle.store(false, std::memory_order_relaxed);
+        }
         Commit* commit = nullptr;
         std::uint64_t sequence = 0;
         std::shared_ptr<ReplaySegment> segment;
@@ -998,6 +1004,7 @@ void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     const ProducerScope producer(Producer::Draining);
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     const auto start = std::chrono::steady_clock::now();
+    if (!OnPrepThread()) SpinUntil(HandoffSpinWindow() * 2, [&] { return !Busy(); });
     drainPrep();
     std::unique_lock lock(mutex);
     ++idleWaiters;

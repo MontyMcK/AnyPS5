@@ -15,6 +15,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <vector>
 
@@ -93,6 +94,18 @@ std::vector<std::unique_ptr<TPage>>& pagePool() {
 
 constexpr std::size_t PagePoolLimit = 64;
 
+template<typename TPage>
+struct SharedPagePool {
+    std::mutex mutex;
+    std::vector<std::unique_ptr<TPage>> pages;
+};
+
+template<typename TPage>
+SharedPagePool<TPage>& sharedPagePool() {
+    static auto* pool = new SharedPagePool<TPage>();
+    return *pool;
+}
+
 }
 
 void ShaderMemory::SetWaitedMsProvider(WaitedMsProvider provider) {
@@ -115,9 +128,14 @@ ShaderMemory::ShaderMemory(ShaderMemory&& other) noexcept : initial(std::move(ot
 
 ShaderMemory::~ShaderMemory() {
     auto& pool = pagePool<Page>();
-    for (const auto& [base, page] : pages) {
-        if (pool.size() < PagePoolLimit) pool.emplace_back(page);
-        else delete page;
+    std::size_t kept = 0;
+    for (; kept < pages.size() && pool.size() < PagePoolLimit; ++kept) pool.emplace_back(pages[kept].second);
+    if (kept == pages.size()) return;
+    auto& shared = sharedPagePool<Page>();
+    std::lock_guard lock(shared.mutex);
+    for (; kept < pages.size(); ++kept) {
+        if (shared.pages.size() < 1024) shared.pages.emplace_back(pages[kept].second);
+        else delete pages[kept].second;
     }
 }
 
@@ -155,6 +173,14 @@ ShaderMemory::Page& ShaderMemory::page(std::uint64_t base) {
         return *lastPage;
     }
     auto& pool = pagePool<Page>();
+    if (pool.empty()) {
+        auto& shared = sharedPagePool<Page>();
+        std::lock_guard lock(shared.mutex);
+        for (std::size_t i = 0; i < 32 && !shared.pages.empty(); ++i) {
+            pool.push_back(std::move(shared.pages.back()));
+            shared.pages.pop_back();
+        }
+    }
     std::unique_ptr<Page> owned;
     if (pool.empty()) {
         owned = std::make_unique<Page>();

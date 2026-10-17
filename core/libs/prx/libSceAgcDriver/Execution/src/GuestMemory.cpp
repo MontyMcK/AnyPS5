@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "ThreadOwned.hpp"
@@ -2375,6 +2376,11 @@ void GpuMutexType::rawLock() {
     mutex.lock();
 }
 
+void GpuMutexType::rawLockSpinning() {
+    if (SpinUntil(HandoffSpinWindow(), [&] { return rawTryLock(); })) return;
+    rawLock();
+}
+
 void GpuMutexType::rawUnlock() {
 #ifdef _WIN32
     if (SrwGpuMutex()) {
@@ -2510,7 +2516,7 @@ void GpuMutexType::lock() {
     if (!GpuLockProfiled()) {
         if (!rawTryLock()) {
             contenders.fetch_add(1, std::memory_order_relaxed);
-            rawLock();
+            rawLockSpinning();
             contenders.fetch_sub(1, std::memory_order_relaxed);
         }
         acquired();
@@ -2528,7 +2534,7 @@ void GpuMutexType::lock() {
         if (holders) Holders().Snapshot(before);
         const auto start = std::chrono::steady_clock::now();
         contenders.fetch_add(1, std::memory_order_relaxed);
-        rawLock();
+        rawLockSpinning();
         contenders.fetch_sub(1, std::memory_order_relaxed);
         acquired();
         const auto now = std::chrono::steady_clock::now();

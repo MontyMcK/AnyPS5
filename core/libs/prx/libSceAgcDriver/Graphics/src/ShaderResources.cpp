@@ -3793,8 +3793,25 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
 }
 
 std::size_t ResourceCache::HashKey(const Key& key) noexcept {
-    std::uint64_t hash = 14695981039346656037ull;
-    for (const auto word : key) hash = (hash ^ word) * 1099511628211ull;
+    constexpr std::uint64_t Prime = 0x9e3779b97f4a7c15ull;
+    std::uint64_t lanes[4] = {0x243f6a8885a308d3ull, 0x13198a2e03707344ull, 0xa4093822299f31d0ull, 0x082efa98ec4e6c89ull};
+    const auto* words = key.data();
+    const auto count = key.size();
+    std::size_t at = 0;
+    for (; at + 8u <= count; at += 8u) {
+        for (std::size_t lane = 0; lane < 4u; ++lane) {
+            const auto value = static_cast<std::uint64_t>(words[at + lane * 2u]) | static_cast<std::uint64_t>(words[at + lane * 2u + 1u]) << 32u;
+            lanes[lane] = (lanes[lane] ^ value) * Prime;
+            lanes[lane] ^= lanes[lane] >> 29u;
+        }
+    }
+    std::uint64_t hash = lanes[0] ^ (lanes[1] << 17u | lanes[1] >> 47u) ^ (lanes[2] << 31u | lanes[2] >> 33u) ^ (lanes[3] << 47u | lanes[3] >> 17u) ^ count;
+    for (; at < count; ++at) hash = (hash ^ words[at]) * Prime;
+    hash ^= hash >> 33u;
+    hash *= 0xff51afd7ed558ccdull;
+    hash ^= hash >> 33u;
+    hash *= 0xc4ceb9fe1a85ec53ull;
+    hash ^= hash >> 33u;
     return static_cast<std::size_t>(hash);
 }
 
@@ -4827,7 +4844,6 @@ void VerifyStreamedCopy(std::uint64_t begin, std::span<const std::byte> copy) {
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if (_set == VK_NULL_HANDLE || usesBda) return {};
-    const auto reads = guestMemory.InPlaceReads();
     auto result = std::make_shared<DrawBindings>();
     thread_local std::vector<std::size_t>* selectedSlot = nullptr;
     auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
@@ -4857,7 +4873,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             size = override->size;
         } else {
             if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
-            const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
+            const bool direct = guestMemory.ReadsInPlace(item.address, item.size);
             if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
         }
         const auto begin = address - item.adjustment;
@@ -5190,8 +5206,7 @@ bool ShaderResources::WritesMemory() const {
 }
 
 bool ShaderResources::ReadsOverlap(std::uint64_t address, std::size_t bytes) const {
-    const auto reads = guestMemory.InPlaceReads();
-    return std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
+    return guestMemory.InPlaceReadsOverlap(address, bytes);
 }
 
 std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
