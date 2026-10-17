@@ -2709,6 +2709,31 @@ void flushRecordStores(const RecordedDraw& record) {
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
 }
 
+// What gpu-timeline.txt names a draw pass range by (Recorder::NoteTimedDraw): the draw's first
+// color target and depth target, and its pixel and vertex programs' guest addresses.
+Recorder::TimedDraw timedDraw(const State& state, std::span<const CompiledShader> shaders) {
+    Recorder::TimedDraw timed;
+    const ColorTarget* color = !state.colors.empty() ? &state.colors.front() : state.hasColorTarget ? &state.color : nullptr;
+    if (color != nullptr) {
+        timed.color = color->address;
+        timed.colorWidth = color->extent.width;
+        timed.colorHeight = color->extent.height;
+        timed.colorFormat = static_cast<std::uint32_t>(color->format);
+        timed.colorTargets = state.colors.empty() ? 1u : static_cast<std::uint32_t>(state.colors.size());
+    }
+    if (state.depth) {
+        timed.depth = state.depth->address;
+        timed.depthWidth = state.depth->extent.width;
+        timed.depthHeight = state.depth->extent.height;
+        timed.depthFormat = static_cast<std::uint32_t>(state.depth->format);
+    }
+    for (const auto& shader : shaders) {
+        if (shader.stage == ShaderRecompiler::ShaderStage::Fragment) timed.pixelProgram = shader.codeAddress;
+        else if (timed.vertexProgram == 0) timed.vertexProgram = shader.codeAddress;
+    }
+    return timed;
+}
+
 void emitRecord(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, DrawInputs& inputs, RecordedDraw& record, const RecordPlan& plan, DrawOutcome& outcome, DrawTimer& timer, double& ownWaitedMs) {
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
@@ -2819,6 +2844,7 @@ void emitRecord(const Context& context, const State& state, const Pm4::DrawParam
         recordLap = now;
     };
     const auto drawTiming = !continued ? recorder->BeginGpuTiming(passTimingKey) : Recorder::NoTiming;
+    if (Recorder::TimedIdentityWanted()) recorder->NoteTimedDraw(continued ? recorder->RenderPassTiming() : drawTiming, timedDraw(state, shaders));
     std::unique_ptr<DeviceBuffer> scratch;
     std::shared_ptr<Buffer> meshArguments;
     VkBuffer argumentBuffer = VK_NULL_HANDLE;
@@ -3347,6 +3373,7 @@ void drawPrepared(const Context& context, const State& state, const Pm4::DrawPar
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");
     // The draw's [gputime] class range: from its first barrier to the download barrier.
     const auto drawTiming = recorded ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    if (recorded && Recorder::TimedIdentityWanted()) recorder->NoteTimedDraw(drawTiming, timedDraw(state, shaders));
     std::unique_ptr<DeviceBuffer> scratch;
     VkBuffer argumentBuffer = VK_NULL_HANDLE;
     VkDeviceSize argumentOffset = 0;

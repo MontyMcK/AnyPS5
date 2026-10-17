@@ -667,6 +667,27 @@ public:
     // The key of the whole-batch range (first to last command; reported as "batch" on the [gputime]
     // line, apart from the per-program totals).
     static constexpr std::uint64_t BatchTimingKey = 0x3;
+    // What a timed range worked on, appended to its gpu-timeline.txt line (APS5_GPU_TIMELINE with
+    // APS5_PROFILE_GPU; nothing is kept outside that window's configuration). A draw pass range
+    // carries the targets of its first draw, its draw count and the guest program addresses of
+    // the pixel and vertex shaders that drew most in it; a surface range (storage upload or
+    // write-back, staging copies) the surface's guest address, size, formats and the path that
+    // moved it. `index` is BeginGpuTiming's (NoTiming and label-only ranges are ignored).
+    struct TimedDraw {
+        std::uint64_t color = 0;
+        std::uint32_t colorWidth = 0, colorHeight = 0, colorFormat = 0, colorTargets = 0;
+        std::uint64_t depth = 0;
+        std::uint32_t depthWidth = 0, depthHeight = 0, depthFormat = 0;
+        std::uint64_t pixelProgram = 0, vertexProgram = 0;
+    };
+    void NoteTimedDraw(std::uint32_t index, const TimedDraw& draw);
+    // The timing index of the open render pass (a continued draw lies in its range), or NoTiming.
+    std::uint32_t RenderPassTiming() const;
+    // `format`: the host VkFormat (0 when none), `guestFormat` the guest's; `kind` a string literal;
+    // `pieces`: the ranges or regions the command moved (staging copies cover several buffers,
+    // `address` is then the first one's and `bytes` their sum).
+    void NoteTimedSurface(std::uint32_t index, std::uint64_t address, std::uint64_t bytes, std::uint32_t format, std::uint32_t guestFormat, std::uint32_t width, std::uint32_t height, const char* kind, std::uint32_t pieces = 1);
+    static bool TimedIdentityWanted();
     // The driver's own command classes: their [gputime] ranges take the reserved keys 0x10 + class
     // (printed by name, with counts and bytes, per 10 s and per present) and their barriers are
     // counted on the [barriers] line (CountBarriers, printed every 10 s under APS5_PROFILE_DRAW
@@ -818,6 +839,18 @@ private:
         bool samplesDrawn = false;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
+        // Parallel to timedKeys while TimedIdentityWanted (NoteTimedDraw, NoteTimedSurface).
+        struct TimedIdentity {
+            TimedDraw targets;
+            std::uint32_t draws = 0;
+            // The four programs that drew most (address, draws) and the draws of all others.
+            std::array<std::pair<std::uint64_t, std::uint32_t>, 4> pixel{}, vertex{};
+            std::uint32_t otherPixel = 0, otherVertex = 0;
+            std::uint64_t surface = 0, surfaceBytes = 0;
+            std::uint32_t surfaceFormat = 0, surfaceGuestFormat = 0, surfaceWidth = 0, surfaceHeight = 0, surfacePieces = 0;
+            const char* surfaceKind = nullptr;
+        };
+        std::vector<TimedIdentity> timedIdentity;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;

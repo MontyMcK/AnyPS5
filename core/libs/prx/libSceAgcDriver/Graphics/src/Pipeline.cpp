@@ -979,7 +979,7 @@ void compileInBackground(PipelineStore& store, const Context& context, const Sta
     auto job = std::make_shared<Job>(Job{context, state, vertexInput, {layoutKey.begin(), layoutKey.end()}, setLayout, {}, {}, attachmentLayout, hash});
     job->programs.reserve(shaders.size());
     for (const auto& shader : shaders) job->programs.push_back(*shader.program);
-    for (std::size_t index = 0; index < shaders.size(); ++index) job->shaders.push_back({shaders[index].stage, &job->programs[index], shaders[index].pushConstantOffset});
+    for (std::size_t index = 0; index < shaders.size(); ++index) job->shaders.push_back({shaders[index].stage, &job->programs[index], shaders[index].pushConstantOffset, shaders[index].codeAddress});
     store.pending.emplace(hash, key);
     ++store.inflight;
     ++store.asyncStarted;

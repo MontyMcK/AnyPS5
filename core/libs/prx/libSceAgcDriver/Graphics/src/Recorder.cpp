@@ -2465,6 +2465,12 @@ std::mutex timingMutex;
 std::map<std::uint64_t, TimingTotals> timingByKey;
 double timingProgramMs = 0, timingClassMs = 0, timingUnionMs = 0, timingBatchMs = 0;
 std::uint64_t timingBatches = 0;
+// The [gputime] busy figures: the union of every timed range and of the batch spans over all
+// batches (not per batch), in timestamp ticks, against the GPU clock span from the first batch
+// start to the last batch end of the report. Batches are read in completion order, so a running
+// end mark merges them (a batch that started before the mark only adds what lies past it).
+std::uint64_t busyTicks = 0, batchBusyTicks = 0, busyMark = 0, batchBusyMark = 0;
+std::uint64_t spanFirstTick = 0, spanLastTick = 0;
 
 bool DrawOrGpuProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr || Recorder::GpuTimingEnabled();
@@ -2823,6 +2829,7 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
+    if (TimedIdentityWanted()) open->timedIdentity.resize(index + 1);
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
@@ -2844,6 +2851,64 @@ void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
     if (index == NoTiming || open == nullptr || open->queries == VK_NULL_HANDLE) return;
     if (index < open->timedBytes.size()) open->timedBytes[index] += bytes;
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(open->commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2 + 1);
+}
+
+bool Recorder::TimedIdentityWanted() {
+    static const bool configured = GpuTimingEnabled() && CpuTimeline::Window().second != 0;
+    if (!configured) return false;
+    // From a second before the window to a second after it (batches recorded at its edges are
+    // read a little later).
+    const auto [first, last] = CpuTimeline::Window();
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    return now >= first - 1'000'000'000ll && now < last + 1'000'000'000ll;
+}
+
+std::uint32_t Recorder::RenderPassTiming() const {
+    return open != nullptr && open->renderPass.open ? open->renderPass.timing : NoTiming;
+}
+
+void Recorder::NoteTimedDraw(std::uint32_t index, const TimedDraw& draw) {
+    if (index == NoTiming || index == NvPerfRange || open == nullptr) return;
+    // A label-only range (LabelOnly) lies past every identity.
+    index &= ~LabelBit;
+    if (index >= open->timedIdentity.size()) return;
+    auto& identity = open->timedIdentity[index];
+    if (identity.draws++ == 0) identity.targets = draw;
+    const auto count = [](auto& slots, std::uint32_t& other, std::uint64_t program) {
+        for (auto& [address, draws] : slots) {
+            if (draws != 0 && address == program) {
+                ++draws;
+                return;
+            }
+        }
+        for (auto& [address, draws] : slots) {
+            if (draws == 0) {
+                address = program;
+                draws = 1;
+                return;
+            }
+        }
+        ++other;
+    };
+    count(identity.pixel, identity.otherPixel, draw.pixelProgram);
+    count(identity.vertex, identity.otherVertex, draw.vertexProgram);
+}
+
+void Recorder::NoteTimedSurface(std::uint32_t index, std::uint64_t address, std::uint64_t bytes, std::uint32_t format, std::uint32_t guestFormat, std::uint32_t width, std::uint32_t height, const char* kind, std::uint32_t pieces) {
+    if (index == NoTiming || index == NvPerfRange || open == nullptr) return;
+    index &= ~LabelBit;
+    if (index >= open->timedIdentity.size()) return;
+    auto& identity = open->timedIdentity[index];
+    if (identity.surfacePieces == 0) {
+        identity.surface = address;
+        identity.surfaceFormat = format;
+        identity.surfaceGuestFormat = guestFormat;
+        identity.surfaceWidth = width;
+        identity.surfaceHeight = height;
+        identity.surfaceKind = kind;
+    }
+    identity.surfaceBytes += bytes;
+    identity.surfacePieces += pieces;
 }
 
 void Recorder::CountSamples() {
@@ -3097,7 +3162,51 @@ void Recorder::readGpuTiming(Batch& batch) {
         intervals.emplace_back(stamps[i * 2], stamps[i * 2 + 1]);
     }
     // APS5_GPU_TIMELINE=<start s>,<seconds>: every timed range of the window as "<begin ns> <end ns>
-    // <key> <name>" in gpu-timeline.txt (the game directory), to see which work a frame ends on.
+    // <key> <name> <bytes>[ identity]" in gpu-timeline.txt (the game directory), to see which work
+    // a frame ends on. The identity fields (key=value, appended so older readers still parse the
+    // first five) are, for a range with draws (NoteTimedDraw):
+    //   n=<draws> rt=0x<color>:<w>x<h>:<VkFormat>[+<more color targets>]|rt=none
+    //   ds=0x<depth>:<w>x<h>:<VkFormat>|ds=none ps=0x<program>:<draws>,...[,other:<draws>] vs=...
+    // (the first draw's targets; the four programs that drew most, by first appearance), and for a
+    // surface range (NoteTimedSurface):
+    //   surf=0x<guest address> size=<bytes> fmt=<VkFormat> gfmt=<guest format> dim=<w>x<h>
+    //   kind=<path> pieces=<regions>
+    const auto identityText = [&batch](std::size_t i, char* text, std::size_t size) {
+        text[0] = '\0';
+        if (i >= batch.timedIdentity.size()) return;
+        const auto& identity = batch.timedIdentity[i];
+        std::size_t used = 0;
+        const auto append = [&](const char* format, auto... values) {
+            if (used >= size) return;
+            const int written = std::snprintf(text + used, size - used, format, values...);
+            if (written > 0) used = std::min(size - 1, used + static_cast<std::size_t>(written));
+        };
+        if (identity.draws != 0) {
+            const auto& targets = identity.targets;
+            append(" n=%u", identity.draws);
+            if (targets.colorTargets != 0) {
+                append(" rt=0x%llx:%ux%u:%u", static_cast<unsigned long long>(targets.color), targets.colorWidth, targets.colorHeight, targets.colorFormat);
+                if (targets.colorTargets > 1) append("+%u", targets.colorTargets - 1);
+            } else {
+                append(" rt=none");
+            }
+            if (targets.depth != 0) append(" ds=0x%llx:%ux%u:%u", static_cast<unsigned long long>(targets.depth), targets.depthWidth, targets.depthHeight, targets.depthFormat);
+            else append(" ds=none");
+            const auto programs = [&](const char* name, const auto& slots, std::uint32_t other) {
+                append(" %s=", name);
+                bool first = true;
+                for (const auto& [address, draws] : slots) {
+                    if (draws == 0) continue;
+                    append(first ? "0x%llx:%u" : ",0x%llx:%u", static_cast<unsigned long long>(address), draws);
+                    first = false;
+                }
+                if (other != 0) append(first ? "other:%u" : ",other:%u", other);
+            };
+            programs("ps", identity.pixel, identity.otherPixel);
+            programs("vs", identity.vertex, identity.otherVertex);
+        }
+        if (identity.surfacePieces != 0) append(" surf=0x%llx size=%llu fmt=%u gfmt=%u dim=%ux%u kind=%s pieces=%u", static_cast<unsigned long long>(identity.surface), static_cast<unsigned long long>(identity.surfaceBytes), identity.surfaceFormat, identity.surfaceGuestFormat, identity.surfaceWidth, identity.surfaceHeight, identity.surfaceKind != nullptr ? identity.surfaceKind : "?", identity.surfacePieces);
+    };
     {
         // One window for both files (cpu-timeline.txt, CpuTimeline.hpp).
         static const auto window = CpuTimeline::Window();
@@ -3109,7 +3218,9 @@ void Recorder::readGpuTiming(Batch& batch) {
                 for (std::size_t i = 0; i < batch.timedKeys.size(); ++i) {
                     const auto key = batch.timedKeys[i];
                     const bool isClass = key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count);
-                    std::fprintf(timeline, "%.0f %.0f %llx %s %llu\n", static_cast<double>(stamps[i * 2]) * period, static_cast<double>(stamps[i * 2 + 1]) * period, static_cast<unsigned long long>(key), i == batch.batchTiming ? "batch" : isClass ? CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)] : "program", static_cast<unsigned long long>(i < batch.timedBytes.size() ? batch.timedBytes[i] : 0));
+                    char identity[640];
+                    identityText(i, identity, sizeof(identity));
+                    std::fprintf(timeline, "%.0f %.0f %llx %s %llu%s\n", static_cast<double>(stamps[i * 2]) * period, static_cast<double>(stamps[i * 2 + 1]) * period, static_cast<unsigned long long>(key), i == batch.batchTiming ? "batch" : isClass ? CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)] : "program", static_cast<unsigned long long>(i < batch.timedBytes.size() ? batch.timedBytes[i] : 0), identity);
                 }
             }
         } else if (timeline != nullptr && now >= window.second) {
@@ -3125,6 +3236,19 @@ void Recorder::readGpuTiming(Batch& batch) {
         unionEnd = std::max(unionEnd, end);
     }
     timingUnionMs += static_cast<double>(coveredTicks) * period / 1e6;
+    for (const auto& [begin, end] : intervals) {
+        const auto from = std::max(begin, busyMark);
+        if (end > from) busyTicks += end - from;
+        busyMark = std::max(busyMark, end);
+    }
+    if (batch.batchTiming < batch.timedKeys.size() && stamps[batch.batchTiming * 2 + 1] >= stamps[batch.batchTiming * 2]) {
+        const auto begin = stamps[batch.batchTiming * 2], end = stamps[batch.batchTiming * 2 + 1];
+        const auto from = std::max(begin, batchBusyMark);
+        if (end > from) batchBusyTicks += end - from;
+        batchBusyMark = std::max(batchBusyMark, end);
+        if (spanFirstTick == 0 || begin < spanFirstTick) spanFirstTick = begin;
+        spanLastTick = std::max(spanLastTick, end);
+    }
     ++timingBatches;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
@@ -3144,12 +3268,22 @@ void Recorder::readGpuTiming(Batch& batch) {
         }
     }
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
-    // The first field stays the program sum: the measure scripts match on it.
-    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
+    // The first field stays the program sum and the text up to "(batch <ms> ms" and the
+    // "; <n> presents; <n> ranges dropped" part stay as they were: the measure scripts match on
+    // them. The line names what each figure is: 'GPU busy' (the union of every timed range over
+    // all batches) is the GPU's working time; the 'batch' sum counts each batch's gaps between
+    // its commands and is not.
+    const double busyMs = static_cast<double>(busyTicks) * period / 1e6;
+    const double batchBusyMs = static_cast<double>(batchBusyTicks) * period / 1e6;
+    const double spanMs = spanLastTick > spanFirstTick ? static_cast<double>(spanLastTick - spanFirstTick) * period / 1e6 : 0.0;
+    AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command, summed per batch; GPU busy %.0f ms = union of every timed range over all batches, %.0f%% of the %.0f ms GPU clock span from the first batch start to the last batch end; batch busy %.0f ms = union of the batch spans, GPU idle %.0f ms = span - batch busy; the leading figure is the program (dispatch) ranges alone; classes %.0f ms, all ranges %.0f ms summed per batch, untimed %.0f ms inside batches outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, busyMs, spanMs > 0 ? 100.0 * busyMs / spanMs : 0.0, spanMs, batchBusyMs, std::max(0.0, spanMs - batchBusyMs), timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
     for (std::size_t i = 0; i < hot.size() && i < 30; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
     timingByKey.clear();
     timingProgramMs = timingClassMs = timingUnionMs = timingBatchMs = 0;
+    // The marks stay: they are absolute GPU times, so the next report still merges against them.
+    busyTicks = batchBusyTicks = 0;
+    spanFirstTick = spanLastTick = 0;
     timingBatches = 0;
     lock.unlock();
     reportBarriers();

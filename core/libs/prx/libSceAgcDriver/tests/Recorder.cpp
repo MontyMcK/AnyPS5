@@ -604,6 +604,75 @@ void cpuTimelineTests(const Device& device, Recorder& recorder) {
     std::cout << "cpu timeline passed\n";
 }
 
+// gpu-timeline.txt (APS5_GPU_TIMELINE with APS5_PROFILE_GPU): a timed range carries what its
+// command noted (Recorder::NoteTimedDraw, NoteTimedSurface) after the five fields older readers
+// parse, and the [gputime] busy figures come from the same ranges. Run from a scratch directory.
+void gpuTimelineIdentityTests(Recorder& recorder) {
+    Require(CpuTimeline::Window().second != 0 && Recorder::GpuTimingEnabled(), "identity tests need APS5_GPU_TIMELINE and APS5_PROFILE_GPU");
+    const auto directory = std::filesystem::temp_directory_path() / ("aps5-gpu-timeline-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directories(directory);
+    const auto previous = std::filesystem::current_path();
+    std::filesystem::current_path(directory);
+    while (!CpuTimeline::Active()) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    Require(Recorder::TimedIdentityWanted(), "identities are not kept inside the window");
+    recorder.Sync();
+    const auto surface = recorder.BeginGpuTiming(Recorder::CommandClass::StorageWriteBack);
+    Require(surface != Recorder::NoTiming, "the write-back range was not timed");
+    recorder.NoteTimedSurface(surface, 0x1500000000ull, 0x10000, 97, 12, 64, 32, "test-writeback", 3);
+    recorder.EndGpuTiming(surface, 0x800);
+    const auto pass = recorder.BeginGpuTiming(Recorder::CommandClass::Draw);
+    Recorder::TimedDraw draw;
+    draw.color = 0x1200000000ull;
+    draw.colorWidth = 3840;
+    draw.colorHeight = 2160;
+    draw.colorFormat = 97;
+    draw.colorTargets = 2;
+    draw.depth = 0x1300000000ull;
+    draw.depthWidth = 3840;
+    draw.depthHeight = 2160;
+    draw.depthFormat = 126;
+    draw.pixelProgram = 0x1258d2f400ull;
+    draw.vertexProgram = 0x1258000000ull;
+    recorder.NoteTimedDraw(pass, draw);
+    recorder.NoteTimedDraw(pass, draw);
+    // A later draw's targets do not replace the first draw's; its program is counted.
+    draw.color = 0x1100000000ull;
+    draw.pixelProgram = 0x1258c63e00ull;
+    recorder.NoteTimedDraw(pass, draw);
+    recorder.EndGpuTiming(pass);
+    // An untimed index is ignored.
+    recorder.NoteTimedDraw(Recorder::NoTiming, draw);
+    recorder.NoteTimedSurface(Recorder::NoTiming, 1, 1, 0, 0, 0, 0, "none");
+    recorder.Submit();
+    recorder.Sync();
+    // The file closes at the first timed batch read after the window.
+    const auto last = CpuTimeline::Window().second;
+    while (CpuTimeline::Clock::now().time_since_epoch().count() < last + 50'000'000ll) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto late = recorder.BeginGpuTiming(Recorder::CommandClass::Fill);
+    recorder.EndGpuTiming(late);
+    recorder.Submit();
+    recorder.Sync();
+    std::ifstream file(directory / "gpu-timeline.txt");
+    Require(static_cast<bool>(file), "gpu-timeline.txt was not written");
+    std::string line;
+    bool surfaceLine = false, drawLine = false;
+    while (std::getline(file, line)) {
+        surfaceLine = surfaceLine || line.find(" storage-writeback 2048 surf=0x1500000000 size=65536 fmt=97 gfmt=12 dim=64x32 kind=test-writeback pieces=3") != std::string::npos;
+        drawLine = drawLine || line.find(" draw 0 n=3 rt=0x1200000000:3840x2160:97+1 ds=0x1300000000:3840x2160:126 ps=0x1258d2f400:2,0x1258c63e00:1 vs=0x1258000000:3") != std::string::npos;
+    }
+    if (!surfaceLine || !drawLine) {
+        std::ifstream again(directory / "gpu-timeline.txt");
+        while (std::getline(again, line)) std::cerr << line << '\n';
+    }
+    Require(surfaceLine, "gpu-timeline.txt lacks the write-back range's surface");
+    Require(drawLine, "gpu-timeline.txt lacks the draw range's targets and programs");
+    file.close();
+    std::filesystem::current_path(previous);
+    std::error_code ignored;
+    std::filesystem::remove_all(directory, ignored);
+    std::cout << "gpu timeline identity passed\n";
+}
+
 void batchStampTests(Recorder& recorder) {
     Require(recorder.Idle(), "batch stamps: the recorder is busy");
     double previousEnd = 0;
@@ -5333,6 +5402,10 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--cpu-timeline-only") {
             cpuTimelineTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--gpu-timeline-identity-only") {
+            gpuTimelineIdentityTests(recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--usage-elide-only") {

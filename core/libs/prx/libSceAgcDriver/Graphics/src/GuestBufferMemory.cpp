@@ -2720,6 +2720,11 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         commands = recorder->Commands();
     }
     const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
+    if (Recorder::TimedIdentityWanted() && !copies.empty()) {
+        std::uint64_t stagedBytes = 0;
+        for (const auto* region : copies) stagedBytes += region->end - region->begin;
+        recorder->NoteTimedSurface(timing, copies.front()->begin, stagedBytes, 0, 0, 0, 0, "staging-in", static_cast<std::uint32_t>(copies.size()));
+    }
     if (elided) {
         Recorder::CountSkipped(Recorder::CommandClass::StagingIn);
     } else {
@@ -2825,6 +2830,9 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     VkCommandBuffer commands = VK_NULL_HANDLE;
     auto timing = Recorder::NoTiming;
     std::uint64_t copiedBytes = 0;
+    // What the staging-out range names in gpu-timeline.txt (Recorder::NoteTimedSurface).
+    std::uint64_t firstCopied = 0;
+    std::uint32_t copiedPieces = 0;
     const auto mergeWrites = [&] {
         if (!merged.empty() || writes.empty()) return;
         auto sorted = writes;
@@ -2870,6 +2878,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             // would have stored there itself had the range been bindable.
             CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, to - from);
             copiedBytes += to - from;
+            if (copiedPieces++ == 0) firstCopied = from;
             recorder.Keep(region.buffer);
             if (profile) {
                 Copies().gpuCopyBacks.fetch_add(1, std::memory_order_relaxed);
@@ -2883,6 +2892,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         region.copiedBack = true;
     }
     if (!recording) return;
+    recorder.NoteTimedSurface(timing, firstCopied, copiedBytes, 0, 0, 0, 0, "staging-out", copiedPieces);
     // As a GPU label store or fill: visible to everything recorded after (shaders, transfers, an
     // indirect dispatch's arguments) and to the host once the batch completed; the caller's
     // pending-write note makes CPU readers wait for that.

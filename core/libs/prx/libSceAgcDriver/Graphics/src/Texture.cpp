@@ -2091,6 +2091,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             const std::pair<VkImage, bool> written{image, true};
             commands = Recorder::BarrierTracking() ? recorder->Commands(Recorder::CommandClass::StorageUpload, Recorder::Access{std::span(&read, 1), {}, std::span(&written, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT}, elided) : recorder->Commands();
             timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
+            recorder->NoteTimedSurface(timing, descriptor.baseAddress, guestBytes, static_cast<std::uint32_t>(storageFormat), descriptor.format, descriptor.width, descriptor.height, "upload", 1);
             recorder->Keep(linear, linear->Size());
             // The image itself must outlive the recorded copy: the cache may evict it right after.
             if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
@@ -2429,6 +2430,7 @@ std::uint64_t StorageTexture::uploadWindows(const HostImport& import, std::span<
         const std::pair<VkImage, bool> written{image, true};
         commands = Recorder::BarrierTracking() ? recorder->Commands(Recorder::CommandClass::StorageUpload, Recorder::Access{tracked, {}, std::span(&written, 1), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT}, elided) : recorder->Commands();
         timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
+        recorder->NoteTimedSurface(timing, descriptor.baseAddress, guestBytes, static_cast<std::uint32_t>(storageFormat), descriptor.format, descriptor.width, descriptor.height, "upload-windows", static_cast<std::uint32_t>(runs.size()));
         recorder->Keep(linear, linear->Size());
         for (const auto& source : sources) {
             if (source.slab != nullptr) recorder->Keep(source.slab);
@@ -2633,6 +2635,7 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
             commands = recorder->Commands(&covered);
         }
         timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageWriteBack);
+        recorder->NoteTimedSurface(timing, descriptor.baseAddress, guestBytes, static_cast<std::uint32_t>(storageFormat), descriptor.format, descriptor.width, descriptor.height, "writeback-windows", static_cast<std::uint32_t>(keep.size()));
         if (linear) recorder->Keep(linear, linear->Size());
         if (tiledScratch) recorder->Keep(tiledScratch, tiledScratch->Size());
         for (const auto& pieces : slabPieces) recorder->Keep(pieces.slab);
@@ -4172,6 +4175,7 @@ void StorageTexture::recordBorrowCopy(StorageTexture& source, const std::vector<
         const std::array<std::pair<VkImage, bool>, 2> images{{{source.image, false}, {image, true}}};
         commands = Recorder::BarrierTracking() ? recorder->Commands(Recorder::CommandClass::StorageUpload, Recorder::Access{{}, {}, images, VK_PIPELINE_STAGE_TRANSFER_BIT}, elided) : recorder->Commands();
         timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
+        recorder->NoteTimedSurface(timing, descriptor.baseAddress, guestBytes, static_cast<std::uint32_t>(storageFormat), descriptor.format, descriptor.width, descriptor.height, "borrow-copy", static_cast<std::uint32_t>(regions.size()));
         if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
         if (auto other = source.weak_from_this().lock()) recorder->Keep(std::move(other));
         if (elided) Recorder::CountSkipped(Recorder::CommandClass::StorageUpload, 2);
@@ -4530,6 +4534,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                 commands = recorder->Commands();
             }
             timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageWriteBack);
+            recorder->NoteTimedSurface(timing, descriptor.baseAddress, guestBytes, static_cast<std::uint32_t>(storageFormat), descriptor.format, descriptor.width, descriptor.height, "writeback-layers", static_cast<std::uint32_t>(keep.size()));
             recorder->Keep(linear, linear->Size());
             recorder->Keep(tiledScratch, tiledScratch->Size());
             for (const auto& slab : padding.slabs) recorder->Keep(slab);

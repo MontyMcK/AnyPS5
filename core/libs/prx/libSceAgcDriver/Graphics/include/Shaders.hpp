@@ -17,6 +17,9 @@ struct CompiledShader {
     ShaderRecompiler::ShaderStage stage;
     const ShaderRecompiler::RecompileResult* program;
     std::uint32_t pushConstantOffset;
+    // The guest program's code address (0 when the caller did not give it): only names the draw's
+    // shaders in profiles (Recorder::NoteTimedDraw).
+    std::uint64_t codeAddress = 0;
 };
 
 inline VkShaderStageFlagBits VulkanStage(ShaderRecompiler::ShaderStage stage) {

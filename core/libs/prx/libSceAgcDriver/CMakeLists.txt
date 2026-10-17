@@ -817,6 +817,12 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_recorder_cpu_timeline PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_driver_recorder_gpu_timeline_identity COMMAND agc_driver_recorder_tests --gpu-timeline-identity-only)
+    set_tests_properties(agc_driver_recorder_gpu_timeline_identity PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_GPU_TIMELINE=0,2;APS5_PROFILE_GPU=1" SKIP_RETURN_CODE 77)
+    if(WIN32)
+        set_tests_properties(agc_driver_recorder_gpu_timeline_identity PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     foreach(agcCommitTest IN ITEMS commit_paths bind_elide draw_set_writes moved_publish speculated_committer2)
         if(agcCommitTest STREQUAL "commit_paths")
             add_test(NAME agc_driver_recorder_${agcCommitTest} COMMAND agc_driver_recorder_tests --commit-paths-only)
