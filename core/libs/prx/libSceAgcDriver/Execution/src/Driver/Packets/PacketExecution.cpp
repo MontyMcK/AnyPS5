@@ -492,7 +492,10 @@ void Driver::execute(const Submission& submission) {
             return;
         }
         if ((std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0) {
-            DrawPipeline::Queue0().Enqueue([this] { submitOpenWork(); }, {}, 0, {}, true);
+            DrawPipeline::Queue0().Enqueue([this] {
+                submitOpenWork();
+                wakeQueueZeroForCompletions();
+            }, {}, 0, {}, true);
             executeRewindTail(submission);
             return;
         }

@@ -78,6 +78,15 @@ void Driver::submitOpenWork() {
     if (localDevice != nullptr) localDevice->SubmitRecorded(true, Graphics::Recorder::SubmitReason::SubmissionEnd);
 }
 
+// Queue 0 reaps completions (deferred EOP interrupts, completion labels, write-backs) while it
+// polls; once dormant it reaps only when woken. A thread that leaves completions behind after
+// queue 0 may have gone dormant (the draw pipeline, a compute queue) wakes it here.
+void Driver::wakeQueueZeroForCompletions() {
+    if (!completionsPending()) return;
+    std::lock_guard lock(mutex);
+    changed.notify_all();
+}
+
 void Driver::completeSubmission(std::uint64_t serial, std::uint64_t received, std::span<const std::uint64_t> labelWrites) {
     struct Complete {
         Driver& driver;
@@ -91,7 +100,7 @@ void Driver::completeSubmission(std::uint64_t serial, std::uint64_t received, st
                 driver.forgetUnfinishedWrites(driver.workers.at(0), labelWrites);
                 const auto found = std::find(driver.queue0Uncommitted.begin(), driver.queue0Uncommitted.end(), received);
                 if (found != driver.queue0Uncommitted.end()) driver.queue0Uncommitted.erase(found);
-                notify = driver.idleWaiters != 0 || driver.orderHolders.load(std::memory_order_acquire) != 0;
+                notify = driver.idleWaiters != 0 || driver.orderHolders.load(std::memory_order_acquire) != 0 || completionsPending();
             }
             if (notify) driver.changed.notify_all();
         }
@@ -182,8 +191,9 @@ void Driver::run(std::uint32_t id) noexcept {
                     const bool commitsPending = id == 0 && DrawPipeline::Queue0().Busy();
                     if (!commitsPending && (!completionsPending() || (id != 0 && Graphics::Recorder::PendingCompletionLabels() == 0))) {
                         if (id == 0) queue0Dormant.store(true, std::memory_order_relaxed);
-                        changed.wait(lock, ready);
+                        changed.wait(lock, [&] { return ready() || (id == 0 && completionsPending()); });
                         if (id == 0) queue0Dormant.store(false, std::memory_order_relaxed);
+                        if (!ready()) continue;
                         break;
                     }
                     if (poll(ready)) break;
@@ -235,7 +245,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 }
                 if (id == 0) queue0Executing = 0;
 
-                notify = idleWaiters != 0 || orderHolders.load(std::memory_order_acquire) != 0;
+                notify = idleWaiters != 0 || orderHolders.load(std::memory_order_acquire) != 0 || (id != 0 && completionsPending());
             }
             if (notify) changed.notify_all();
             else ++costs.notifiesSkipped;
