@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/CpuTimeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredVulkan.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/NativeFillCounters.hpp"
@@ -251,6 +252,18 @@ bool ForkStreamLazyEnabled() {
         return value != nullptr && std::strcmp(value, "0") != 0;
     }();
     return LiveFlag("fork_stream_lazy", enabled);
+}
+
+bool LockSpinEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_LOCK_SPIN");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    return LiveFlag("lock_spin", enabled);
+}
+
+void LockContended(std::mutex& mutex) {
+    LockMaybeSpinning(mutex, LockSpinEnabled());
 }
 
 bool CommitHoldEnabled() {

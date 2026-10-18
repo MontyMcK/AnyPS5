@@ -56,6 +56,9 @@ bool ForkStreamEnabled();
 bool ForkStreamWaitEnabled();
 bool ForkStreamLazyEnabled();
 bool CommitHoldEnabled();
+// Live `lock_spin` (env APS5_LOCK_SPIN, default on): contended driver mutexes spin briefly before
+// blocking (Execution/include/HandoffSpin.hpp, LockSpinWindow).
+bool LockSpinEnabled();
 // Live `parallel_commit` (env APS5_PARALLEL_COMMIT), stage P1 of the parallel committer: pass runs
 // (Execution/include/Driver/Draw/PassRun.hpp). APS5_VERIFY_PARALLEL_COMMIT=1 checks each run.
 bool ParallelCommitEnabled();

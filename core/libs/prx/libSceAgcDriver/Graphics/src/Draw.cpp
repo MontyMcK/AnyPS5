@@ -5,6 +5,7 @@
 #include <immintrin.h>
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawSpeculation.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/IndexScanMemo.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -26,6 +27,8 @@
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
 #include <algorithm>
 #include <unordered_set>
+#include <unordered_map>
+#include <span>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -884,10 +887,18 @@ bool VerifyDrawSpeculation() {
     return enabled;
 }
 
+namespace {
+
+// The committer's last refusal of a brought speculation (TakeCommitSpeculationMiss).
+thread_local DrawSpeculation::Miss lastCommitMiss = DrawSpeculation::Miss::None;
+
+}
+
 void CountSpeculationMiss(DrawSpeculation::Miss miss, bool committer) {
     const auto index = static_cast<std::size_t>(miss);
     if (index == 0 || index >= SpeculationMissCount) return;
     (committer ? Speculations().commit : Speculations().prep)[index].fetch_add(1, std::memory_order_relaxed);
+    if (committer) lastCommitMiss = miss;
 }
 
 bool DrawTokensEnabled() {
@@ -1013,6 +1024,10 @@ DrawSpeculation::Miss TakeSpeculationRefusal() {
     return std::exchange(lastSpeculationRefusal, DrawSpeculation::Miss::None);
 }
 
+DrawSpeculation::Miss TakeCommitSpeculationMiss() {
+    return std::exchange(lastCommitMiss, DrawSpeculation::Miss::None);
+}
+
 const char* SpeculationMissName(DrawSpeculation::Miss miss) {
     const auto index = static_cast<std::size_t>(miss);
     return index < SpeculationMissCount ? SpeculationMissNames[index] : "?";
@@ -1041,6 +1056,7 @@ std::shared_ptr<DrawSpeculation> SpeculateDrawResources(const Context& context, 
         return std::shared_ptr<DrawSpeculation>{};
     };
     lastSpeculationRefusal = Miss::None;
+    static_cast<void>(TakeSpeculationRefusalDetail());
     if (noDrawResourceCache || noTextureCache || !std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; })) return refuse(Miss::Uncacheable);
     try {
         auto speculation = std::make_shared<DrawSpeculation>();
@@ -1669,6 +1685,44 @@ bool PrepIndexScan() {
     return LiveFlag("prep_index", enabled);
 }
 
+// Live `index_scan_memo` (env APS5_INDEX_SCAN_MEMO=0 turns it off): the committer remembers, per
+// thread, the highest index it scanned in an in-place index range, with the write-tracker
+// generation collected before the scan. A later draw over the same range (address, bytes, index
+// size) takes it while the range is unchanged since that generation: the prep worker's prescan
+// rule (a CPU write is stamped by the collect, a stored GPU result when it lands). The World Map
+// draws the same ~1,800 ranges every frame and scanned them all, 2.7% of Graphics::Draw.
+// APS5_VERIFY_PREP_INDEX=1 also checks every memo hit against a scan.
+bool IndexScanMemo() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_INDEX_SCAN_MEMO");
+        return value == nullptr || value[0] != '0';
+    }();
+    return LiveFlag("index_scan_memo", enabled);
+}
+
+struct IndexScanMemoTag;
+
+std::atomic<std::uint64_t> indexMemoHits{0}, indexMemoMisses{0};
+
+// The highest index in the in-place range [address, address + bytes), from this thread's memo when
+// the range is unchanged since the remembered scan, else scanned (and remembered).
+std::uint32_t MemoizedHighestIndex(std::uint64_t address, std::size_t bytes, std::uint32_t indexSize) {
+    auto& memo = HostThreadLocal<IndexScanMemoTable, IndexScanMemoTag>();
+    const auto span = std::span<const std::byte>(reinterpret_cast<const std::byte*>(address), bytes);
+    bool hit = false;
+    const auto highest = memo.Highest(
+        address, bytes, indexSize, [&] { return GuestMemory::CollectWrites(address, bytes); },
+        [&](std::uint64_t generation) { return GuestMemory::UnchangedSince(address, bytes, generation); },
+        [&] { return ScanHighestIndex(span, indexSize); }, &hit);
+    (hit ? indexMemoHits : indexMemoMisses).fetch_add(1, std::memory_order_relaxed);
+    if (hit && VerifyPrepIndexScan() && highest != ScanHighestIndex(span, indexSize)) {
+        std::fprintf(stderr, "[vertex] APS5_VERIFY_PREP_INDEX: the index scan memo's highest index %u differs from a scan at 0x%llx\n", highest, static_cast<unsigned long long>(address));
+        std::fflush(stderr);
+        std::abort();
+    }
+    return highest;
+}
+
 VertexFetchPlan planVertexFetches(const State& state, const Pm4::DrawParameters& draw, std::span<const ShaderRecompiler::VertexAttribute> attributes, std::uint32_t maxIndex, bool indirect) {
     VertexFetchPlan result;
     result.shortBytes.resize(attributes.size());
@@ -1745,7 +1799,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             const auto bytes = stats.indexBytes.exchange(0);
             const auto scanned = stats.scanned.exchange(0);
             const auto prescanned = stats.prescanned.exchange(0);
-            std::fprintf(stderr, "[vertex-split] %llu draws (%llu indexed, %.0f index bytes each, %llu unmemoized, %llu of them prescanned), us per draw: index %.2f ranges %.2f\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(indexed), indexed != 0 ? static_cast<double>(bytes) / static_cast<double>(indexed) : 0.0, static_cast<unsigned long long>(scanned), static_cast<unsigned long long>(prescanned), per(stats.indexNs), per(stats.rangesNs));
+            std::fprintf(stderr, "[vertex-split] %llu draws (%llu indexed, %.0f index bytes each, %llu unmemoized, %llu of them prescanned), us per draw: index %.2f ranges %.2f; index scan memo %llu hits, %llu misses\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(indexed), indexed != 0 ? static_cast<double>(bytes) / static_cast<double>(indexed) : 0.0, static_cast<unsigned long long>(scanned), static_cast<unsigned long long>(prescanned), per(stats.indexNs), per(stats.rangesNs), static_cast<unsigned long long>(indexMemoHits.exchange(0)), static_cast<unsigned long long>(indexMemoMisses.exchange(0)));
         }
     } vertexReport{vertexStats, vertexSplit};
     if (draw.indexed) {
@@ -1780,6 +1834,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                     std::abort();
                 }
                 if (vertexSplit) vertexStats.prescanned.fetch_add(1, std::memory_order_relaxed);
+            } else if (import != nullptr && IndexScanMemo()) {
+                highest = MemoizedHighestIndex(draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
             } else {
                 highest = ScanHighestIndex(bytes, draw.indexSize);
             }

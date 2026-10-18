@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DRIVER_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/Submission.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SpecRefusalSites.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/DeviceAccess.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Packets/PacketHistory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
@@ -236,7 +237,7 @@ private:
     void noteForeignWriter(std::uint64_t begin, std::uint64_t end, std::uint32_t queue);
     void noteDrawWriters(std::span<const Graphics::CompiledShader> stages, std::uint32_t queue);
     static std::vector<std::pair<std::uint64_t, std::uint64_t>> drawWriteRanges(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages);
-    void commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, std::shared_ptr<Graphics::DrawSpeculation> speculation = nullptr, std::shared_ptr<Graphics::DrawPrebuild> prebuilt = nullptr, std::uint8_t prepRefusal = 0xffu);
+    void commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, std::shared_ptr<Graphics::DrawSpeculation> speculation = nullptr, std::shared_ptr<Graphics::DrawPrebuild> prebuilt = nullptr, std::uint8_t prepRefusal = 0xffu, Graphics::SpeculationRefusalDetail prepDetail = {});
     void buildAhead(DrawForkJob& job);
     void commitForked(const DrawForkJob& job, const Graphics::Context& context, Graphics::ForkedDraw* forked, const Graphics::ForkStamp& stamp, std::shared_ptr<const DrawRecipe>& built, bool& cut, const std::function<void()>* quiesce = nullptr);
     bool labelsPending(VulkanDevice* localDevice) const;

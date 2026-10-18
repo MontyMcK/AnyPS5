@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/SpecRefusalSites.hpp"
 #include <memory>
 #include <span>
 #include <utility>
@@ -76,6 +77,12 @@ void SpeculateDrawPipeline(const Context& context, const State& state, std::span
 // The refusal of this thread's last SpeculateDrawResources call (None: it speculated or was not
 // called since the last take), for the committer's [commit] profile.
 DrawSpeculation::Miss TakeSpeculationRefusal();
+// For a pending refusal of this thread's last SpeculateDrawResources call: what blocked it
+// (APS5_PROFILE_DRAW's [spec-refusals] table; kind None otherwise). Logging only.
+SpeculationRefusalDetail TakeSpeculationRefusalDetail();
+// The committer's last refusal of a brought speculation on this thread (None: none since the
+// last take), naming the [spec-refusals] "refused on commit" rows.
+DrawSpeculation::Miss TakeCommitSpeculationMiss();
 const char* SpeculationMissName(DrawSpeculation::Miss miss);
 // What became of the speculation the committer's last draw on this thread brought: 0 none, 1
 // accepted, 2 refused (the [commit] profile).

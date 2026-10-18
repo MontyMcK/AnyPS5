@@ -1389,10 +1389,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         std::shared_ptr<Graphics::DrawSpeculation> speculation;
         // Why the prep thread did not speculate (the [commit] line): Count when it did not try.
         auto prepRefusal = Graphics::DrawSpeculation::Miss::Count;
+        Graphics::SpeculationRefusalDetail prepDetail;
         if (recipe == nullptr && Graphics::DrawSpeculationEnabled() && DrawPipeline::Queue0().OnPrepThread()) {
             try {
                 speculation = localDevice->SpeculateDraw(graphics, drawParameters, stages, snapshots);
                 prepRefusal = Graphics::TakeSpeculationRefusal();
+                prepDetail = Graphics::TakeSpeculationRefusalDetail();
             } catch (...) {
                 speculation = nullptr;
                 prepRefusal = Graphics::DrawSpeculation::Miss::Thrown;
@@ -1414,7 +1416,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             forkJob = std::make_shared<DrawForkJob>();
             forkJob->forFork = forkFlags;
         }
-        auto commit = [this, forkJob, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, prepRefusal, speculation = std::move(speculation), prebuilt = std::move(prebuilt), programs = std::move(programs), results = std::move(results), compiledStages = std::move(compiledStages), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry)](DrawForkJob* fork) {
+        auto commit = [this, forkJob, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, commitQueue, commitPacket, epoch, prepRefusal, prepDetail, speculation = std::move(speculation), prebuilt = std::move(prebuilt), programs = std::move(programs), results = std::move(results), compiledStages = std::move(compiledStages), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry)](DrawForkJob* fork) {
             if (fork != nullptr) {
                 fork->device = localDevice;
                 fork->state = &decode->state;
@@ -1452,7 +1454,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, std::move(speculation), std::move(prebuilt), static_cast<std::uint8_t>(prepRefusal));
+            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, std::move(speculation), std::move(prebuilt), static_cast<std::uint8_t>(prepRefusal), prepDetail);
             if (forkJob != nullptr && Graphics::ForkAheadEnabled()) {
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
                 std::lock_guard publishLock(GuestMemory::GpuMutex());
@@ -1513,6 +1515,9 @@ struct CommitProfile {
     std::array<std::atomic<std::uint64_t>, ClassCount> heldNs{};
     std::atomic<std::uint64_t> commits{0}, waitNs{0}, labelsNs{0}, writersNs{0}, drawNs{0}, attachNs{0}, submitNs{0}, held{0}, attached{0};
     std::atomic<std::int64_t> reported{0};
+    // The [spec-refusals] table: commits by class and draw site (Graphics/include/SpecRefusalSites.hpp).
+    std::mutex sitesMutex;
+    Graphics::RefusalSites sites;
 };
 
 CommitProfile& CommitStats() {
@@ -1560,11 +1565,42 @@ void reportCommits() {
         line += item;
     }
     std::fprintf(stderr, "%s\n", line.c_str());
+    // [spec-refusals]: the heaviest classes (recipe and accepted draws left out) by draw site.
+    std::vector<std::string> sites;
+    {
+        std::lock_guard lock(stats.sitesMutex);
+        sites = stats.sites.Report([](std::uint8_t cls, std::uint8_t sub) {
+            std::string name = cls == CommitProfile::Refused ? "refused on commit" : cls == CommitProfile::FirstPrep + CommitProfile::MissCount ? "not tried" : cls == CommitProfile::FirstPrep + CommitProfile::MissCount + 1 ? "unknown" : std::string("prep refused ") + Graphics::SpeculationMissName(static_cast<Graphics::DrawSpeculation::Miss>(cls - CommitProfile::FirstPrep));
+            if (cls == CommitProfile::Refused) name += std::string(" (") + Graphics::SpeculationMissName(static_cast<Graphics::DrawSpeculation::Miss>(sub)) + ")";
+            return name;
+        }, {static_cast<std::uint8_t>(CommitProfile::Recipe), static_cast<std::uint8_t>(CommitProfile::Accepted)});
+    }
+    for (const auto& site : sites) std::fprintf(stderr, "%s\n", site.c_str());
+}
+
+// One draw commit into the [spec-refusals] table: its class, the committer's miss for a refusal
+// on commit, the draw's programs and colour target, and the prep thread's pending detail.
+void noteRefusalSite(std::size_t cls, std::span<const Graphics::CompiledShader> stages, const Graphics::State& graphics, const Graphics::SpeculationRefusalDetail& detail, std::uint64_t ns) {
+    Graphics::RefusalSites::Key key;
+    key.cls = static_cast<std::uint8_t>(cls);
+    key.sub = cls == CommitProfile::Refused ? static_cast<std::uint8_t>(Graphics::TakeCommitSpeculationMiss()) : 0;
+    for (const auto& stage : stages) {
+        if (stage.stage == ShaderRecompiler::ShaderStage::Fragment) key.pixel = stage.codeAddress;
+        else if (key.vertex == 0) key.vertex = stage.codeAddress;
+    }
+    if (graphics.hasColorTarget) {
+        key.target = graphics.color.address;
+        key.targetBytes = graphics.color.bytes;
+    }
+    if (cls == CommitProfile::FirstPrep + static_cast<std::size_t>(Graphics::DrawSpeculation::Miss::Pending)) key.detail = detail;
+    auto& stats = CommitStats();
+    std::lock_guard lock(stats.sitesMutex);
+    stats.sites.Add(key, ns);
 }
 
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, std::shared_ptr<Graphics::DrawSpeculation> speculation, std::shared_ptr<Graphics::DrawPrebuild> prebuilt, std::uint8_t prepRefusal) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, std::shared_ptr<Graphics::DrawSpeculation> speculation, std::shared_ptr<Graphics::DrawPrebuild> prebuilt, std::uint8_t prepRefusal, Graphics::SpeculationRefusalDetail prepDetail) {
     const bool timed = forkTimed();
     auto lap = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto mark = [&](std::atomic<std::uint64_t>& into) {
@@ -1605,6 +1641,9 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
         std::chrono::steady_clock::time_point locked;
         const bool& recipeDrawn;
         std::uint8_t prepRefusal;
+        std::span<const Graphics::CompiledShader> stages;
+        const Graphics::State& graphics;
+        const Graphics::SpeculationRefusalDetail& detail;
         ~HoldEnd() {
             if (!profiled) return;
             const auto held = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - locked).count());
@@ -1613,9 +1652,13 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
             stats.counts[index].fetch_add(1, std::memory_order_relaxed);
             stats.heldNs[index].fetch_add(held, std::memory_order_relaxed);
             stats.commits.fetch_add(1, std::memory_order_relaxed);
+            noteRefusalSite(index, stages, graphics, detail, held);
         }
-    } holdEnd{profiled, commitStats, stampAt, recipeDrawn, prepRefusal};
-    if (profiled) static_cast<void>(Graphics::TakeCommitSpeculationOutcome());
+    } holdEnd{profiled, commitStats, stampAt, recipeDrawn, prepRefusal, stages, graphics, prepDetail};
+    if (profiled) {
+        static_cast<void>(Graphics::TakeCommitSpeculationOutcome());
+        static_cast<void>(Graphics::TakeCommitSpeculationMiss());
+    }
     if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
     mark(Commits().lockNs);
     struct SubmitDue {

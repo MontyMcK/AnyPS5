@@ -208,6 +208,8 @@ public:
         const StorageTexture* pending;
         bool overlaps;
         const StorageTexture* found = nullptr;
+        // The first pending image found overlapping (APS5_PROFILE_DRAW's [spec-refusals] only).
+        const StorageTexture* blocker = nullptr;
     };
     static bool ScanPending(std::span<PendingQuery> queries);
     // APS5_PROFILE_DRAW, for the flush hook's recorded-store attribution ([hooksync]): the pending

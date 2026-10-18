@@ -1128,12 +1128,14 @@ WriteTracker& Tracker() {
 // ('tracker waits N / M' in [guestmem]), which says whether walking outside the lock would pay.
 std::unique_lock<std::mutex> lockTracker(WriteTracker& tracker) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!profile) return std::unique_lock(tracker.mutex);
+    // Live `lock_spin` (HandoffSpin.hpp LockSpinWindow): a contended acquisition spins first.
     std::unique_lock lock(tracker.mutex, std::try_to_lock);
     if (!lock.owns_lock()) {
-        trackerWaits.fetch_add(1, std::memory_order_relaxed);
-        lock.lock();
+        if (profile) trackerWaits.fetch_add(1, std::memory_order_relaxed);
+        LockMaybeSpinning(tracker.mutex, Graphics::LockSpinEnabled());
+        lock = std::unique_lock(tracker.mutex, std::adopt_lock);
     }
+    if (!profile) return lock;
     trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
     return lock;
 }

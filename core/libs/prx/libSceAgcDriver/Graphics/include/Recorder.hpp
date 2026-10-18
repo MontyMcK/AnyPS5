@@ -87,9 +87,12 @@ void CountForkRefusal(const char* site, bool backstop = false);
 inline void ForkTrap(const char* site) {
     if (ForkLogged() != nullptr) ForkRefuse(site);
 }
+// A contended ForkLock outside a fork: spins for the live `lock_spin` window before blocking
+// (Recorder.cpp; HandoffSpin.hpp LockSpinWindow).
+void LockContended(std::mutex& mutex);
 inline void ForkLock(std::mutex& mutex) {
     if (ForkLogged() == nullptr) {
-        mutex.lock();
+        if (!mutex.try_lock()) LockContended(mutex);
         return;
     }
     for (std::uint32_t spin = 0; !mutex.try_lock(); ++spin) {

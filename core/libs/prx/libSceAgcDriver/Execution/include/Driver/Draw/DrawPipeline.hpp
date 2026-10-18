@@ -108,6 +108,36 @@ public:
     std::uint64_t AppliedFrontier() const { return appliedFrontier.load(std::memory_order_acquire); }
     Window CheckWindow(std::uint64_t fromExclusive, std::uint64_t toExclusive, std::span<const Range> reads);
     bool WindowClear(std::uint64_t fromExclusive, std::uint64_t toExclusive, std::span<const Range> reads) { return CheckWindow(fromExclusive, toExclusive, reads) == Window::Clear; }
+    // CheckWindow's verdict over the applied slots of sequences fromExclusive+1 .. toExclusive-1;
+    // `slotAt(sequence)` gives the slot (sequence, unknown, writes) holding it. An unknown slot makes
+    // the verdict Unknown; a write overlapping a read turns a Clear verdict into Overlap; a slot of
+    // another sequence (overwritten) makes it Overflow. With `earlyOut` (live `window_early_out`) the
+    // writes of a slot are compared with the reads only while the verdict is still Clear, the only
+    // verdict a comparison can change: the result is the same.
+    template<typename TSlotAt>
+    static Window ScanWindow(std::uint64_t fromExclusive, std::uint64_t toExclusive, TSlotAt&& slotAt, std::span<const Range> reads, bool earlyOut) {
+        auto verdict = Window::Clear;
+        for (auto sequence = fromExclusive + 1; sequence < toExclusive; ++sequence) {
+            const auto& slot = slotAt(sequence);
+            if (slot.sequence != sequence) return Window::Overflow;
+            if (slot.unknown) {
+                verdict = Window::Unknown;
+                continue;
+            }
+            if (earlyOut && verdict != Window::Clear) continue;
+            for (const auto& [begin, end] : slot.writes) {
+                bool overlaps = false;
+                for (const auto& read : reads) {
+                    if (read.first < end && begin < read.second) {
+                        overlaps = true;
+                        break;
+                    }
+                }
+                if (overlaps && verdict == Window::Clear) verdict = Window::Overlap;
+            }
+        }
+        return verdict;
+    }
     static std::uint64_t& CommittingSequence();
     std::uint64_t CommitNsTotal();
 
@@ -140,6 +170,9 @@ private:
     void finishPrepTurn(std::uint64_t sequence);
     void deliverPrepared(std::uint64_t sequence, std::optional<Item> item);
     void pushItem(Item item);
+    // Live `room_spin`: with the queue full, spins outside the mutex until the committer makes room
+    // (or the window ends), then takes `lock` again; true when there is room. See DrawPipeline.cpp.
+    bool spinForRoom(std::unique_lock<std::mutex>& lock);
     static bool PrepReorder();
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);

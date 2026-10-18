@@ -386,6 +386,27 @@ void DrawPipeline::deliverPrepared(std::uint64_t sequence, std::optional<Item> i
     }
 }
 
+// Live `room_spin` (env APS5_ROOM_SPIN=0 turns it off; HandoffSpin.hpp RoomSpinWindow): a producer
+// finding the queue full used to sleep on `idle` at once, so with the committer the bottleneck every
+// commit had to wake it: sampling the World Map committer put the condition variable broadcast
+// (ReleaseSemaphore) and the wake's mutex hand-back (SetEvent) at about 6% of its time, roughly 2 us
+// a commit. The producer now first spins outside the mutex on `outstanding` (items.size(), kept with
+// it under the mutex) for one window, about five commits, and sleeps only if the queue is still
+// full. It pushes only with the mutex held and room in the queue, as before.
+bool DrawPipeline::spinForRoom(std::unique_lock<std::mutex>& lock) {
+    static const bool enabledDefault = [] {
+        const char* value = std::getenv("APS5_ROOM_SPIN");
+        return value == nullptr || value[0] != '0';
+    }();
+    const auto window = RoomSpinWindow();
+    if (window.count() <= 0 || !Graphics::LiveFlag("room_spin", enabledDefault)) return false;
+    const auto depth = Depth();
+    lock.unlock();
+    SpinUntil(window, [&] { return outstanding.load(std::memory_order_acquire) < depth; });
+    lock.lock();
+    return items.size() < Depth();
+}
+
 void DrawPipeline::pushItem(Item item) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::vector<Commit> finished;
@@ -393,9 +414,11 @@ void DrawPipeline::pushItem(Item item) {
     finished.swap(retired);
     if (items.size() >= Depth()) {
         const auto start = std::chrono::steady_clock::now();
-        ++idleWaiters;
-        idle.wait(lock, [&] { return items.size() < Depth(); });
-        --idleWaiters;
+        if (!spinForRoom(lock)) {
+            ++idleWaiters;
+            idle.wait(lock, [&] { return items.size() < Depth(); });
+            --idleWaiters;
+        }
         fullWaitNs += elapsedNs(start);
         threadRoomWaitMs += static_cast<double>(elapsedNs(start)) / 1e6;
     }
@@ -558,9 +581,11 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     if (items.size() >= Depth()) {
         const ProducerScope producer(Producer::EnqueueRoom);
         const auto start = std::chrono::steady_clock::now();
-        ++idleWaiters;
-        idle.wait(lock, [&] { return items.size() < Depth(); });
-        --idleWaiters;
+        if (!spinForRoom(lock)) {
+            ++idleWaiters;
+            idle.wait(lock, [&] { return items.size() < Depth(); });
+            --idleWaiters;
+        }
         fullWaitNs += elapsedNs(start);
         rethrowFailure();
     }
@@ -1072,20 +1097,15 @@ DrawPipeline::Window DrawPipeline::CheckWindow(std::uint64_t fromExclusive, std:
     if (toExclusive - fromExclusive - 1 > AppliedCapacity) return Window::Overflow;
     std::lock_guard lock(appliedMutex);
     if (applied.size() != AppliedCapacity || appliedFrontier.load(std::memory_order_relaxed) + 1 < toExclusive) return Window::Overflow;
-    auto verdict = Window::Clear;
-    for (auto sequence = fromExclusive + 1; sequence < toExclusive; ++sequence) {
-        const auto& slot = applied[static_cast<std::size_t>(sequence % AppliedCapacity)];
-        if (slot.sequence != sequence) return Window::Overflow;
-        if (slot.unknown) {
-            verdict = Window::Unknown;
-            continue;
-        }
-        for (const auto& [begin, end] : slot.writes) {
-            const bool overlaps = std::any_of(reads.begin(), reads.end(), [&](const Range& read) { return read.first < end && begin < read.second; });
-            if (overlaps && verdict == Window::Clear) verdict = Window::Overlap;
-        }
-    }
-    return verdict;
+    // Live `window_early_out` (env APS5_WINDOW_EARLY_OUT=0 turns it off): see ScanWindow. Sampling
+    // the World Map committer put this scan (every write of every slot against every read) at about
+    // 2.5% of Graphics::Draw.
+    static const bool earlyOutDefault = [] {
+        const char* value = std::getenv("APS5_WINDOW_EARLY_OUT");
+        return value == nullptr || value[0] != '0';
+    }();
+    const bool earlyOut = Graphics::LiveFlag("window_early_out", earlyOutDefault);
+    return ScanWindow(fromExclusive, toExclusive, [&](std::uint64_t sequence) -> const Applied& { return applied[static_cast<std::size_t>(sequence % AppliedCapacity)]; }, reads, earlyOut);
 }
 
 std::optional<std::uint64_t> DrawPipeline::PendingLabel(std::uint64_t address, std::size_t bytes) {

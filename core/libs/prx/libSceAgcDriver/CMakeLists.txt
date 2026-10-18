@@ -278,6 +278,30 @@ if(BUILD_TESTING)
         set_tests_properties(agc_handoff_spin PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+
+    # window_early_out, pending_fill and index_scan_memo (header-only logic).
+    add_test_executable(agc_committer_cuts_tests tests/CommitterCuts.cpp)
+    target_include_directories(agc_committer_cuts_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_committer_cuts_tests PRIVATE libc)
+    configure_windows_unwind(agc_committer_cuts_tests)
+    add_test(NAME agc_committer_cuts COMMAND agc_committer_cuts_tests)
+    set_tests_properties(agc_committer_cuts PROPERTIES TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_committer_cuts PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+
+    # fast_heap_prefetch: the allocator itself, with a stub for its live flags.
+    if(WIN32)
+        add_test_executable(agc_fast_heap_prefetch_tests tests/FastHeapPrefetch.cpp Execution/src/FastHeap.cpp)
+        target_include_directories(agc_fast_heap_prefetch_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        target_compile_definitions(agc_fast_heap_prefetch_tests PRIVATE APS5_FAST_HEAP_TEST_HOOKS)
+        target_link_libraries(agc_fast_heap_prefetch_tests PRIVATE libc)
+        configure_windows_unwind(agc_fast_heap_prefetch_tests)
+        add_test(NAME agc_fast_heap_prefetch COMMAND agc_fast_heap_prefetch_tests)
+        set_tests_properties(agc_fast_heap_prefetch PROPERTIES TIMEOUT 60 ENVIRONMENT "APS5_FAST_HEAP=1"
+                ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
 
 if(WIN32)

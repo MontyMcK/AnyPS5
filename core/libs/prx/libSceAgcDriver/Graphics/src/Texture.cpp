@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/AddressLedger.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PendingUnits.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/Float11Repack_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
@@ -2995,7 +2996,14 @@ void StorageTexture::refreshGeneration() {
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
-    for (std::uint32_t layer = first; layer < first + count; ++layer) layerPending[layer] = true;
+    // Live `pending_fill` (env APS5_PENDING_FILL=0 turns it off; PendingUnits.hpp): whole words of
+    // the bit vector at once. One bit at a time was about 2.7% of Graphics::Draw on the World Map,
+    // where every draw marks its whole target pending.
+    static const bool fillDefault = [] {
+        const char* value = std::getenv("APS5_PENDING_FILL");
+        return value == nullptr || value[0] != '0';
+    }();
+    MarkUnitsPending(layerPending, first, count, LiveFlag("pending_fill", fillDefault));
     // Results of this image now cover the alias's results borrowed into these units: this image
     // stores them, the alias no longer has to (its results, unchanged since the borrow, are in
     // this image's content). An alias written since keeps its own newer results pending.
@@ -3221,8 +3229,18 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     // Debug aid: APS5_TRACE_FLUSH names what forces pending results to guest memory.
     static const bool trace = std::getenv("APS5_TRACE_FLUSH") != nullptr;
     if (trace) {
+        // The flushed image and, for a refresh, the image refreshing (the one that forced it), each
+        // with format, tiling, dimension and size, so profiling/cprof/diag-summary.py can aggregate pairs.
+        const auto describe = [](const StorageTexture* texture) {
+            if (texture == nullptr) return std::string("-");
+            const auto& d = texture->descriptor;
+            char text[160];
+            std::snprintf(text, sizeof(text), "0x%llx+0x%llx fmt%u tile%u dim%u %ux%ux%u", static_cast<unsigned long long>(d.baseAddress), static_cast<unsigned long long>(texture->guestBytes), d.format, static_cast<unsigned>(d.tileMode), static_cast<unsigned>(d.dimension), d.width, d.height, d.depthOrLastArray);
+            return std::string(text);
+        };
         const auto packet = GuestMemory::CurrentPacket();
-        for (const auto& texture : flush) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx for %s 0x%llx+0x%zx (packet 0x%x)\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), reason, static_cast<unsigned long long>(address), bytes, packet.opcode);
+        const auto by = describe(refreshing);
+        for (const auto& texture : flush) std::fprintf(stderr, "[flush] image 0x%llx+0x%llx for %s 0x%llx+0x%zx (packet 0x%x) flushed {%s} by {%s} site %s\n", static_cast<unsigned long long>(texture->descriptor.baseAddress), static_cast<unsigned long long>(texture->guestBytes), reason, static_cast<unsigned long long>(address), bytes, packet.opcode, describe(texture.get()).c_str(), by.c_str(), g_refreshSite);
     }
     static const bool traceAliases = std::getenv("APS5_TRACE_ALIAS_FLUSH") != nullptr;
     if (traceAliases) {
@@ -3562,16 +3580,23 @@ bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
     for (auto& query : queries) {
         query.overlaps = false;
         query.found = nullptr;
+        query.blocker = nullptr;
         if (query.end <= query.begin) continue;
         const auto bytes = static_cast<std::size_t>(query.end - query.begin);
         if (pending.textures.MayOverlap(query.begin, bytes)) {
             for (const auto* texture : pending.textures) {
                 if (query.found == nullptr && texture->descriptor.baseAddress == query.begin && texture->guestBytes >= bytes) query.found = texture;
-                if (texture != query.except && texture->overlaps(query.begin, bytes)) query.overlaps = true;
+                if (texture != query.except && texture->overlaps(query.begin, bytes)) {
+                    query.overlaps = true;
+                    if (query.blocker == nullptr) query.blocker = texture;
+                }
             }
         }
         for (const auto* texture : pending.flushing) {
-            if (texture != query.except && texture->overlaps(query.begin, bytes)) query.overlaps = true;
+            if (texture != query.except && texture->overlaps(query.begin, bytes)) {
+                query.overlaps = true;
+                if (query.blocker == nullptr) query.blocker = texture;
+            }
         }
         if (query.pending != nullptr && query.found != query.pending) identities = false;
     }

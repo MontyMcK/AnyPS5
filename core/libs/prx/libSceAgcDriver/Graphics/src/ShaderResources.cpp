@@ -3171,6 +3171,46 @@ std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderResources:
 
 }
 
+namespace {
+
+// See TakeSpeculationRefusalDetail. `identity`: ScanPending found another image than the one
+// speculated at a surface's base; otherwise the first overlap that is not an own-source view.
+thread_local SpeculationRefusalDetail pendingRefusalDetail;
+
+void notePendingRefusal(std::span<const StorageTexture::PendingQuery> scan, std::uint8_t kind, bool identity) {
+    SpeculationRefusalDetail detail;
+    detail.kind = kind;
+    const StorageTexture::PendingQuery* chosen = nullptr;
+    for (const auto& query : scan) {
+        const bool hit = identity ? (query.pending != nullptr && query.found != query.pending) : query.overlaps;
+        if (!hit) continue;
+        if (chosen == nullptr) chosen = &query;
+        if (identity || !(query.found != nullptr && query.found == query.except)) {
+            chosen = &query;
+            break;
+        }
+    }
+    if (chosen != nullptr) {
+        detail.surface = chosen->begin;
+        detail.surfaceBytes = chosen->end - chosen->begin;
+        if (const auto* blocker = identity ? chosen->found : chosen->blocker; blocker != nullptr) {
+            const auto& d = blocker->Descriptor();
+            detail.blocker = d.baseAddress;
+            detail.blockerBytes = blocker->GuestBytes();
+            detail.blockerFormat = d.format;
+            detail.blockerWidth = d.width;
+            detail.blockerHeight = d.height;
+        }
+    }
+    pendingRefusalDetail = detail;
+}
+
+}
+
+SpeculationRefusalDetail TakeSpeculationRefusalDetail() {
+    return std::exchange(pendingRefusalDetail, SpeculationRefusalDetail{});
+}
+
 ShaderResources::PendingVerdict ShaderResources::SpeculatedPendingVerdict(std::span<const ProofSpeculation::Surface> surfaces, std::span<const StorageTexture::PendingQuery> scan, bool acceptOwnSource) {
     bool own = false;
     for (std::size_t k = 0; k < scan.size(); ++k) {
@@ -3286,10 +3326,15 @@ ShaderResources::SpeculationMiss ShaderResources::SpeculateProof(ProofSpeculatio
         thread_local std::vector<StorageTexture::PendingQuery>* scanSlot = nullptr;
         auto& scan = ShaderRecompiler::ThreadOwned(scanSlot);
         scan.assign(speculation.pending.begin(), speculation.pending.end());
-        if (!StorageTexture::ScanPending(scan)) return Miss::Pending;
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (!StorageTexture::ScanPending(scan)) {
+            if (profile) notePendingRefusal(scan, SpeculationRefusalDetail::Identity, true);
+            return Miss::Pending;
+        }
         const auto verdict = SpeculatedPendingVerdict(speculation.surfaces, scan, speculation.ownPending);
         if (verdict != PendingVerdict::Clear) {
             PendingVerdictCounts()[static_cast<std::size_t>(verdict)].fetch_add(1, std::memory_order_relaxed);
+            if (profile) notePendingRefusal(scan, static_cast<std::uint8_t>(static_cast<std::uint8_t>(verdict) + 1u), false);
             return Miss::Pending;
         }
         if (std::any_of(scan.begin(), scan.end(), [](const StorageTexture::PendingQuery& query) { return query.overlaps; })) {

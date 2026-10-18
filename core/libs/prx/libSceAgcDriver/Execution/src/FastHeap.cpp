@@ -13,6 +13,14 @@
 // cache, which trades batches with a per-class global pool, so a block freed on another thread is
 // reused there. Thread caches are returned to the pools when a thread exits.
 //
+// Prefetch (live `fast_heap_prefetch`, env APS5_FAST_HEAP_PREFETCH=0 turns it off): taking a block
+// from a thread cache reads its link word, and the caller then writes the object. Blocks freed on
+// other threads (draw state made by the prep threads, batches traded through the pools) are cold in
+// this core's caches; sampling the World Map committer put the stall on that load at about 9% of
+// Graphics::Draw. Each allocation now prefetches, for writing, the block the next allocation of its
+// class takes (the new list head), so that miss overlaps the caller's work instead of stalling the
+// next allocation. A prefetch has no architectural effect: the blocks handed out are the same.
+//
 // Large blocks (live `fast_heap_large`, env APS5_FAST_HEAP_LARGE=0 turns them off): requests over
 // 32 KiB up to 4 MiB take a power-of-two run of whole spans from the same arena and go back to a
 // per-size free list when freed. Through the runtime they walked the process heap's fragmented free
@@ -77,6 +85,7 @@ Pool pools[MaxClasses];
 // Freed large blocks by size, linked through their first word.
 Pool largePools[LargeClasses];
 std::atomic<bool> largeEnabled{true};
+std::atomic<bool> prefetchEnabled{true};
 
 // head is the list blocks are taken from and freed to; when it reaches a batch it becomes the spare
 // (one full batch held back), and an older spare goes to the pool. Nothing walks a list.
@@ -112,6 +121,11 @@ inline void* NextBatch(void* block) {
 
 inline std::uint32_t BatchCount(void* block) {
     return static_cast<std::uint32_t>(static_cast<std::uintptr_t*>(block)[1] >> 48);
+}
+
+// A write prefetch of the block the next allocation of a class takes (see the header comment).
+inline void PrefetchHead(void* head) {
+    if (head != nullptr && prefetchEnabled.load(std::memory_order_relaxed)) __builtin_prefetch(head, 1, 3);
 }
 
 inline std::uint32_t ClassOf(std::size_t bytes) {
@@ -264,8 +278,10 @@ void* FastMalloc(std::size_t bytes) {
         if (!Refill(sizeClass, cache)) return realMalloc(bytes);
         block = cache->head[sizeClass];
     }
-    cache->head[sizeClass] = Next(block);
+    void* next = Next(block);
+    cache->head[sizeClass] = next;
     --cache->count[sizeClass];
+    PrefetchHead(next);
     return block;
 }
 
@@ -421,11 +437,13 @@ bool Redirect(std::uint8_t* function, void* target, std::uint8_t*& trampolines) 
 // Follows live `fast_heap_large` (the env setting is the default) twice a second; a block's size is
 // in its span tag, so frees stay right whichever path made it.
 bool largeDefault = true;
+bool prefetchDefault = true;
 
 DWORD WINAPI FollowMain(void*) {
     for (;;) {
         Sleep(500);
         largeEnabled.store(AgcDriver::Graphics::LiveFlag("fast_heap_large", largeDefault), std::memory_order_relaxed);
+        prefetchEnabled.store(AgcDriver::Graphics::LiveFlag("fast_heap_prefetch", prefetchDefault), std::memory_order_relaxed);
     }
 }
 
@@ -492,7 +510,18 @@ bool Install() {
     const char* largeValue = std::getenv("APS5_FAST_HEAP_LARGE");
     largeDefault = largeValue == nullptr || largeValue[0] != '0';
     largeEnabled.store(largeDefault, std::memory_order_relaxed);
+    const char* prefetchValue = std::getenv("APS5_FAST_HEAP_PREFETCH");
+    prefetchDefault = prefetchValue == nullptr || prefetchValue[0] != '0';
+    prefetchEnabled.store(prefetchDefault, std::memory_order_relaxed);
     return value != nullptr && value[0] == '1' && Install();
 }();
 
 }
+
+#ifdef APS5_FAST_HEAP_TEST_HOOKS
+// tests/FastHeapPrefetch.cpp: whether the redirect is in place, whether a block is in the arena,
+// and the live prefetch state.
+bool FastHeapTestInstalled() { return installed; }
+bool FastHeapTestOwned(const void* block) { return Owned(block); }
+bool FastHeapTestPrefetch() { return prefetchEnabled.load(std::memory_order_relaxed); }
+#endif
