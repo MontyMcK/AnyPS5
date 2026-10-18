@@ -285,8 +285,14 @@ int APS5_VABI sceKernelIsTrinityMode(void) {
 int APS5_VABI sceKernelGetOperationMode(int* mode, int* submode) {
     if (!mode || !submode)
         throw std::invalid_argument("sceKernelGetOperationMode: null output");
+    // Local switch APS5_OPERATION_SUBMODE=<n>: report that submode (default 0). PPSA01317 picks
+    // its native 1920x1080 mode with 1.
+    static const int operationSubmode = [] {
+        const char* text = std::getenv("APS5_OPERATION_SUBMODE");
+        return text != nullptr ? static_cast<int>(std::strtol(text, nullptr, 0)) : 0;
+    }();
     *mode = 0;
-    *submode = 0;
+    *submode = operationSubmode;
     return 0;
 }
 
