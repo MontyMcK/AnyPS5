@@ -107,7 +107,8 @@ Stream& TheStream() {
     return stream;
 }
 
-// Live `stream_batch` (env APS5_STREAM_BATCH=0 turns it off): a producer's calls are linked into an
+// Live `stream_batch` (off by default; env APS5_STREAM_BATCH=1 turns it on, measured -15 FPS at the
+// PPSA01317 World Map): a producer's calls are linked into an
 // open batch and published to the stream together (one exchange, one counter add, one cache line
 // handed to the recorder thread) instead of one by one: a draw streams about a dozen calls, and each
 // push cost a few tens of nanoseconds in cross-core traffic. The open batch belongs to the GPU
@@ -119,7 +120,7 @@ Stream& TheStream() {
 bool StreamBatch() {
     static const bool requested = [] {
         const char* value = std::getenv("APS5_STREAM_BATCH");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     static const LiveSwitch flag("stream_batch");
     return flag.Get(requested);
@@ -278,7 +279,7 @@ std::vector<T> Copy(const T* values, std::uint32_t count) {
 bool StreamInline() {
     static const bool requested = [] {
         const char* value = std::getenv("APS5_STREAM_INLINE");
-        return value == nullptr || value[0] != '0';
+        return value != nullptr && value[0] == '1';
     }();
     static const LiveSwitch flag("stream_inline");
     return flag.Get(requested);

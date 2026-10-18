@@ -8,6 +8,7 @@ This branch is an experimental performance branch for PPSA01317 and is not meant
 |---|---|---|
 | `APS5_NET_OFFLINE` | `1` | Makes network calls fail at once. Without it the title waits minutes at boot for server responses. |
 | `APS5_NO_PIPELINE_JOURNAL` | `1` | Turns off the pipeline journal replay at boot (it costs FPS while it runs). |
+| `APS5_OPERATION_SUBMODE` | `1` | Makes the title use its native 1920x1080 mode instead of 4K (World Map about 19 -> 21.5 FPS on our machine). Leave it unset for 4K. |
 | `APS5_LIVE_FLAGS` | path to `live-flags.txt` | Live switches, re-read while the game runs. Copy `docs/ppsa01317/live-flags.txt` next to the game and point this at it. |
 | `APS5_ADDRESS_TEMPLATES` | `1` | |
 | `APS5_RESOURCE_CACHE_ENTRIES` | `8192` | |
@@ -37,6 +38,7 @@ The unlabelled rows are performance switches from earlier experiments. Each is d
 ```powershell
 $env:APS5_NET_OFFLINE = '1'
 $env:APS5_NO_PIPELINE_JOURNAL = '1'
+$env:APS5_OPERATION_SUBMODE = '1'
 $env:APS5_LIVE_FLAGS = "$PWD\live-flags.txt"
 $env:APS5_ADDRESS_TEMPLATES = '1'
 $env:APS5_RESOURCE_CACHE_ENTRIES = '8192'
