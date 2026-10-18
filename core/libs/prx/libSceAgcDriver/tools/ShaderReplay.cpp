@@ -7,6 +7,8 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Recompiler.hpp"
+#include "BdaAbi.hpp"
+#include <cstdlib>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 
 #if ANYPS5_ENABLE_SPIRV_TOOLS
@@ -150,6 +152,8 @@ bool Replay(const char* path) {
     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
     // A replay measures the current implementation, not a prior cached artifact.
     request.request.useCache = false;
+    // Requests dumped by older libs name their BDA ABI; replay them with the current one.
+    if (std::getenv("APS5_REPLAY_CURRENT_BDA_ABI") != nullptr) request.request.target.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
     std::printf("%s: %zu code words, %zu user data, %zu memory regions, wave%u\n", path, request.request.shader.code.size(), request.request.context.userData.size(), request.request.context.memory.size(), request.request.context.waveSize);
     if (request.request.context.compute.has_value()) {
         const auto& compute = *request.request.context.compute;

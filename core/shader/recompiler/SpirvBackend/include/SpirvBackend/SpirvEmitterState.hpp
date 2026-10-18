@@ -127,6 +127,12 @@ struct SpirvEmitterState {
     std::uint32_t bdaClockLookup = 0;
     std::uint32_t bdaClockCalls = 0;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
+    // The lookup path of an anchored dword read outlined (see DefineBdaSlowReadFunctions), by
+    // [stops invocations][coherent]; 0 where reads keep it inline.
+    std::array<std::array<std::uint32_t, 2>, 2> bdaSlowReadFunctions {};
+    std::uint32_t bdaSlowReadType = 0;
+    // Values of grouped anchored reads emitted with the first of their group (LoadBdaGroup).
+    std::unordered_map<const IrValue*, std::uint32_t> bdaGroupValues;
     // Reads whose 64-bit base is a pair of user data registers (one value for the whole draw): the
     // table range holding that base, found once at the program's entry (see EmitBdaAnchors). A read
     // that lies in it loads from the range's device address plus its offset, behind one branch;

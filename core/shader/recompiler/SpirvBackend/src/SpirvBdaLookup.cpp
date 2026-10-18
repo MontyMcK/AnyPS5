@@ -496,6 +496,7 @@ void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false);
     DefineBdaDwordReadFunctions(state);
     if (!state.bdaAnchors.empty()) DefineBdaAnchorFunction(state);
+    if (!state.bdaAnchors.empty()) DefineBdaSlowReadFunctions(state);
     if (state.program.Info().bdaWrites) {
         state.bdaWritePointerFunction = DefineBdaLookup(state, "get_bda_write_pointer", true, BdaAbi::Write);
         state.bdaAtomicPointerFunction = DefineBdaLookup(state, "get_bda_atomic_pointer", true, BdaAbi::Read | BdaAbi::Write);

@@ -6,6 +6,7 @@
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -193,6 +194,31 @@ std::uint32_t GuestAddressBase(SpirvValueEmitContext& ctx, const IrValue& inst, 
     return AddBdaAddress(ctx, inst, base, Unary(state, spv::OpUConvert, TypeScalarU64(state), low), false);
 }
 
+// The operands of the checked sum GuestAddressBase forms: the 64-bit base and the 32-bit lane
+// offset (0 for a full address, which GuestAddressBase takes as it is).
+std::pair<std::uint32_t, std::uint32_t> GuestAddressBaseOperands(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem) {
+    auto& state = ctx.state;
+    auto low = ctx.Arg(inst, 1);
+    if (mem.kind == ResourceKind::ScalarAddress) {
+        low = Binary(state, spv::OpBitwiseAnd, TypeU32(state), low, ConstantU32(state, ~3u));
+    }
+    if (mem.addressIsFull) return {DeviceAddressFromWords(state, low, ctx.Arg(inst, 2)), ConstantU32(state, 0u)};
+    const IrValue* argument = inst.Argument(0);
+    const IrValue* handle = argument != nullptr ? argument->Resolve() : nullptr;
+    if (handle == nullptr || handle->Opcode() != IrOpcode::GetAddressResource || handle->ArgumentCount() != 2u) {
+        ctx.Fail(inst, "has no address base pair");
+    }
+    return {DeviceAddressFromWords(state, ctx.Arg(*handle, 0), ctx.Arg(*handle, 1)), low};
+}
+
+// An anchored read's lookup path through the outlined function (EmitBdaDwordReadsOutlined).
+std::array<std::uint32_t, 4> OutlinedBdaDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem, std::uint32_t offset, std::uint32_t dwords) {
+    const auto& functions = ctx.state.bdaSlowReadFunctions[ctx.state.bdaStopsInvocations];
+    if (functions[0] == 0 && functions[1] == 0) return EmitBdaDwordReads(ctx, inst, GuestAddressBase(ctx, inst, mem), offset, dwords);
+    const auto [base, low] = GuestAddressBaseOperands(ctx, inst, mem);
+    return EmitBdaDwordReadsOutlined(ctx, inst, base, low, offset, dwords, [&] { return GuestAddressBase(ctx, inst, mem); });
+}
+
 std::uint32_t GuestAddress(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& mem) {
     const auto address = GuestAddressBase(ctx, inst, mem);
     auto immediate = static_cast<std::int32_t>(mem.offset);
@@ -226,6 +252,9 @@ std::uint32_t LoadBda(SpirvValueEmitContext& ctx, const IrValue& inst, const Mem
         if (anchor == nullptr) return EmitBdaRead(ctx, inst, GuestAddress(ctx, inst, mem), bits);
         const auto [low, immediate] = GuestAddressParts(ctx, inst, mem, true);
         return EmitAnchoredBdaRead(ctx.state, inst, *anchor, low, immediate, bits, 1u, 1u, [&] {
+            // A dword read: GuestAddress's immediate is the outlined path's first dword offset
+            // (EmitBdaRead adds none, AddBdaImmediate checks the sum the same way).
+            if (bits == 32u) return OutlinedBdaDwordReads(ctx, inst, mem, static_cast<std::uint32_t>(immediate), 1u);
             return std::array<std::uint32_t, 4>{EmitBdaRead(ctx, inst, GuestAddress(ctx, inst, mem), bits)};
         })[0];
     });
@@ -359,6 +388,114 @@ const MemoryInfo& SharedMemory(SpirvValueEmitContext& ctx, const IrValue& inst) 
     return mem;
 }
 
+// Adjacent anchored reads of one guest instruction (EmitAnchoredBdaGroupRead): the IR splits a
+// scalar or vector load into reads of single dwords or dword groups, each with its own lookup
+// fallback (a call NVIDIA saves every live register around). A run of such reads with the same
+// operands and pc, increasing non-overlapping offsets within 64 bytes, is emitted at its first
+// read with one fallback call; the others take their values from bdaGroupValues. True when
+// `inst` was defined here.
+// The same operand: one value, or immediates of one type and value.
+bool SameIrOperand(const IrValue* a, const IrValue* b) {
+    if (a == b) return true;
+    if (a == nullptr || b == nullptr) return false;
+    a = a->Resolve();
+    b = b->Resolve();
+    if (a == b) return true;
+    return a != nullptr && b != nullptr && a->HasImmediate() && b->HasImmediate() && a->Opcode() == b->Opcode() && a->Type() == b->Type() && a->ImmediateU64() == b->ImmediateU64();
+}
+
+bool LoadBdaGroup(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t components) {
+    auto& state = ctx.state;
+    if (const auto found = state.bdaGroupValues.find(&inst); found != state.bdaGroupValues.end()) {
+        ctx.Define(inst, found->second);
+        state.bdaGroupValues.erase(found);
+        return true;
+    }
+    const auto function = BdaSlowReadFunction(state, inst);
+    if (function == 0) return false;
+    const auto& mem = ctx.Memory(inst);
+    const auto* anchor = ReadAnchor(state, inst);
+    if (anchor == nullptr || mem.planningOnly || mem.addressIsFull) return false;
+    const bool wide = components > 1u;
+    // The offset each read passes to its lookup path (and, the same, to its anchor test).
+    const auto immediateOf = [&](const MemoryInfo& info) {
+        auto immediate = static_cast<std::int32_t>(info.offset);
+        if (!wide && info.kind == ResourceKind::ScalarAddress) immediate = static_cast<std::int32_t>(static_cast<std::uint32_t>(immediate) & ~3u);
+        return immediate;
+    };
+    const auto usedOf = [&](const IrValue& read) { return wide ? UsedBdaReadDwords(read, components) : 1u; };
+    struct Member {
+        const IrValue* inst;
+        std::int64_t immediate;
+        std::uint32_t used;
+    };
+    std::vector<Member> members{{&inst, immediateOf(mem), usedOf(inst)}};
+    if (members.front().used == 0u) return false;
+    const auto pc = inst.Flags<MemoryFlags>().pc;
+    const auto& instructions = inst.Parent()->Instructions();
+    auto next = std::find(instructions.begin(), instructions.end(), &inst);
+    if (next == instructions.end()) return false;
+    const auto firstDword = [](std::uint32_t used) { return static_cast<std::int64_t>(std::countr_zero(used)); };
+    const auto lastDword = [](std::uint32_t used) { return static_cast<std::int64_t>(31 - std::countl_zero(used)); };
+    for (++next; next != instructions.end(); ++next) {
+        const IrValue& read = **next;
+        if (read.Opcode() != inst.Opcode() || read.ArgumentCount() != inst.ArgumentCount() || read.Flags<MemoryFlags>().pc != pc) break;
+        bool sameArguments = true;
+        for (std::size_t argument = 0; argument < inst.ArgumentCount(); ++argument) sameArguments = sameArguments && SameIrOperand(read.Argument(argument), inst.Argument(argument));
+        if (!sameArguments) break;
+        const auto& info = ctx.Memory(read);
+        if (info.kind != mem.kind || info.planningOnly || info.addressIsFull || BdaSlowReadFunction(state, read) != function || ReadAnchor(state, read) != anchor) break;
+        const Member member{&read, immediateOf(info), usedOf(read)};
+        const auto& previous = members.back();
+        const auto delta = member.immediate - members.front().immediate;
+        if (member.used == 0u || delta % 4 != 0) break;
+        // In order and apart: dword order is program order.
+        if (member.immediate + 4 * firstDword(member.used) <= previous.immediate + 4 * lastDword(previous.used)) break;
+        if (delta / 4 + lastDword(member.used) >= static_cast<std::int64_t>(BdaSlowReadDwords)) break;
+        members.push_back(member);
+    }
+    if (members.size() < 2u) return false;
+    std::uint32_t used = 0;
+    for (const auto& member : members) used |= member.used << static_cast<std::uint32_t>((member.immediate - members.front().immediate) / 4);
+    const auto [low, immediate] = GuestAddressParts(ctx, inst, mem, !wide);
+    (void)immediate;
+    const auto [base, baseLow] = GuestAddressBaseOperands(ctx, inst, mem);
+    // Under the reads' common active argument, as each read alone (EmitValueOrDefaultIfCondition).
+    const auto active = ActiveArgument(ctx, inst);
+    const auto thenLabel = state.module.AllocateId();
+    const auto elseLabel = state.module.AllocateId();
+    const auto mergeLabel = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelectionMerge, mergeLabel, spv::SelectionControlMaskNone);
+    state.module.AddFunction(spv::OpBranchConditional, active, thenLabel, elseLabel);
+    EmitLabel(state, thenLabel);
+    const auto values = EmitAnchoredBdaGroupRead(state, inst, *anchor, low, static_cast<std::uint32_t>(members.front().immediate), used, base, baseLow);
+    std::vector<std::uint32_t> memberValues;
+    for (const auto& member : members) {
+        const auto shift = static_cast<std::uint32_t>((member.immediate - members.front().immediate) / 4);
+        if (!wide) {
+            memberValues.push_back(values[shift]);
+            continue;
+        }
+        std::array<std::uint32_t, 4> dwords{};
+        for (std::uint32_t dword = 0; dword < components; ++dword) dwords[dword] = (member.used & (1u << dword)) != 0u ? values[shift + dword] : ConstantU32(state, 0u);
+        memberValues.push_back(ConstructU32Composite(state, components, dwords));
+    }
+    const auto thenExit = state.currentLabel;
+    state.module.AddFunction(spv::OpBranch, mergeLabel);
+    EmitLabel(state, elseLabel);
+    state.module.AddFunction(spv::OpBranch, mergeLabel);
+    EmitLabel(state, mergeLabel);
+    const auto type = wide ? TypeU32Composite(state, components) : TypeU32(state);
+    const auto zero = wide ? ConstantU32CompositeZero(state, components) : ConstantU32(state, 0u);
+    for (std::size_t index = 0; index < members.size(); ++index) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpPhi, type, value, memberValues[index], thenExit, zero, elseLabel);
+        if (index == 0u) ctx.Define(inst, value);
+        else state.bdaGroupValues[members[index].inst] = value;
+    }
+    return true;
+}
+
 void LoadAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t bits) {
     const auto& mem = ctx.Memory(inst);
     if (bits == 32u && mem.planningOnly) {
@@ -371,6 +508,7 @@ void LoadAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t 
     case ResourceKind::ScalarAddress:
     case ResourceKind::Flat:
     case ResourceKind::Global:
+        if (bits == 32u && LoadBdaGroup(ctx, inst, 1u)) return;
         ctx.Define(inst, LoadBda(ctx, inst, mem, bits));
         return;
     default:
@@ -386,7 +524,7 @@ std::uint32_t LoadBdaWide(SpirvValueEmitContext& ctx, const IrValue& inst, const
         if (anchor == nullptr || used == 0u) return ConstructU32Composite(state, components, EmitBdaDwordReads(ctx, inst, GuestAddressBase(ctx, inst, mem), mem.offset, components));
         const auto [low, immediate] = GuestAddressParts(ctx, inst, mem, false);
         return ConstructU32Composite(state, components, EmitAnchoredBdaRead(state, inst, *anchor, low, immediate, 32u, components, used, [&] {
-            return EmitBdaDwordReads(ctx, inst, GuestAddressBase(ctx, inst, mem), mem.offset, components);
+            return OutlinedBdaDwordReads(ctx, inst, mem, mem.offset, components);
         }));
     });
 }
@@ -399,6 +537,7 @@ void LoadAddressWide(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint3
     switch (mem.kind) {
     case ResourceKind::Flat:
     case ResourceKind::Global:
+        if (LoadBdaGroup(ctx, inst, components)) return;
         ctx.Define(inst, LoadBdaWide(ctx, inst, mem, components));
         return;
     default:

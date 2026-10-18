@@ -15,6 +15,29 @@ std::uint32_t BdaLoadWord(SpirvEmitterState& state, std::uint32_t index);
 std::uint32_t BdaLoadAddress(SpirvEmitterState& state, std::uint32_t index);
 void DefineBdaFaultFunction(SpirvEmitterState& state);
 void DefineBdaDwordReadFunctions(SpirvEmitterState& state);
+// After DefineBdaDwordReadFunctions, for programs with anchors: the lookup path of a dword read
+// (EmitBdaDwordReads) as one function per [stops invocations][coherent], so the rarely taken
+// fallback of an anchored read is one call instead of its probe, byte reads and fault checks
+// inline (which grew NVIDIA's native code by ~40% and spilled registers in PPSA01317's 4K passes).
+void DefineBdaSlowReadFunctions(SpirvEmitterState& state);
+// The dwords one call of the outlined function reads (a mask of them; a group of reads within
+// 64 bytes shares one call, see EmitAnchoredBdaGroupRead).
+inline constexpr std::uint32_t BdaSlowReadDwords = 16;
+// The outlined function for `inst`'s reads (its coherence and the program's stop mode), 0 if none.
+std::uint32_t BdaSlowReadFunction(const SpirvEmitterState& state, const IrValue& inst);
+// Adjacent anchored dword reads of one guest instruction with the same base, lane offset `low`
+// (anchor form) and `baseLow` (GuestAddressBase form) whose dwords lie in 64 bytes: the dwords of
+// `used` (bit d: the dword at offset + 4 d) through the anchor where it holds them all, else
+// through one call of the outlined function. Each member, read alone, takes the anchor's path
+// exactly when the anchor holds it, and a held member's lookup path reads the same value without
+// a fault; the members' faults keep their order (dword order is program order). Needs
+// BdaSlowReadFunction(state, inst).
+std::array<std::uint32_t, BdaSlowReadDwords> EmitAnchoredBdaGroupRead(SpirvEmitterState& state, const IrValue& inst, const SpirvEmitterState::BdaAnchor& anchor, std::uint32_t low, std::uint32_t offset, std::uint32_t used, std::uint32_t base, std::uint32_t baseLow);
+// EmitBdaDwordReads(address(), offset, dwords) through the outlined function where it is defined,
+// with the address base + zext(low) formed inside it as GuestAddressBase forms it (`address`
+// emits that inline when there is no function). The same reads, faults and stops in the same
+// order; for the fallback of an anchored read.
+std::array<std::uint32_t, 4> EmitBdaDwordReadsOutlined(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t base, std::uint32_t low, std::uint32_t offset, std::uint32_t dwords, const std::function<std::uint32_t()>& address);
 void RecordBdaFault(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason);
 void ReturnBdaFailureIf(SpirvEmitterState& state, std::uint32_t condition, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason);
 void ValidateBdaTarget(const IrProgram& program, const SpirvTargetOptions& target);
