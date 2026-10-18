@@ -993,8 +993,16 @@ bool SpeculatedKeyHash() {
     return LiveFlag("spec_key_hash", requested);
 }
 
+// Live `spec_entry_stamp` (on by default since bs53; env APS5_SPEC_ENTRY_STAMP=0 turns it off): the
+// prep thread's peek keeps the cache entry's handle and stamp, and the committer's lookup of an
+// unchanged entry is TouchStamped (no key hash, no key compare) instead of Find. Measured neutral
+// while the World Map was GPU-bound (bs33); the 1080p committer-bound frame pays Find's hash and
+// compare on every draw.
 bool SpeculatedEntryStamps() {
-    static const bool requested = std::getenv("APS5_SPEC_ENTRY_STAMP") != nullptr;
+    static const bool requested = [] {
+        const char* value = std::getenv("APS5_SPEC_ENTRY_STAMP");
+        return value == nullptr || value[0] != '0';
+    }();
     return LiveFlag("spec_entry_stamp", requested);
 }
 

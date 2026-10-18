@@ -351,7 +351,8 @@ configure_windows_unwind(agc_write_tracking_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_write_tracking_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_write_tracking COMMAND agc_write_tracking_tests)
-    set_tests_properties(agc_write_tracking PROPERTIES SKIP_RETURN_CODE 77)
+    # The shared-epoch memo on, so the collect_local_copy check runs.
+    set_tests_properties(agc_write_tracking PROPERTIES SKIP_RETURN_CODE 77 ENVIRONMENT "APS5_SHARED_EPOCH_MEMO=1")
     if(WIN32)
         set_tests_properties(agc_write_tracking PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
@@ -882,6 +883,23 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_recorder_lazy_writeback PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    # The bs53 committer cuts (stream_batch, import_memo, spec_entry_stamp on by default, the
+    # lock-free tracker queries): the commit, speculation and draw input modes with the recorder
+    # thread streaming (APS5_RECORDER_THREAD=1) and every import memo hit checked against the
+    # locked lookup (APS5_VERIFY_IMPORT_MEMO=1).
+    foreach(agcB53Mode IN ITEMS commit-paths speculated-draw draw-input-in-place merged-import draw-input)
+        string(REPLACE "-" "_" agcB53Name "${agcB53Mode}")
+        add_test(NAME agc_driver_recorder_b53_${agcB53Name} COMMAND agc_driver_recorder_tests --${agcB53Mode}-only)
+        if(agcB53Mode STREQUAL "speculated-draw")
+            set_tests_properties(agc_driver_recorder_b53_${agcB53Name} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_RECORDER_THREAD=1;APS5_VERIFY_IMPORT_MEMO=1;APS5_DRAW_PLAN=1;APS5_SPEC_PIPELINE=1;APS5_SPEC_KEY_HASH=1;APS5_VERIFY_DRAW_SPECULATION=1;APS5_SPEC_WINDOW_READS=1;APS5_DEFER_DROPS=1;APS5_BIND_ELIDE=1;APS5_DRAW_SET_WRITES=1" SKIP_RETURN_CODE 77)
+        else()
+            set_tests_properties(agc_driver_recorder_b53_${agcB53Name} PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_RECORDER_THREAD=1;APS5_VERIFY_IMPORT_MEMO=1;APS5_DRAW_INPUT_MEMO=1" SKIP_RETURN_CODE 77)
+        endif()
+        if(WIN32)
+            set_tests_properties(agc_driver_recorder_b53_${agcB53Name} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
 
     foreach(agcTest IN ITEMS agc_spirv_narrow_constant_store_tests agc_spirv_optimizer_tests agc_driver_constant_store_tests)
         if(NOT TARGET ${agcTest})

@@ -193,6 +193,10 @@ GpuMutexType& GpuMutex();
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.
 void SetGpuUnlockHook(void (*hook)());
+// Called on the holder's thread at the start of its outermost release, while it still holds the
+// mutex: work the next holder must find done (the recorder thread's open stream batch is
+// published, DeferredVulkan stream_batch). One hook, set once; it must not take GpuMutex.
+void SetGpuReleaseHook(void (*hook)());
 // Called with each profiled (APS5_PROFILE_DRAW) outermost GPU mutex hold of a millisecond or more,
 // on the holder's thread right before it releases: the recorder's cpu-timeline.txt hold events.
 // One hook, set once; it must not take GpuMutex.

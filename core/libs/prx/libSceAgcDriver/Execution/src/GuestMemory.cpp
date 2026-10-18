@@ -870,6 +870,9 @@ struct WriteTracker {
     // bumps, or an image refreshed after a stamp would keep failing UnchangedSince until the next
     // walk of its range and re-upload at every use of the epoch.
     std::atomic<std::uint32_t> generation{1};
+    // Set once initialize() has sized the block and coverage arrays of a watched arena (Windows):
+    // from then on the lock-free UnchangedSince (live `unchanged_lockfree`) may read them.
+    std::atomic<bool> lockFreeReady{false};
     std::vector<void*> pages;
     // Collect memo: page-rounded ranges walked during the current epoch (see BumpCollectEpoch). A
     // collect fully inside one skips GetWriteWatch, whose cost is proportional to the range's pages,
@@ -976,6 +979,7 @@ struct WriteTracker {
             }
         }
         GuestArena::GuestArenaSetPrivateMappingObserver_nid_postfix(&watchPrivateMapping);
+        lockFreeReady.store(true, std::memory_order_release);
 #else
         watched = GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix();
         if (watched) leaves.resize(LeafCount);
@@ -1082,6 +1086,16 @@ struct WriteTracker {
 #endif
     }
 
+#ifdef _WIN32
+    // unchanged() without the mutex (acquire loads; see the lock-free UnchangedSince).
+    bool unchangedAcquire(std::uint64_t first, std::uint64_t last, std::uint64_t since) const {
+        for (auto block = first; block <= last; ++block) {
+            if (std::atomic_ref<std::uint32_t>(const_cast<std::uint32_t&>(blocks[block])).load(std::memory_order_acquire) > since) return false;
+        }
+        return true;
+    }
+#endif
+
     std::uint32_t cpuStampOf(std::uint64_t block) const {
 #ifdef _WIN32
         return cpuBlocks[block];
@@ -1106,7 +1120,8 @@ struct WriteTracker {
         // Stamps change only here, under the tracker mutex: one writer.
         stampSerial.store(stampSerial.load(std::memory_order_relaxed) + 1, std::memory_order_release);
 #ifdef _WIN32
-        blocks[block] = stampGeneration;
+        // A release store: the lock-free UnchangedSince reads stamps without the mutex.
+        std::atomic_ref<std::uint32_t>(blocks[block]).store(stampGeneration, std::memory_order_release);
         if (cpu) cpuBlocks[block] = stampGeneration;
         if (written) writtenBlocks[block] = stampGeneration;
 #else
@@ -1145,13 +1160,16 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     if (!tracker.watched || bytes == 0 || bytes > tracker.size || address < tracker.base || address - tracker.base > tracker.size - bytes) return;
-    tracker.coverage.Restore(address, bytes, generation);
+    // The fresh backing's stamps go in before its blocks are watched again (Restore): a lock-free
+    // UnchangedSince (live `unchanged_lockfree`) that finds a block watched also finds its new
+    // stamp. Under the mutex the order is invisible, as before.
     forgetBlocksWalked(address, bytes);
     ++tracker.generation;
     for (auto block = tracker.blockOf(address); block <= tracker.blockOf(address + bytes - 1); ++block) {
         tracker.driverPieces.erase(block);
         tracker.stamp(block, tracker.generation, StampKind::Cpu);
     }
+    tracker.coverage.Restore(address, bytes, generation);
     unwatchSerial.fetch_add(1, std::memory_order_release);
     if (const auto observer = dirtyObserver.load(std::memory_order_acquire)) observer(address, bytes);
 }
@@ -1278,6 +1296,16 @@ bool collectHistory() {
 bool epochCollectMapEnabled() {
     static const bool enabled = std::getenv("APS5_NO_EPOCH_COLLECT_MAP") == nullptr;
     return enabled;
+}
+
+// Live `collect_local_copy` (env APS5_COLLECT_LOCAL_COPY=0 turns it off): see collectWrites.
+bool collectLocalCopy() {
+    static const bool requested = [] {
+        const char* value = std::getenv("APS5_COLLECT_LOCAL_COPY");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const Graphics::LiveSwitch flag("collect_local_copy");
+    return flag.Get(requested);
 }
 
 bool sharedCollectMemo() {
@@ -1565,16 +1593,29 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if ((epoch & SharedEpochBit) != 0) {
             auto& shared = SharedRanges();
             const bool history = collectHistory();
-            std::lock_guard sharedLock(shared.mutex);
-            if (const auto* ranges = shared.find(epoch, history)) {
-                if (const auto found = ranges->find(first); found != ranges->end() && found->second.unwatched == unwatched && stop <= found->second.end) {
-                    collectMemoHits.fetch_add(1, std::memory_order_relaxed);
-                    if (collectProfile) {
-                        CollectSplitStats().mapHits.fetch_add(1, std::memory_order_relaxed);
-                        reportCollectSplit();
-                    }
-                    return tracker.generation.load(std::memory_order_relaxed);
+            WriteTracker::Memo sharedHit{};
+            {
+                std::lock_guard sharedLock(shared.mutex);
+                if (const auto* ranges = shared.find(epoch, history)) {
+                    if (const auto found = ranges->find(first); found != ranges->end() && found->second.unwatched == unwatched && stop <= found->second.end) sharedHit = found->second;
                 }
+            }
+            if (sharedHit.end != 0) {
+                // Live `collect_local_copy`: the shared entry (a walk of this followed epoch by
+                // any thread) also goes into this thread's epoch map, so the next collect of the
+                // range answers there without the shared mutex. Both maps answer for the same
+                // epoch value and check the same unwatch serial and end, so the copy answers
+                // exactly as the shared entry would.
+                if (epochCollectMapEnabled() && collectLocalCopy()) {
+                    auto& entry = epochCollectMap(epoch).ranges[first];
+                    if (entry.unwatched != sharedHit.unwatched || entry.end < sharedHit.end) entry = sharedHit;
+                }
+                collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+                if (collectProfile) {
+                    CollectSplitStats().mapHits.fetch_add(1, std::memory_order_relaxed);
+                    reportCollectSplit();
+                }
+                return tracker.generation.load(std::memory_order_relaxed);
             }
         }
         const auto ringStart = collectProfile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1975,8 +2016,58 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
     return tracker.watched && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && tracker.covers(address, bytes);
 }
 
+namespace {
+
+// Live `unchanged_lockfree` (env APS5_UNCHANGED_LOCKFREE=0 turns it off): UnchangedSince and
+// UnchangedSinceAll read the coverage bytes and the block stamps without the tracker mutex (Windows;
+// a probe sink takes the locked path). The draw committer asks these several times per draw (the
+// template proofs, the sampled-texture fast path, the target proof, the index scan memo) against
+// six prep workers and the queue workers that take the same mutex for their collects; the waits
+// and handoffs were about 0.5 us per commit.
+//
+// The answer is one the locked query could give: the arrays are sized once before `lockFreeReady`
+// and every store into them is an atomic store under the mutex (stamps only grow). A "changed" or
+// "not covered" answer is true at the instant its byte was read. An "unchanged" answer read every
+// block watched and every stamp not newer than `generation`; since stamps only grow and a Restore
+// stamps before it clears a block's exclusion, the same held at the first read, where the locked
+// query would have answered the same.
+// Odd while storeOwn writes guest bytes under the tracker mutex before it stamps them (a locked
+// query waits for the stamps; a lock-free one must not answer from the stamps of before the store).
+// A lock-free answer stands only when the sequence was even and unchanged across the read; otherwise
+// the query takes the mutex as before.
+std::atomic<std::uint64_t> storeSequence{0};
+
+struct StoreSequenceScope {
+    StoreSequenceScope() { storeSequence.fetch_add(1, std::memory_order_seq_cst); }
+    ~StoreSequenceScope() { storeSequence.fetch_add(1, std::memory_order_seq_cst); }
+    StoreSequenceScope(const StoreSequenceScope&) = delete;
+    StoreSequenceScope& operator=(const StoreSequenceScope&) = delete;
+};
+
+bool unchangedLockFree() {
+    static const bool requested = [] {
+        const char* value = std::getenv("APS5_UNCHANGED_LOCKFREE");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const Graphics::LiveSwitch flag("unchanged_lockfree");
+    return flag.Get(requested);
+}
+
+}
+
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     auto& tracker = Tracker();
+#ifdef _WIN32
+    if (probeSink == nullptr && tracker.lockFreeReady.load(std::memory_order_acquire) && unchangedLockFree()) {
+        if (generation == 0 || bytes == 0) return false;
+        const auto sequence = storeSequence.load(std::memory_order_seq_cst);
+        if ((sequence & 1u) == 0) {
+            const bool answer = tracker.coverage.CoversAcquire(address, bytes) && tracker.unchangedAcquire(tracker.blockOf(address), tracker.blockOf(address + bytes - 1), generation);
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (storeSequence.load(std::memory_order_relaxed) == sequence) return answer;
+        }
+    }
+#endif
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
@@ -1989,6 +2080,22 @@ bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t gene
 
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
     auto& tracker = Tracker();
+#ifdef _WIN32
+    if (probeSink == nullptr && tracker.lockFreeReady.load(std::memory_order_acquire) && unchangedLockFree()) {
+        const auto sequence = storeSequence.load(std::memory_order_seq_cst);
+        if ((sequence & 1u) == 0) {
+            bool answer = true;
+            for (const auto& [address, bytes, generation] : queries) {
+                if (generation == 0 || bytes == 0 || !tracker.coverage.CoversAcquire(address, bytes) || !tracker.unchangedAcquire(tracker.blockOf(address), tracker.blockOf(address + bytes - 1), generation)) {
+                    answer = false;
+                    break;
+                }
+            }
+            std::atomic_thread_fence(std::memory_order_seq_cst);
+            if (storeSequence.load(std::memory_order_relaxed) == sequence) return answer;
+        }
+    }
+#endif
     const auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched) return false;
@@ -2020,6 +2127,8 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     };
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
+    // Until the stamps are in, lock-free queries take the mutex (unchanged_lockfree).
+    const StoreSequenceScope storing;
     tracker.initialize();
     if (!tracker.watched || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return stampStored(tracker, store());
     constexpr std::uint64_t page = 4096;
@@ -2467,6 +2576,11 @@ bool GpuMutexType::try_lock() {
 
 namespace {
 std::atomic<void (*)()> gpuUnlockHook{nullptr};
+std::atomic<void (*)()> gpuReleaseHook{nullptr};
+}
+
+void SetGpuReleaseHook(void (*hook)()) {
+    gpuReleaseHook.store(hook, std::memory_order_release);
 }
 
 void SetGpuHoldHook(void (*hook)(std::chrono::steady_clock::time_point begin, std::chrono::steady_clock::time_point end, std::size_t site, const char* siteName)) {
@@ -2478,6 +2592,11 @@ void SetGpuUnlockHook(void (*hook)()) {
 }
 
 void GpuMutexType::unlock() {
+    // Still the holder, at its outermost hold: what the hold left for the next holder to follow
+    // goes out first (the recorder thread's open batch, stream_batch).
+    if (depth == 1) {
+        if (auto* hook = gpuReleaseHook.load(std::memory_order_acquire); hook != nullptr) hook();
+    }
     const bool outermost = --depth == 0;
     if (outermost) {
         owner.store(nullptr, std::memory_order_relaxed);

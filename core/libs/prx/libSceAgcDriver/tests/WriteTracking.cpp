@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #ifdef _WIN32
@@ -10,13 +11,41 @@
 #include <sys/mman.h>
 #endif
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <stdexcept>
+#include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
+
+// The tracker's live flags, answered by the test: `unchanged_lockfree` and `collect_local_copy`
+// from the switches below (-1: the fallback), every other name from its fallback.
+namespace AgcDriver::Graphics {
+
+std::atomic<int> testLockFree{-1};
+std::atomic<int> testLocalCopy{-1};
+
+bool LiveFlag(std::string_view name, bool fallback) {
+    const auto pick = [&](const std::atomic<int>& value) { return value.load() < 0 ? fallback : value.load() != 0; };
+    if (name == "unchanged_lockfree") return pick(testLockFree);
+    if (name == "collect_local_copy") return pick(testLocalCopy);
+    return fallback;
+}
+
+bool LockSpinEnabled() {
+    return true;
+}
+
+bool LiveSwitch::Get(bool fallback) const {
+    return LiveFlag(name, fallback);
+}
+
+}
 
 namespace {
 
@@ -147,6 +176,136 @@ void CheckUnwatch() {
     Require(!UnchangedSince(base, Block, adjacent), "unwatch hid a CPU edit in unrelated memory");
 }
 
+// Live `unchanged_lockfree`: the lock-free UnchangedSince and UnchangedSinceAll answer exactly as
+// the locked queries for every range shape (inside one block, across blocks, partly unwatched,
+// outside the arena, empty, generation 0), before and after stamps, unwatches and fresh backing.
+void CheckLockFreeAgrees(const char* stage, std::uint64_t base, std::size_t bytes, std::span<const std::uint64_t> generations) {
+    struct Query {
+        std::uint64_t address;
+        std::size_t bytes;
+    };
+    std::array<std::uint64_t, 64> outsideBytes{};
+    const auto outside = reinterpret_cast<std::uint64_t>(outsideBytes.data());
+    const std::vector<Query> queries{{base, bytes}, {base, 64}, {base + 4096, 8192}, {base + Block - 16, 32}, {base + Block, Block}, {base + 2 * Block + 100, Block}, {base, 0}, {outside, sizeof(outsideBytes)}, {base + bytes - 8, 8}, {base + bytes - 8, 16}};
+    for (const auto generation : generations) {
+        for (const auto& query : queries) {
+            const std::array<UnchangedQuery, 2> both{UnchangedQuery{query.address, query.bytes, generation}, UnchangedQuery{base, 64, generation}};
+            AgcDriver::Graphics::testLockFree.store(0);
+            const bool locked = UnchangedSince(query.address, query.bytes, generation);
+            const bool lockedAll = UnchangedSinceAll(both);
+            AgcDriver::Graphics::testLockFree.store(1);
+            const bool lockFree = UnchangedSince(query.address, query.bytes, generation);
+            const bool lockFreeAll = UnchangedSinceAll(both);
+            Require(locked == lockFree, std::string(stage) + ": the lock-free UnchangedSince differs from the locked query");
+            Require(lockedAll == lockFreeAll, std::string(stage) + ": the lock-free UnchangedSinceAll differs from the locked query");
+        }
+    }
+    AgcDriver::Graphics::testLockFree.store(-1);
+}
+
+void CheckLockFreeUnchanged() {
+    void* memory = AllocateWatched(4 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 4 * Block);
+    BumpCollectEpoch();
+    const auto first = CollectWrites(base, 4 * Block);
+    Require(first != 0, "the lock-free test block is not collected");
+    std::vector<std::uint64_t> generations{0, 1, first};
+    CheckLockFreeAgrees("collected", base, 4 * Block, generations);
+    const auto marked = MarkWritten(base + Block + 64, 4);
+    generations.push_back(marked);
+    CheckLockFreeAgrees("after a driver store", base, 4 * Block, generations);
+    static_cast<volatile std::uint8_t*>(memory)[2 * Block + 8] = 0x22;
+    CollectWritesUncached(base, 4 * Block);
+    generations.push_back(TrackerGeneration());
+    CheckLockFreeAgrees("after a CPU store", base, 4 * Block, generations);
+    Unwatch(base + 2 * Block, Block);
+    CheckLockFreeAgrees("after an unwatch", base, 4 * Block, generations);
+    AgcDriver::Graphics::testLockFree.store(1);
+    Require(!UnchangedSince(base + 2 * Block, Block, TrackerGeneration()), "an unwatched block reads as unchanged without the lock");
+    Require(UnchangedSince(base, Block, TrackerGeneration()), "a watched, unwritten block reads as changed without the lock");
+    AgcDriver::Graphics::testLockFree.store(-1);
+}
+
+// Live `unchanged_lockfree` under concurrency: a writer stamps blocks (MarkWritten) while readers
+// ask about them without the lock. A store whose MarkWritten returned before a reader's question
+// (published through `published`) must be seen: the reader never answers "unchanged" for a
+// generation older than a stamp it was told about.
+void CheckLockFreeConcurrent() {
+    void* memory = AllocateWatched(8 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, 8 * Block);
+    BumpCollectEpoch();
+    Require(CollectWrites(base, 8 * Block) != 0, "the concurrent test block is not collected");
+    AgcDriver::Graphics::testLockFree.store(1);
+    std::atomic<std::uint64_t> published{0};
+    std::atomic<bool> stop{false};
+    std::atomic<int> failures{0};
+    std::atomic<std::uint64_t> answered{0};
+    std::vector<std::thread> readers;
+    for (int reader = 0; reader < 3; ++reader) {
+        readers.emplace_back([&, reader] {
+            while (!stop.load(std::memory_order_acquire)) {
+                const auto seen = published.load(std::memory_order_acquire);
+                if (seen <= 1) continue;
+                // The newest published store is newer than seen - 1: its block must read changed.
+                const auto block = static_cast<std::uint64_t>(reader) % 8u;
+                static_cast<void>(block);
+                if (UnchangedSince(base, 8 * Block, seen - 1)) failures.fetch_add(1);
+                const std::array<UnchangedQuery, 1> all{UnchangedQuery{base, 8 * Block, seen - 1}};
+                if (UnchangedSinceAll(all)) failures.fetch_add(1);
+                answered.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    // At least 20000 stores, and on until the readers answered a few hundred times (a loaded
+    // machine may not schedule them during the first stores).
+    for (int store = 0; store < 20000 || (answered.load(std::memory_order_relaxed) < 300 && store < 50000000); ++store) {
+        const auto generation = MarkWritten(base + static_cast<std::uint64_t>(store % 8) * Block + 16, 4);
+        Require(generation != 0, "a concurrent driver store was not stamped");
+        published.store(generation, std::memory_order_release);
+    }
+    stop.store(true, std::memory_order_release);
+    for (auto& reader : readers) reader.join();
+    AgcDriver::Graphics::testLockFree.store(-1);
+    Require(failures.load() == 0, "a lock-free reader missed a published store");
+    Require(answered.load() != 0, "the lock-free readers asked nothing");
+}
+
+// Live `collect_local_copy`: a collect answered by another thread's walk of the same followed epoch
+// answers the same with the copy on and off, a later collect of the range answers from the copy,
+// and an unwatch makes the copy answer no more.
+void CheckLocalCopy() {
+    if (!SharedEpochMemo()) {
+        std::cout << "APS5_SHARED_EPOCH_MEMO unset: collect_local_copy check skipped\n";
+        return;
+    }
+    static std::uint64_t token = 1000;
+    for (const int copy : {0, 1}) {
+        void* memory = AllocateWatched(2 * Block);
+        const auto base = reinterpret_cast<std::uint64_t>(memory);
+        std::memset(memory, 0x11, 2 * Block);
+        AgcDriver::Graphics::testLocalCopy.store(copy);
+        const auto followed = ++token;
+        std::uint64_t walked = 0;
+        std::thread walker([&] {
+            FollowCollectEpoch(followed);
+            walked = CollectWrites(base, 2 * Block);
+        });
+        walker.join();
+        Require(walked != 0, "the walker's collect failed");
+        FollowCollectEpoch(followed);
+        const auto first = CollectWrites(base, Block);
+        const auto second = CollectWrites(base, Block);
+        Require(first != 0 && first == TrackerGeneration() && second == first, "a collect answered by the walker's entry does not return the current generation");
+        Require(UnchangedSince(base, Block, first), "the range reads as changed after the shared answer");
+        Unwatch(base + 4096, 4096);
+        Require(CollectWrites(base, Block) == 0, "a collect answered after an unwatch of the range");
+        BumpCollectEpoch();
+    }
+    AgcDriver::Graphics::testLocalCopy.store(-1);
+}
+
 #ifdef _WIN32
 void CheckPrivateMappingReuse() {
     void* memory = AllocateWatched(3 * Block);
@@ -188,11 +347,21 @@ int main() {
             std::cout << "no write watching: skipped\n";
             return 77;
         }
-        CheckSharedBlock();
-        CheckOwnStore();
-        CheckUnwatch();
+        // Every check runs with the lock-free queries off, then on (live `unchanged_lockfree`).
+        for (const int lockFree : {0, 1}) {
+            AgcDriver::Graphics::testLockFree.store(lockFree);
+            CheckSharedBlock();
+            CheckOwnStore();
+            CheckUnwatch();
 #ifdef _WIN32
-        CheckPrivateMappingReuse();
+            CheckPrivateMappingReuse();
+#endif
+        }
+        AgcDriver::Graphics::testLockFree.store(-1);
+#ifdef _WIN32
+        CheckLockFreeUnchanged();
+        CheckLockFreeConcurrent();
+        CheckLocalCopy();
 #endif
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";

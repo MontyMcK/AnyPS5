@@ -174,10 +174,37 @@ struct LiveFlags {
 
 }
 
+namespace {
+
+LiveFlags* LiveFlagsFile() {
+    static LiveFlags* const flags = [] {
+        const char* path = std::getenv("APS5_LIVE_FLAGS");
+        return path != nullptr ? new LiveFlags(path) : nullptr;
+    }();
+    return flags;
+}
+
+}
+
+bool LiveSwitch::Get(bool fallback) const {
+    auto* flags = LiveFlagsFile();
+    if (flags == nullptr) return fallback;
+    const auto count = flags->count.load(std::memory_order_acquire);
+    auto word = resolved.load(std::memory_order_relaxed);
+    if (static_cast<std::uint32_t>(word >> 32u) != count) {
+        word = (static_cast<std::uint64_t>(count) << 32u) | static_cast<std::uint32_t>(flags->slotOf(name) + 1);
+        resolved.store(word, std::memory_order_relaxed);
+    }
+    const auto at = static_cast<int>(static_cast<std::uint32_t>(word)) - 1;
+    if (at < 0) return fallback;
+    const auto value = flags->values[static_cast<std::size_t>(at)].load(std::memory_order_relaxed);
+    return value < 0 ? fallback : value != 0;
+}
+
 bool LiveFlag(std::string_view name, bool fallback) {
-    static const char* path = std::getenv("APS5_LIVE_FLAGS");
-    if (path == nullptr) return fallback;
-    static LiveFlags flags(path);
+    auto* file = LiveFlagsFile();
+    if (file == nullptr) return fallback;
+    auto& flags = *file;
     struct Cached {
         const char* key = nullptr;
         std::size_t size = 0;

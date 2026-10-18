@@ -13,6 +13,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -22,6 +23,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#include <array>
 #include <atomic>
 #include <functional>
 #include <bit>
@@ -147,6 +149,10 @@ struct HostImports {
     std::uint64_t unimportableHits = 0;
     // Requests served by a span import covering them (see importAllocation).
     std::uint64_t spanReuses = 0;
+    // Bumped (under `mutex`, before the change) by every change a HostImportFor hit depends on: an
+    // import added or dropped, the device, the reconciled registry generation (live `import_memo`).
+    std::atomic<std::uint64_t> tableSerial{1};
+    void changing() { tableSerial.fetch_add(1, std::memory_order_seq_cst); }
 };
 
 HostImports& Imports() {
@@ -187,6 +193,7 @@ void retireImport(const Context& context, HostImports& state, std::map<std::uint
     RetireShadow(context, it->second, [&lease](std::uint64_t begin, std::uint64_t end) { return containingRange(lease, begin, end) != nullptr; });
     auto holder = std::make_shared<RetiredImport>(context, it->second);
     if (auto* recorder = Recorder::Active(); recorder != nullptr && !recorder->Idle()) recorder->Keep(std::move(holder));
+    state.changing();
     ++state.epoch;
     state.imports.erase(it);
 }
@@ -485,6 +492,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     std::uint64_t liveBytes = bytes;
     for (const auto& [address, existing] : state.imports) liveBytes += existing.bytes;
     if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, liveBytes / 1048576.0, importedBytes / 1048576.0);
+    state.changing();
     return &state.imports.emplace(base, entry).first->second;
 }
 
@@ -508,6 +516,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     ForkTrap("import refresh");
     ForkQuiesce("import refresh");
     if (state.device != context.device) {
+        state.changing();
         for (const auto& [address, entry] : state.imports) {
             if (state.device != VK_NULL_HANDLE && state.destroyBuffer != nullptr && state.freeMemory != nullptr) {
                 AddressLedger::Destroyed(entry.buffer);
@@ -528,6 +537,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
     }
     const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     if (generation == state.refreshedGeneration) return;
+    state.changing();
     state.refreshedGeneration = generation;
     for (auto it = state.imports.begin(); it != state.imports.end();) {
         const auto* range = leasedRangeAt(lease, it->first);
@@ -1237,6 +1247,7 @@ void ClearHostImports(VkDevice device) {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     if (state.device != device) return;
+    state.changing();
     for (const auto& [address, entry] : state.imports) {
         AddressLedger::Destroyed(entry.buffer);
         state.destroyBuffer(state.device, entry.buffer, nullptr);
@@ -1421,13 +1432,72 @@ void SetImportWatch(const Context& context, ImportWatch watch) {
     state.unwatchDmaBufImports = state.unwatchImports;
 }
 
+namespace {
+
+// Live `import_memo` (env APS5_IMPORT_MEMO=0 turns it off): a thread remembers its HostImportFor
+// hits per exact range (address, bytes), with the device, the table serial and the reconciled
+// registry generation of the hit. A later call for the range answers from the memo, without the
+// imports mutex, while the serial is unchanged (no import added or dropped, same device, same
+// reconciled generation: the locked lookup would walk the very same map) and the registry still
+// has that generation (so the table is not stale): exactly the entry the locked lookup returns.
+// The serial moves before any change, so a hit never races a change further than a locked hit
+// whose caller used the entry after the unlock. Draw inputs (index and vertex ranges) ask this
+// once or twice per draw, behind the mutex the prep workers' stage A takes. APS5_VERIFY_IMPORT_MEMO=1
+// also looks every memo hit up under the mutex and aborts when the lookup, made while the serial
+// still is the hit's, names another entry.
+bool importMemo() {
+    static const bool requested = [] {
+        const char* value = std::getenv("APS5_IMPORT_MEMO");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const LiveSwitch flag("import_memo");
+    return flag.Get(requested);
+}
+
+struct ImportMemo {
+    struct Entry {
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t serial = 0;
+        std::uint64_t refreshed = 0;
+        VkDevice device = VK_NULL_HANDLE;
+        const HostImport* import = nullptr;
+    };
+    static constexpr std::size_t Size = 256;
+    std::array<Entry, Size> entries{};
+};
+struct ImportMemoTag;
+
+}
+
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     auto& state = Imports();
+    ImportMemo::Entry* slot = nullptr;
+    if (importMemo()) {
+        auto& memo = HostThreadLocal<ImportMemo, ImportMemoTag>();
+        const auto mixed = (address * 0x9e3779b97f4a7c15ull) ^ (static_cast<std::uint64_t>(bytes) * 0xc2b2ae3d27d4eb4full);
+        slot = &memo.entries[static_cast<std::size_t>(mixed >> 56u) % ImportMemo::Size];
+        if (slot->import != nullptr && slot->address == address && slot->bytes == bytes && slot->device == context.device && state.tableSerial.load(std::memory_order_seq_cst) == slot->serial && GuestAllocations::GuestAllocationsGeneration_nid_postfix() == slot->refreshed) {
+            static const bool verify = std::getenv("APS5_VERIFY_IMPORT_MEMO") != nullptr;
+            if (verify) {
+                const ForkGuard lock(state.mutex);
+                if (state.tableSerial.load(std::memory_order_relaxed) == slot->serial && GuestAllocations::GuestAllocationsGeneration_nid_postfix() == slot->refreshed && (importsStale(context, state) || findImport(state, address, address + bytes) != slot->import)) {
+                    std::fprintf(stderr, "[gpu] APS5_VERIFY_IMPORT_MEMO: the import memo's entry for 0x%llx+0x%zx differs from the locked lookup\n", static_cast<unsigned long long>(address), bytes);
+                    std::fflush(stderr);
+                    std::abort();
+                }
+            }
+            return slot->import;
+        }
+    }
     const ForkGuard lock(state.mutex);
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
-        if (const auto* entry = findImport(state, address, address + bytes)) return entry;
+        if (const auto* entry = findImport(state, address, address + bytes)) {
+            if (slot != nullptr) *slot = {address, bytes, state.tableSerial.load(std::memory_order_relaxed), state.refreshedGeneration, context.device, entry};
+            return entry;
+        }
     }
     if (ForkLogged() != nullptr) {
         static const bool forkNegative = std::getenv("APS5_NO_UNIMPORTABLE_MEMO") == nullptr;

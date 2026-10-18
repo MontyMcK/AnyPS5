@@ -48,6 +48,21 @@ private:
 PerformanceControls& LivePerformanceControls();
 
 bool LiveFlag(std::string_view name, bool fallback);
+// A live flag read on a hot path (several times per draw, from several threads): the flag's slot in
+// the live-flag file is resolved once (again only when the file gains names), so a read is two
+// shared loads, without LiveFlag's per-thread cache (a TLS lookup per call). Same answers as
+// LiveFlag(name, fallback). Define one per name with static storage.
+class LiveSwitch {
+public:
+    explicit constexpr LiveSwitch(const char* name) : name(name) {}
+    bool Get(bool fallback) const;
+
+private:
+    const char* name;
+    // (file name count the slot was resolved at) << 32 | (slot + 1): one word, so a reader never
+    // pairs a slot with another resolution's count.
+    mutable std::atomic<std::uint64_t> resolved{0};
+};
 bool ForkStatsEnabled();
 bool ForkLogEnabled();
 bool ForkBuildEnabled();

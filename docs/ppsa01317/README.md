@@ -65,6 +65,8 @@ The window title shows the current FPS.
 
 - The first boot compiles shaders and is slow. FPS settles after a couple of minutes on the World Map, and later boots start warm from the saved pipeline cache.
 - Newer switches (lazy write-back, native pattern fill, and the committer cuts `room_spin`, `fast_heap_prefetch`, `lock_spin`, `pending_fill`, `index_scan_memo`, `window_early_out`) are on by default. Setting one to `0` in `live-flags.txt` turns it off while the game runs.
+- The bs53 committer cuts are on by default too: `unchanged_lockfree`, `collect_local_copy`, `spec_entry_stamp`, `stream_batch`, `stream_inline` and `import_memo`. Each has an env switch (`APS5_UNCHANGED_LOCKFREE`, `APS5_COLLECT_LOCAL_COPY`, `APS5_SPEC_ENTRY_STAMP`, `APS5_STREAM_BATCH`, `APS5_STREAM_INLINE`, `APS5_IMPORT_MEMO`) whose value `0` turns it off from the start. The live flags take effect while the game runs.
+- `APS5_OPERATION_SUBMODE=1` makes `sceKernelGetOperationMode` report submode 1, which makes PPSA01317 render at its native 1920x1080 (no binary patch needed). The default stays 0.
 - Results were measured on an NVIDIA GPU at 4K. Other GPUs are untested.
 
 AI-assisted: yes

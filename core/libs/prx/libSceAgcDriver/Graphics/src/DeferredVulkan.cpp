@@ -9,14 +9,17 @@
 #include "prx/libSceAgcDriver/Graphics/include/DeferredVulkan.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
 #include <windows.h>
 #include <immintrin.h>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -54,10 +57,16 @@ struct Stream {
     DWORD recorderThread = 0;
 
     void push(Item* item) {
-        item->next.store(nullptr, std::memory_order_relaxed);
-        Item* previous = head.exchange(item, std::memory_order_acq_rel);
-        previous->next.store(item, std::memory_order_release);
-        pushed.fetch_add(1, std::memory_order_seq_cst);
+        pushChain(item, item, 1);
+    }
+
+    // `count` items already linked first -> ... -> last, published as one: the consumer, which
+    // acquires `previous->next`, also sees the chain's inner links (stored before the release).
+    void pushChain(Item* first, Item* last, std::uint64_t count) {
+        last->next.store(nullptr, std::memory_order_relaxed);
+        Item* previous = head.exchange(last, std::memory_order_acq_rel);
+        previous->next.store(first, std::memory_order_release);
+        pushed.fetch_add(count, std::memory_order_seq_cst);
         if (sleeping.load(std::memory_order_seq_cst) != 0) {
             AcquireSRWLockExclusive(&lock);
             WakeConditionVariable(&wake);
@@ -98,6 +107,50 @@ Stream& TheStream() {
     return stream;
 }
 
+// Live `stream_batch` (env APS5_STREAM_BATCH=0 turns it off): a producer's calls are linked into an
+// open batch and published to the stream together (one exchange, one counter add, one cache line
+// handed to the recorder thread) instead of one by one: a draw streams about a dozen calls, and each
+// push cost a few tens of nanoseconds in cross-core traffic. The open batch belongs to the GPU
+// mutex holder (every producer holds it) and is published before the holder gives the mutex up
+// (the release hook), before any wait for the stream (Drain), before a ticket is read, right after
+// a vkQueueSubmit, and every BatchCap calls. The calls, their order and their arguments are the
+// same; only the moment the recorder thread may start them moves, never past a point where anyone
+// can wait for them.
+bool StreamBatch() {
+    static const bool requested = [] {
+        const char* value = std::getenv("APS5_STREAM_BATCH");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const LiveSwitch flag("stream_batch");
+    return flag.Get(requested);
+}
+
+constexpr std::uint32_t BatchCap = 32;
+
+// Guarded by the GPU mutex (only its holder streams).
+struct OpenBatch {
+    Item* first = nullptr;
+    Item* last = nullptr;
+    std::uint32_t count = 0;
+};
+OpenBatch openBatch;
+std::atomic<std::uint64_t> batchesPublished{0};
+// Calls streamed so far, published or still in the open batch (written by the holder only), and a
+// request from a thread without the mutex that the holder publish at its next streamed call.
+std::atomic<std::uint64_t> deferredTotal{0};
+std::atomic<bool> publishRequested{false};
+std::atomic<std::uint64_t> drainFallbacks{0};
+
+// On the GPU mutex holder only.
+void PublishOpenBatch() {
+    publishRequested.store(false, std::memory_order_relaxed);
+    auto& batch = openBatch;
+    if (batch.first == nullptr) return;
+    TheStream().pushChain(batch.first, batch.last, batch.count);
+    batchesPublished.fetch_add(1, std::memory_order_relaxed);
+    batch = {};
+}
+
 DWORD WINAPI RecorderMain(void*) {
     auto& stream = TheStream();
     SetThreadDescription(GetCurrentThread(), L"AgcRecorder");
@@ -131,6 +184,8 @@ bool Enabled() {
         if (HANDLE thread = CreateThread(nullptr, 0, RecorderMain, nullptr, 0, &id)) {
             CloseHandle(thread);
             TheStream().recorderThread = id;
+            // The open batch (stream_batch) reaches the stream before the mutex changes hands.
+            GuestMemory::SetGpuReleaseHook(&PublishOpenBatch);
             std::fprintf(stderr, "[recorder] command recording runs on a recorder thread (APS5_RECORDER_THREAD=1)\n");
             return true;
         }
@@ -150,12 +205,49 @@ bool Streaming() {
 
 template<typename F>
 void Defer(F&& function) {
-    TheStream().push(new ItemOf<std::decay_t<F>>(std::forward<F>(function)));
+    Item* item = new ItemOf<std::decay_t<F>>(std::forward<F>(function));
+    deferredTotal.store(deferredTotal.load(std::memory_order_relaxed) + 1, std::memory_order_release);
+    if (!StreamBatch()) {
+        // Switched off live: what the batch holds goes first.
+        PublishOpenBatch();
+        TheStream().push(item);
+        return;
+    }
+    auto& batch = openBatch;
+    item->next.store(nullptr, std::memory_order_relaxed);
+    if (batch.first == nullptr) batch.first = item;
+    else batch.last->next.store(item, std::memory_order_relaxed);
+    batch.last = item;
+    if (++batch.count >= BatchCap || publishRequested.load(std::memory_order_relaxed)) PublishOpenBatch();
 }
 
 void Drain() {
     if (!Enabled() || OnRecorder()) return;
     auto& stream = TheStream();
+    if (GuestMemory::GpuMutex().HeldByThisThread()) {
+        // The caller's own calls first.
+        PublishOpenBatch();
+    } else if (deferredTotal.load(std::memory_order_acquire) != stream.pushed.load(std::memory_order_acquire)) {
+        // Another thread's open batch (stream_batch): every call streamed before this Drain is
+        // waited for, as when each call was pushed at once. The holder publishes at its next
+        // streamed call (asked here), at its release of the mutex, or at its own Drain; if none
+        // comes within 50 ms (a holder blocked with a batch open) the published calls are
+        // waited for and the fallback is counted.
+        const auto target = deferredTotal.load(std::memory_order_acquire);
+        publishRequested.store(true, std::memory_order_relaxed);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(50);
+        for (int spin = 0; stream.pushed.load(std::memory_order_acquire) < target; ++spin) {
+            if (spin < 2000) {
+                _mm_pause();
+                continue;
+            }
+            if (std::chrono::steady_clock::now() > deadline) {
+                drainFallbacks.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            SwitchToThread();
+        }
+    }
     const auto target = stream.pushed.load(std::memory_order_acquire);
     for (int spin = 0; stream.executed.load(std::memory_order_acquire) < target; ++spin) {
         if (spin < 2000) _mm_pause();
@@ -176,6 +268,48 @@ void CheckDeferred(VkResult result, const char* call) {
 template<typename T>
 std::vector<T> Copy(const T* values, std::uint32_t count) {
     return values != nullptr && count != 0 ? std::vector<T>(values, values + count) : std::vector<T>{};
+}
+
+// Live `stream_inline` (env APS5_STREAM_INLINE=0 turns it off): a streamed call's small argument
+// arrays (up to 128 bytes each: push constants, descriptor sets, vertex buffers and offsets,
+// viewports, scissors, barriers, descriptor infos) are copied into the call's own stream item
+// instead of a heap block each, so a draw's dozen calls allocate a dozen blocks, not two or three
+// dozen (and the recorder thread frees as many fewer). The bytes the driver call reads are the same.
+bool StreamInline() {
+    static const bool requested = [] {
+        const char* value = std::getenv("APS5_STREAM_INLINE");
+        return value == nullptr || value[0] != '0';
+    }();
+    static const LiveSwitch flag("stream_inline");
+    return flag.Get(requested);
+}
+
+template<typename T>
+class ArgCopy {
+    static_assert(std::is_trivially_copyable_v<T>);
+
+public:
+    static constexpr std::size_t Inline = sizeof(T) >= 128 ? 1 : 128 / sizeof(T);
+    ArgCopy() = default;
+    ArgCopy(const T* values, std::uint32_t count) {
+        if (values == nullptr || count == 0) return;
+        if (count <= Inline && StreamInline()) std::memcpy(local, values, sizeof(T) * count);
+        else heap.assign(values, values + count);
+        n = count;
+    }
+    const T* data() const { return n == 0 ? nullptr : heap.empty() ? reinterpret_cast<const T*>(local) : heap.data(); }
+    std::size_t size() const { return n; }
+    bool empty() const { return n == 0; }
+
+private:
+    std::uint32_t n = 0;
+    std::vector<T> heap;
+    alignas(T) unsigned char local[Inline * sizeof(T)];
+};
+
+template<typename T>
+ArgCopy<T> Arg(const T* values, std::uint32_t count) {
+    return ArgCopy<T>(values, count);
 }
 
 // Real entry points, recorded when the thunks are handed out.
@@ -229,9 +363,9 @@ struct Real {
 // A copied descriptor write: the arrays its type reads.
 struct WriteCopy {
     VkWriteDescriptorSet write;
-    std::vector<VkDescriptorImageInfo> images;
-    std::vector<VkDescriptorBufferInfo> buffers;
-    std::vector<VkBufferView> views;
+    ArgCopy<VkDescriptorImageInfo> images;
+    ArgCopy<VkDescriptorBufferInfo> buffers;
+    ArgCopy<VkBufferView> views;
 };
 
 std::optional<std::vector<WriteCopy>> CopyWrites(std::uint32_t count, const VkWriteDescriptorSet* writes) {
@@ -239,9 +373,9 @@ std::optional<std::vector<WriteCopy>> CopyWrites(std::uint32_t count, const VkWr
     for (std::uint32_t i = 0; i < count; ++i) {
         if (writes[i].pNext != nullptr) return std::nullopt;
         copies[i].write = writes[i];
-        copies[i].images = Copy(writes[i].pImageInfo, writes[i].pImageInfo != nullptr ? writes[i].descriptorCount : 0);
-        copies[i].buffers = Copy(writes[i].pBufferInfo, writes[i].pBufferInfo != nullptr ? writes[i].descriptorCount : 0);
-        copies[i].views = Copy(writes[i].pTexelBufferView, writes[i].pTexelBufferView != nullptr ? writes[i].descriptorCount : 0);
+        copies[i].images = Arg(writes[i].pImageInfo, writes[i].pImageInfo != nullptr ? writes[i].descriptorCount : 0);
+        copies[i].buffers = Arg(writes[i].pBufferInfo, writes[i].pBufferInfo != nullptr ? writes[i].descriptorCount : 0);
+        copies[i].views = Arg(writes[i].pTexelBufferView, writes[i].pTexelBufferView != nullptr ? writes[i].descriptorCount : 0);
     }
     return copies;
 }
@@ -263,44 +397,44 @@ std::vector<VkWriteDescriptorSet> Rebuild(std::vector<WriteCopy>& copies) {
 
 VKAPI_ATTR void VKAPI_CALL CmdPipelineBarrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst, VkDependencyFlags flags, uint32_t memoryCount, const VkMemoryBarrier* memory, uint32_t bufferCount, const VkBufferMemoryBarrier* buffers, uint32_t imageCount, const VkImageMemoryBarrier* images) {
     if (!Streaming()) return real.cmdPipelineBarrier(cb, src, dst, flags, memoryCount, memory, bufferCount, buffers, imageCount, images);
-    Defer([=, m = Copy(memory, memoryCount), b = Copy(buffers, bufferCount), i = Copy(images, imageCount)] {
+    Defer([=, m = Arg(memory, memoryCount), b = Arg(buffers, bufferCount), i = Arg(images, imageCount)] {
         real.cmdPipelineBarrier(cb, src, dst, flags, static_cast<uint32_t>(m.size()), m.data(), static_cast<uint32_t>(b.size()), b.data(), static_cast<uint32_t>(i.size()), i.data());
     });
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer buffer, VkImage image, VkImageLayout layout, uint32_t count, const VkBufferImageCopy* regions) {
     if (!Streaming()) return real.cmdCopyBufferToImage(cb, buffer, image, layout, count, regions);
-    Defer([=, r = Copy(regions, count)] { real.cmdCopyBufferToImage(cb, buffer, image, layout, static_cast<uint32_t>(r.size()), r.data()); });
+    Defer([=, r = Arg(regions, count)] { real.cmdCopyBufferToImage(cb, buffer, image, layout, static_cast<uint32_t>(r.size()), r.data()); });
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdCopyImageToBuffer(VkCommandBuffer cb, VkImage image, VkImageLayout layout, VkBuffer buffer, uint32_t count, const VkBufferImageCopy* regions) {
     if (!Streaming()) return real.cmdCopyImageToBuffer(cb, image, layout, buffer, count, regions);
-    Defer([=, r = Copy(regions, count)] { real.cmdCopyImageToBuffer(cb, image, layout, buffer, static_cast<uint32_t>(r.size()), r.data()); });
+    Defer([=, r = Arg(regions, count)] { real.cmdCopyImageToBuffer(cb, image, layout, buffer, static_cast<uint32_t>(r.size()), r.data()); });
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdClearColorImage(VkCommandBuffer cb, VkImage image, VkImageLayout layout, const VkClearColorValue* color, uint32_t count, const VkImageSubresourceRange* ranges) {
     if (!Streaming()) return real.cmdClearColorImage(cb, image, layout, color, count, ranges);
-    Defer([=, c = *color, r = Copy(ranges, count)] { real.cmdClearColorImage(cb, image, layout, &c, static_cast<uint32_t>(r.size()), r.data()); });
+    Defer([=, c = *color, r = Arg(ranges, count)] { real.cmdClearColorImage(cb, image, layout, &c, static_cast<uint32_t>(r.size()), r.data()); });
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdClearDepthStencilImage(VkCommandBuffer cb, VkImage image, VkImageLayout layout, const VkClearDepthStencilValue* value, uint32_t count, const VkImageSubresourceRange* ranges) {
     if (!Streaming()) return real.cmdClearDepthStencilImage(cb, image, layout, value, count, ranges);
-    Defer([=, v = *value, r = Copy(ranges, count)] { real.cmdClearDepthStencilImage(cb, image, layout, &v, static_cast<uint32_t>(r.size()), r.data()); });
+    Defer([=, v = *value, r = Arg(ranges, count)] { real.cmdClearDepthStencilImage(cb, image, layout, &v, static_cast<uint32_t>(r.size()), r.data()); });
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdCopyBuffer(VkCommandBuffer cb, VkBuffer source, VkBuffer destination, uint32_t count, const VkBufferCopy* regions) {
     if (!Streaming()) return real.cmdCopyBuffer(cb, source, destination, count, regions);
-    Defer([=, r = Copy(regions, count)] { real.cmdCopyBuffer(cb, source, destination, static_cast<uint32_t>(r.size()), r.data()); });
+    Defer([=, r = Arg(regions, count)] { real.cmdCopyBuffer(cb, source, destination, static_cast<uint32_t>(r.size()), r.data()); });
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdCopyImage(VkCommandBuffer cb, VkImage source, VkImageLayout sourceLayout, VkImage destination, VkImageLayout destinationLayout, uint32_t count, const VkImageCopy* regions) {
     if (!Streaming()) return real.cmdCopyImage(cb, source, sourceLayout, destination, destinationLayout, count, regions);
-    Defer([=, r = Copy(regions, count)] { real.cmdCopyImage(cb, source, sourceLayout, destination, destinationLayout, static_cast<uint32_t>(r.size()), r.data()); });
+    Defer([=, r = Arg(regions, count)] { real.cmdCopyImage(cb, source, sourceLayout, destination, destinationLayout, static_cast<uint32_t>(r.size()), r.data()); });
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdBlitImage(VkCommandBuffer cb, VkImage source, VkImageLayout sourceLayout, VkImage destination, VkImageLayout destinationLayout, uint32_t count, const VkImageBlit* regions, VkFilter filter) {
     if (!Streaming()) return real.cmdBlitImage(cb, source, sourceLayout, destination, destinationLayout, count, regions, filter);
-    Defer([=, r = Copy(regions, count)] { real.cmdBlitImage(cb, source, sourceLayout, destination, destinationLayout, static_cast<uint32_t>(r.size()), r.data(), filter); });
+    Defer([=, r = Arg(regions, count)] { real.cmdBlitImage(cb, source, sourceLayout, destination, destinationLayout, static_cast<uint32_t>(r.size()), r.data(), filter); });
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdWriteTimestamp(VkCommandBuffer cb, VkPipelineStageFlagBits stage, VkQueryPool pool, uint32_t query) {
@@ -310,7 +444,7 @@ VKAPI_ATTR void VKAPI_CALL CmdWriteTimestamp(VkCommandBuffer cb, VkPipelineStage
 
 VKAPI_ATTR void VKAPI_CALL CmdPushConstants(VkCommandBuffer cb, VkPipelineLayout layout, VkShaderStageFlags stages, uint32_t offset, uint32_t size, const void* values) {
     if (!Streaming()) return real.cmdPushConstants(cb, layout, stages, offset, size, values);
-    Defer([=, v = Copy(static_cast<const std::uint8_t*>(values), size)] { real.cmdPushConstants(cb, layout, stages, offset, size, v.data()); });
+    Defer([=, v = Arg(static_cast<const std::uint8_t*>(values), size)] { real.cmdPushConstants(cb, layout, stages, offset, size, v.data()); });
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdDispatch(VkCommandBuffer cb, uint32_t x, uint32_t y, uint32_t z) {
@@ -330,12 +464,12 @@ VKAPI_ATTR void VKAPI_CALL CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoi
 
 VKAPI_ATTR void VKAPI_CALL CmdBindDescriptorSetsThunk(VkCommandBuffer cb, VkPipelineBindPoint point, VkPipelineLayout layout, uint32_t first, uint32_t count, const VkDescriptorSet* sets, uint32_t dynamicCount, const uint32_t* dynamicOffsets) {
     if (!Streaming()) return real.cmdBindDescriptorSets(cb, point, layout, first, count, sets, dynamicCount, dynamicOffsets);
-    Defer([=, s = Copy(sets, count), d = Copy(dynamicOffsets, dynamicCount)] { real.cmdBindDescriptorSets(cb, point, layout, first, static_cast<uint32_t>(s.size()), s.data(), static_cast<uint32_t>(d.size()), d.data()); });
+    Defer([=, s = Arg(sets, count), d = Arg(dynamicOffsets, dynamicCount)] { real.cmdBindDescriptorSets(cb, point, layout, first, static_cast<uint32_t>(s.size()), s.data(), static_cast<uint32_t>(d.size()), d.data()); });
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdUpdateBuffer(VkCommandBuffer cb, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, const void* data) {
     if (!Streaming()) return real.cmdUpdateBuffer(cb, buffer, offset, size, data);
-    Defer([=, v = Copy(static_cast<const std::uint8_t*>(data), static_cast<std::uint32_t>(size))] { real.cmdUpdateBuffer(cb, buffer, offset, size, v.data()); });
+    Defer([=, v = Arg(static_cast<const std::uint8_t*>(data), static_cast<std::uint32_t>(size))] { real.cmdUpdateBuffer(cb, buffer, offset, size, v.data()); });
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdFillBuffer(VkCommandBuffer cb, VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, uint32_t value) {
@@ -368,7 +502,7 @@ VKAPI_ATTR void VKAPI_CALL CmdBeginRenderPass(VkCommandBuffer cb, const VkRender
         if (Streaming()) Drain();
         return real.cmdBeginRenderPass(cb, begin, contents);
     }
-    Defer([=, info = *begin, clears = Copy(begin->pClearValues, begin->clearValueCount)]() mutable {
+    Defer([=, info = *begin, clears = Arg(begin->pClearValues, begin->clearValueCount)]() mutable {
         info.pClearValues = clears.empty() ? nullptr : clears.data();
         real.cmdBeginRenderPass(cb, &info, contents);
     });
@@ -421,12 +555,12 @@ VKAPI_ATTR void VKAPI_CALL CmdDrawMeshTasksIndirect(VkCommandBuffer cb, VkBuffer
 
 VKAPI_ATTR void VKAPI_CALL CmdSetViewport(VkCommandBuffer cb, uint32_t first, uint32_t count, const VkViewport* viewports) {
     if (!Streaming()) return real.cmdSetViewport(cb, first, count, viewports);
-    Defer([=, v = Copy(viewports, count)] { real.cmdSetViewport(cb, first, static_cast<uint32_t>(v.size()), v.data()); });
+    Defer([=, v = Arg(viewports, count)] { real.cmdSetViewport(cb, first, static_cast<uint32_t>(v.size()), v.data()); });
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdSetScissor(VkCommandBuffer cb, uint32_t first, uint32_t count, const VkRect2D* scissors) {
     if (!Streaming()) return real.cmdSetScissor(cb, first, count, scissors);
-    Defer([=, s = Copy(scissors, count)] { real.cmdSetScissor(cb, first, static_cast<uint32_t>(s.size()), s.data()); });
+    Defer([=, s = Arg(scissors, count)] { real.cmdSetScissor(cb, first, static_cast<uint32_t>(s.size()), s.data()); });
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdSetDepthBias(VkCommandBuffer cb, float constant, float clamp, float slope) {
@@ -441,7 +575,7 @@ VKAPI_ATTR void VKAPI_CALL CmdSetDepthBounds(VkCommandBuffer cb, float minimum, 
 
 VKAPI_ATTR void VKAPI_CALL CmdBindVertexBuffers(VkCommandBuffer cb, uint32_t first, uint32_t count, const VkBuffer* buffers, const VkDeviceSize* offsets) {
     if (!Streaming()) return real.cmdBindVertexBuffers(cb, first, count, buffers, offsets);
-    Defer([=, b = Copy(buffers, count), o = Copy(offsets, count)] { real.cmdBindVertexBuffers(cb, first, static_cast<uint32_t>(b.size()), b.data(), o.data()); });
+    Defer([=, b = Arg(buffers, count), o = Arg(offsets, count)] { real.cmdBindVertexBuffers(cb, first, static_cast<uint32_t>(b.size()), b.data(), o.data()); });
 }
 
 VKAPI_ATTR void VKAPI_CALL CmdBindIndexBuffer(VkCommandBuffer cb, VkBuffer buffer, VkDeviceSize offset, VkIndexType type) {
@@ -548,6 +682,8 @@ VKAPI_ATTR VkResult VKAPI_CALL QueueSubmit(VkQueue queue, uint32_t count, const 
         }
         CheckDeferred(real.queueSubmit(queue, static_cast<uint32_t>(infos.size()), infos.data(), fence), "vkQueueSubmit");
     });
+    // A submit is waited for by other threads (fences, timeline values): never left in the batch.
+    PublishOpenBatch();
     return VK_SUCCESS;
 }
 
@@ -559,7 +695,7 @@ VKAPI_ATTR void VKAPI_CALL UpdateDescriptorSets(VkDevice device, uint32_t writeC
         Drain();
         return real.updateDescriptorSets(device, writeCount, writes, copyCount, copies);
     }
-    Defer([=, w = std::move(*writeCopies), c = Copy(copies, copyCount)]() mutable {
+    Defer([=, w = std::move(*writeCopies), c = Arg(copies, copyCount)]() mutable {
         const auto rebuilt = Rebuild(w);
         real.updateDescriptorSets(device, static_cast<uint32_t>(rebuilt.size()), rebuilt.data(), static_cast<uint32_t>(c.size()), c.data());
     });
@@ -607,6 +743,7 @@ void DrainDeferredVulkan() {
 
 std::uint64_t DeferredVulkanTicket() {
     if (!Enabled()) return 0;
+    if (GuestMemory::GpuMutex().HeldByThisThread()) PublishOpenBatch();
     return TheStream().pushed.load(std::memory_order_acquire);
 }
 

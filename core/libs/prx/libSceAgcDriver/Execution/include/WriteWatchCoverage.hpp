@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_WRITEWATCHCOVERAGE_HPP
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -26,6 +27,21 @@ public:
         return std::none_of(excluded.begin() + first, excluded.begin() + last + 1, [](auto generation) { return generation != 0; });
     }
 
+    // Covers without the owner's mutex (live `unchanged_lockfree`, GuestMemory.cpp): the exclusion
+    // bytes are read with acquire loads, and Exclude and Restore store them with release (the
+    // array itself is sized once, by Initialize, before any reader is let in). A Restore publishes
+    // its block stamps before it clears the bytes (watchPrivateMapping), so a reader that sees a
+    // block watched again also sees the stamps the replacement got.
+    bool CoversAcquire(std::uint64_t address, std::size_t bytes) const {
+        if (bytes == 0 || bytes > size || address < base || address - base > size - bytes) return false;
+        const auto first = (address - base) / BlockBytes;
+        const auto last = (address - base + bytes - 1) / BlockBytes;
+        for (auto block = first; block <= last; ++block) {
+            if (std::atomic_ref<std::uint8_t>(const_cast<std::uint8_t&>(excluded[block])).load(std::memory_order_acquire) != 0) return false;
+        }
+        return true;
+    }
+
     bool Exclude(std::uint64_t address, std::size_t bytes, std::uint64_t generation = 1) {
         if (bytes == 0 || size == 0) return false;
         if (address < base) {
@@ -43,7 +59,7 @@ public:
             changed = changed || excluded[block] == 0;
             auto& stamp = excludedGenerations[block];
             stamp = std::max(stamp, std::max<std::uint64_t>(generation, 1));
-            excluded[block] = 1;
+            std::atomic_ref<std::uint8_t>(excluded[block]).store(1, std::memory_order_release);
         }
         return changed;
     }
@@ -65,7 +81,7 @@ public:
         for (auto block = first; block < end; ++block) {
             if (excluded[block] != 0 && excludedGenerations.at(block) < generation) {
                 changed = true;
-                excluded[block] = 0;
+                std::atomic_ref<std::uint8_t>(excluded[block]).store(0, std::memory_order_release);
                 excludedGenerations.erase(block);
             }
         }
