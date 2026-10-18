@@ -68,3 +68,7 @@ The window title shows the current FPS.
 - Results were measured on an NVIDIA GPU at 4K. Other GPUs are untested.
 
 AI-assisted: yes
+
+## Known issues
+
+- **Random crashes, usually within the first few minutes:** the title sometimes crashes inside its own memory allocator. The likely cause is the GPU copy-back of staged buffer ranges, which copies a whole range back and can undo CPU writes made while the GPU work was running. A fix that copies back only the bytes the GPU changed exists, but it currently costs about half the frame rate on the World Map, so it isn't on this branch yet. If the game crashes, relaunch it.
