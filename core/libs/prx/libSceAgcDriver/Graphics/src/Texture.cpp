@@ -39,7 +39,11 @@
 #include <unordered_map>
 #include <utility>
 
+#ifdef _WIN32
 extern "C" __declspec(dllimport) unsigned short __stdcall RtlCaptureStackBackTrace(unsigned long framesToSkip, unsigned long framesToCapture, void** backTrace, unsigned long* backTraceHash);
+#else
+#include <execinfo.h>
+#endif
 
 // The [alias-stack] trace prints this function's address so its return addresses can be placed in
 // the module (its symbol address minus this one is the load offset).
@@ -3264,7 +3268,11 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                 if (stacks >= 6 || texture->descriptor.baseAddress != refreshing->descriptor.baseAddress || texture->descriptor.dimension == TextureDimension::k2D) continue;
                 ++stacks;
                 void* frames[24] = {};
+#ifdef _WIN32
                 const auto count = RtlCaptureStackBackTrace(0, 24, frames, nullptr);
+#else
+                const auto count = static_cast<unsigned>(backtrace(frames, 24));
+#endif
                 char anchor[64];
                 std::snprintf(anchor, sizeof(anchor), "[alias-stack] anchor %llx:", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(&AliasStackAnchor)));
                 std::string text = anchor;

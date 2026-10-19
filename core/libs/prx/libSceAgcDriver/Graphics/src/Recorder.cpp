@@ -1,3 +1,6 @@
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuCheckpoints.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -37,6 +40,18 @@
 #include <string_view>
 #include <thread>
 #include <tuple>
+
+namespace {
+
+unsigned long HostThreadForLog() {
+#ifdef _WIN32
+    return GetCurrentThreadId();
+#else
+    return static_cast<unsigned long>(gettid());
+#endif
+}
+
+}
 
 namespace AgcDriver::Graphics {
 
@@ -1637,7 +1652,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         static const bool traceFlush = std::getenv("APS5_TRACE_ACCESS_FLUSH") != nullptr;
         if (traceFlush && stored) {
             static std::atomic<std::uint32_t> reported{0};
-            if (reported.fetch_add(1, std::memory_order_relaxed) < 400) std::fprintf(stderr, "[access-flush] read 0x%llx+0x%zx site %s thread %lu flushed images\n", static_cast<unsigned long long>(address), bytes, GuestMemory::ReadSiteName(site), GetCurrentThreadId());
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 400) std::fprintf(stderr, "[access-flush] read 0x%llx+0x%zx site %s thread %lu flushed images\n", static_cast<unsigned long long>(address), bytes, GuestMemory::ReadSiteName(site), HostThreadForLog());
         }
     }
     if (stored || published) {

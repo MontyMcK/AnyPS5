@@ -2,7 +2,11 @@
 #include <tuple>
 #include <map>
 #include <atomic>
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <unistd.h>
+#endif
 #include <cstdio>
 #include <mutex>
 #include <set>
@@ -39,6 +43,18 @@
 #include <stdexcept>
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+
+namespace {
+
+unsigned long HostThreadForLog() {
+#ifdef _WIN32
+    return GetCurrentThreadId();
+#else
+    return static_cast<unsigned long>(gettid());
+#endif
+}
+
+}
 
 namespace AgcDriver::DriverDetail {
 
@@ -461,6 +477,7 @@ void ReportCompileProgress(CompileOutcome outcome) {
     static std::atomic<std::uint32_t> failures{0};
     static std::atomic<std::uint64_t> lastMs{0};
     (outcome == CompileOutcome::Compiled ? compiled : outcome == CompileOutcome::Deferred ? deferred : failures).fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
     const auto nowMs = static_cast<std::uint64_t>(GetTickCount64());
     auto last = lastMs.load(std::memory_order_relaxed);
     if (nowMs - last < 250 || !lastMs.compare_exchange_strong(last, nowMs)) return;
@@ -472,6 +489,7 @@ void ReportCompileProgress(CompileOutcome outcome) {
     DWORD written = 0;
     WriteFile(console, "\r", 1, &written, nullptr);
     WriteFile(console, text, static_cast<DWORD>(length), &written, nullptr);
+#endif
 }
 
 // A registration-time preparation that cannot run yet rather than one that failed: a call target
@@ -485,7 +503,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> TryPrepareShader(const Sha
         const auto started = std::chrono::steady_clock::now();
         auto handle = ShaderRecompiler::PrepareShader(request);
         const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
-        if (seconds > 0.2) std::fprintf(stderr, "[prepare] shader 0x%llx stage %u (%zu words) took %.2f s on thread %lu\n", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.shader.stage), request.shader.code.size(), seconds, GetCurrentThreadId());
+        if (seconds > 0.2) std::fprintf(stderr, "[prepare] shader 0x%llx stage %u (%zu words) took %.2f s on thread %lu\n", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.shader.stage), request.shader.code.size(), seconds, HostThreadForLog());
         ReportCompileProgress(CompileOutcome::Compiled);
         return handle;
     } catch (const std::exception& error) {

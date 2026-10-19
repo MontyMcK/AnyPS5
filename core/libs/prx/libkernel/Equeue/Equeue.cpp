@@ -1,5 +1,7 @@
 #include <ProfileOutput.hpp>
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <cstdlib>
 #include <cstdio>
 #include <cmath>
@@ -344,7 +346,11 @@ int APS5_VABI sceKernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int
             return text != nullptr ? std::strtod(text, nullptr) : 10.0;
         }();
         if (traceEvents && waitedMs >= traceThresholdMs) {
+#ifdef _WIN32
             const auto image = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+#else
+            const std::uintptr_t image = 0;
+#endif
             char header[256];
             std::snprintf(header, sizeof(header), "[equeue] %.1f exe+0x%llx waited %.1f ms timeout %lld ->", std::fmod(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(), 1.0e7), static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)) - image), waitedMs, timo ? static_cast<long long>(*timo) : -1LL);
             std::string line(header);

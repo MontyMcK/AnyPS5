@@ -10,7 +10,15 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PerformanceControls.hpp"
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <condition_variable>
+#include <mutex>
+#include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
+#endif
 #include <immintrin.h>
 #include <atomic>
 #include <chrono>
@@ -26,6 +34,33 @@
 namespace AgcDriver::Graphics {
 
 namespace {
+
+#ifdef _WIN32
+struct HostSync {
+    SRWLOCK lock = SRWLOCK_INIT;
+    CONDITION_VARIABLE wake = CONDITION_VARIABLE_INIT;
+    void Lock() { AcquireSRWLockExclusive(&lock); }
+    void Unlock() { ReleaseSRWLockExclusive(&lock); }
+    void Wake() { WakeConditionVariable(&wake); }
+    void SleepMs(unsigned ms) { SleepConditionVariableSRW(&wake, &lock, ms, 0); }
+};
+using HostThreadId = DWORD;
+HostThreadId CurrentHostThread() { return GetCurrentThreadId(); }
+void YieldHost() { SwitchToThread(); }
+#else
+struct HostSync {
+    std::mutex lock;
+    std::condition_variable_any wake;
+    void Lock() { lock.lock(); }
+    void Unlock() { lock.unlock(); }
+    void Wake() { wake.notify_one(); }
+    void SleepMs(unsigned ms) { wake.wait_for(lock, std::chrono::milliseconds(ms)); }
+};
+using HostThreadId = pid_t;
+HostThreadId CurrentHostThread() { return gettid(); }
+void YieldHost() { sched_yield(); }
+#endif
+
 
 struct Item {
     std::atomic<Item*> next{nullptr};
@@ -52,9 +87,8 @@ struct Stream {
     std::atomic<std::uint64_t> pushed{0};
     std::atomic<std::uint64_t> executed{0};
     std::atomic<int> sleeping{0};
-    SRWLOCK lock = SRWLOCK_INIT;
-    CONDITION_VARIABLE wake = CONDITION_VARIABLE_INIT;
-    DWORD recorderThread = 0;
+    HostSync sync;
+    std::atomic<HostThreadId> recorderThread{0};
 
     void push(Item* item) {
         pushChain(item, item, 1);
@@ -68,9 +102,9 @@ struct Stream {
         previous->next.store(first, std::memory_order_release);
         pushed.fetch_add(count, std::memory_order_seq_cst);
         if (sleeping.load(std::memory_order_seq_cst) != 0) {
-            AcquireSRWLockExclusive(&lock);
-            WakeConditionVariable(&wake);
-            ReleaseSRWLockExclusive(&lock);
+            sync.Lock();
+            sync.Wake();
+            sync.Unlock();
         }
     }
 
@@ -152,9 +186,18 @@ void PublishOpenBatch() {
     batch = {};
 }
 
+#ifdef _WIN32
 DWORD WINAPI RecorderMain(void*) {
+#else
+void* RecorderMain(void*) {
+#endif
     auto& stream = TheStream();
+#ifdef _WIN32
     SetThreadDescription(GetCurrentThread(), L"AgcRecorder");
+#else
+    pthread_setname_np(pthread_self(), "AgcRecorder");
+#endif
+    stream.recorderThread.store(CurrentHostThread(), std::memory_order_release);
     for (;;) {
         Item* item = stream.pop();
         if (item != nullptr) {
@@ -169,11 +212,11 @@ DWORD WINAPI RecorderMain(void*) {
             found = stream.executed.load(std::memory_order_relaxed) != stream.pushed.load(std::memory_order_acquire);
         }
         if (found) continue;
-        AcquireSRWLockExclusive(&stream.lock);
+        stream.sync.Lock();
         stream.sleeping.store(1, std::memory_order_seq_cst);
-        if (stream.executed.load(std::memory_order_relaxed) == stream.pushed.load(std::memory_order_seq_cst)) SleepConditionVariableSRW(&stream.wake, &stream.lock, 1, 0);
+        if (stream.executed.load(std::memory_order_relaxed) == stream.pushed.load(std::memory_order_seq_cst)) stream.sync.SleepMs(1);
         stream.sleeping.store(0, std::memory_order_seq_cst);
-        ReleaseSRWLockExclusive(&stream.lock);
+        stream.sync.Unlock();
     }
 }
 
@@ -181,10 +224,16 @@ bool Enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("APS5_RECORDER_THREAD");
         if (value == nullptr || value[0] != '1') return false;
+#ifdef _WIN32
         DWORD id = 0;
         if (HANDLE thread = CreateThread(nullptr, 0, RecorderMain, nullptr, 0, &id)) {
             CloseHandle(thread);
             TheStream().recorderThread = id;
+#else
+        pthread_t thread;
+        if (pthread_create(&thread, nullptr, RecorderMain, nullptr) == 0) {
+            pthread_detach(thread);
+#endif
             // The open batch (stream_batch) reaches the stream before the mutex changes hands.
             GuestMemory::SetGpuReleaseHook(&PublishOpenBatch);
             std::fprintf(stderr, "[recorder] command recording runs on a recorder thread (APS5_RECORDER_THREAD=1)\n");
@@ -196,7 +245,7 @@ bool Enabled() {
 }
 
 bool OnRecorder() {
-    return GetCurrentThreadId() == TheStream().recorderThread;
+    return CurrentHostThread() == TheStream().recorderThread.load(std::memory_order_acquire);
 }
 
 // Whether this call goes into the stream: the caller holds the GPU mutex (every recording does).
@@ -246,13 +295,13 @@ void Drain() {
                 drainFallbacks.fetch_add(1, std::memory_order_relaxed);
                 break;
             }
-            SwitchToThread();
+            YieldHost();
         }
     }
     const auto target = stream.pushed.load(std::memory_order_acquire);
     for (int spin = 0; stream.executed.load(std::memory_order_acquire) < target; ++spin) {
         if (spin < 2000) _mm_pause();
-        else SwitchToThread();
+        else YieldHost();
     }
 }
 

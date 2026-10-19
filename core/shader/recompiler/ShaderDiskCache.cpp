@@ -64,25 +64,25 @@ std::filesystem::path ShaderCacheDirectory() {
 namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(CompiledShaderArtifact) == 128, "CompiledShaderArtifact changed: update the artifact encoder");
-static_assert(sizeof(ShaderInvocation) == 72, "ShaderInvocation changed: update the invocation encoder");
-static_assert(sizeof(RecompileResult) == 208, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(CompiledShaderArtifact) == 192, "CompiledShaderArtifact changed: update the artifact encoder");
+static_assert(sizeof(ShaderInvocation) == 104, "ShaderInvocation changed: update the invocation encoder");
+static_assert(sizeof(RecompileResult) == 304, "RecompileResult changed: update EncodeResult and DecodeResult");
 static_assert(sizeof(DescriptorBinding) == 512, "DescriptorBinding changed: update the binding encoder");
-static_assert(sizeof(VertexAttribute) == 28, "VertexAttribute changed: update the attribute encoder");
-static_assert(sizeof(VertexInput) == 12, "VertexInput changed: update the vertex input encoder");
+static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
+static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 12, "FragmentParameter changed: update the parameter encoder");
-static_assert(sizeof(CompiledShaderInfo) == 328, "CompiledShaderInfo changed: update the info encoder");
+static_assert(sizeof(CompiledShaderInfo) == 336, "CompiledShaderInfo changed: update the info encoder");
 static_assert(sizeof(ShaderInfo) == 224, "ShaderInfo changed: update the info encoder");
 static_assert(sizeof(BufferResource) == 56, "BufferResource changed: update the info encoder");
-static_assert(sizeof(ImageResource) == 104, "ImageResource changed: update the info encoder");
-static_assert(sizeof(SamplerResource) == 16, "SamplerResource changed: update the info encoder");
+static_assert(sizeof(ImageResource) == 112, "ImageResource changed: update the info encoder");
+static_assert(sizeof(SamplerResource) == 20, "SamplerResource changed: update the info encoder");
 static_assert(sizeof(SampledResourcePair) == 12, "SampledResourcePair changed: update the info encoder");
 static_assert(sizeof(StageInput) == 56, "StageInput changed: update the info encoder");
 static_assert(sizeof(StageOutput) == 48, "StageOutput changed: update the info encoder");
-static_assert(sizeof(IrBindingLayout) == 64, "IrBindingLayout changed: update the layout encoder");
+static_assert(sizeof(IrBindingLayout) == 72, "IrBindingLayout changed: update the layout encoder");
 static_assert(sizeof(IrDescriptorBinding) == 32, "IrDescriptorBinding changed: update the layout encoder");
-static_assert(sizeof(BindingAllocationResult) == 120, "BindingAllocationResult changed: update the allocation encoder");
-static_assert(sizeof(CompiledBindingLayout) == 72, "CompiledBindingLayout changed: update the allocation encoder");
+static_assert(sizeof(BindingAllocationResult) == 152, "BindingAllocationResult changed: update the allocation encoder");
+static_assert(sizeof(CompiledBindingLayout) == 80, "CompiledBindingLayout changed: update the allocation encoder");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
 #endif
 

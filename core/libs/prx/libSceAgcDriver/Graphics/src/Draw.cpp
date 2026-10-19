@@ -41,7 +41,9 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#ifdef _WIN32
 #include <windows.h>
+#endif
 #include <limits>
 #include <map>
 #include <memory>
@@ -4773,9 +4775,13 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
                         const auto* v = binding.guestDescriptor.data() + element * 4;
                         const std::uint64_t base = static_cast<std::uint64_t>(v[0]) | (static_cast<std::uint64_t>(v[1] & 0xffffu) << 32u);
                         if (base < 0x100000000ull) continue;
+#ifdef _WIN32
                         MEMORY_BASIC_INFORMATION mbi{};
                         if (VirtualQuery(reinterpret_cast<const void*>(base), &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) continue;
                         const auto available = reinterpret_cast<std::uintptr_t>(mbi.BaseAddress) + mbi.RegionSize - base;
+#else
+                        const std::uint64_t available = 0;
+#endif
                         const auto words = std::min<std::uint64_t>(64, available / 4);
                         std::string data;
                         for (std::uint64_t i = 0; i < words; ++i) {

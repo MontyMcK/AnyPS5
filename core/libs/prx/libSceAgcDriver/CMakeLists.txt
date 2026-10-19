@@ -200,12 +200,21 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Submit/src/Dcb.cpp
 )
 
+if(NOT WIN32)
+    list(REMOVE_ITEM agcDriverSources
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastEmutls.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Sampler.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastHeap.cpp)
+endif()
+
 add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL
         ${agcDriverSources}
 )
 # FastEmutls.cpp defines __emutls_get_address for this module only; exporting it would make every
 # module linked against this one import it from here (and fail to load: the prx export table drops it).
-target_link_options(libSceAgcDriver PRIVATE -Wl,--exclude-symbols,__emutls_get_address)
+if(WIN32)
+    target_link_options(libSceAgcDriver PRIVATE -Wl,--exclude-symbols,__emutls_get_address)
+endif()
 
 target_include_directories(libSceAgcDriver PRIVATE
         ${LIBS_INCLUDE_DIR}

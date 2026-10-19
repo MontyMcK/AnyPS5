@@ -1150,8 +1150,10 @@ void ensurePinWaiter() {
         GuestAllocations::GuestAllocationsSetKeepSameQuery_nid_postfix(+[] { return LiveFlag("keep_same_protect", keepSameDefault); });
         static const bool leaseSnapshotDefault = std::getenv("APS5_NO_LEASE_SNAPSHOT") == nullptr;
         GuestAllocations::GuestAllocationsSetSnapshotQuery_nid_postfix(+[] { return LiveFlag("lease_snapshot", leaseSnapshotDefault); });
+#ifdef _WIN32
         static const bool unlockedWatchDefault = std::getenv("APS5_COLLECT_UNLOCKED_WATCH") != nullptr;
         GuestArena::GuestArenaSetUnlockedWatchQuery_nid_postfix(+[] { return LiveFlag("unlocked_watch", unlockedWatchDefault); });
+#endif
         return true;
     }();
     static_cast<void>(registered);
