@@ -73,6 +73,15 @@ The window title shows the current FPS.
 
 AI-assisted: yes
 
+## Linux (AMD, RADV)
+
+This branch builds on Linux (Fedora 44, GCC 16.2) and runs PPSA01317 01.710 on an AMD RX 9070 XT with Mesa 26.2.3. Two differences from the Windows setup:
+
+- Set `APS5_ASYNC_PIPELINES=1` and `APS5_ASYNC_PIPELINE_THREADS=8`. RADV takes 6 to 12 s to compile each of the title's graphics pipelines, and the title keeps asking for new specialized ones. Without the switch every draw waits for its compile and the title never leaves the black boot screen (about 1,300 frames, then nothing for 20 minutes). With it the pipelines compile on a pool, draws skip until theirs is ready, and the title screen appears within about 5 minutes on a first boot. Eight compile threads use about 36 GB of RAM at the peak; lower the count on machines with less.
+- The relinker of this branch has no `--module-dir`. Put `libSieRdNNabla.prx` and `logiWheel.prx` in `prx/` beside `sce_module/`, then link `app0/libSieRdNNabla.prx.guest.prx` and `app0/logiWheel.prx.guest.prx` to the converted files under `app0/prx/` (the title loads the first from `/app0`). `chmod +x app.elf` after converting.
+
+`FastHeap`, `FastEmutls` and the stack sampler are Windows-only and are not built on Linux, so `APS5_FAST_HEAP` and `APS5_SAMPLE` do nothing there.
+
 ## Known issues
 
 - **Random crashes, usually within the first few minutes:** the title sometimes crashes inside its own memory allocator. The likely cause is the GPU copy-back of staged buffer ranges, which copies a whole range back and can undo CPU writes made while the GPU work was running. A fix that copies back only the bytes the GPU changed exists, but it currently costs about half the frame rate on the World Map, so it isn't on this branch yet. If the game crashes, relaunch it.
